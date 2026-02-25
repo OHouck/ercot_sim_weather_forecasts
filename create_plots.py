@@ -165,6 +165,98 @@ def plot_max_wind_speed_map(year=2025, month=7, output_path=None):
                               output_path=output_path)
 
 
+def _draw_texas(ax, proj):
+    """Draw the Texas state outline on a cartopy axis."""
+    states_shp = shpreader.natural_earth(
+        resolution='10m', category='cultural', name='admin_1_states_provinces')
+    for record in shpreader.Reader(states_shp).records():
+        if record.attributes.get('name') == 'Texas':
+            ax.add_geometries(
+                [record.geometry], proj,
+                facecolor='#f0f0f0', edgecolor='black', linewidth=1.0)
+            break
+    ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
+
+
+def plot_combined_map(year=2025, month=7, output_path=None):
+    """3-panel Texas map: max temperature, max wind speed, and max LMP.
+
+    Left panel: Weather stations colored by max temperature (°C)
+    Center panel: Weather stations colored by max wind speed (m/s)
+    Right panel: ERCOT resource nodes colored by max LMP ($/MWh)
+
+    Args:
+        year: Integer year
+        month: Integer month
+        output_path: If provided, save figure to this path
+    """
+    from process_ercot import compute_max_lmp_by_node, build_node_coordinates
+
+    stations = load_station_metadata()
+    max_temp = compute_station_stat(year, month, stat_func=lambda s: s.max())
+    max_wind = compute_station_stat(
+        year, month, stat_func=lambda s: s.max(), col='WND', parser=parse_wnd_speed)
+    max_lmp = compute_max_lmp_by_node(year, month)
+    node_coords = build_node_coordinates()
+
+    # Merge data
+    temp_merged = stations.merge(max_temp, on='station_id', how='inner')
+    wind_merged = stations.merge(max_wind, on='station_id', how='inner')
+    max_lmp = max_lmp.rename(columns={'settlementPoint': 'settlement_point'})
+    lmp_merged = node_coords.merge(max_lmp, on='settlement_point', how='inner')
+
+    month_name = pd.Timestamp(year=year, month=month, day=1).strftime('%B')
+    proj = ccrs.PlateCarree()
+
+    fig, axes = plt.subplots(1, 3, figsize=(22, 8),
+                             subplot_kw={'projection': proj})
+
+    # Panel 1: Max Temperature
+    ax = axes[0]
+    _draw_texas(ax, proj)
+    sc1 = ax.scatter(
+        temp_merged['lon'], temp_merged['lat'], c=temp_merged['value'],
+        cmap='RdYlBu_r', s=35, edgecolors='k', linewidths=0.3,
+        alpha=0.85, transform=proj, zorder=5)
+    plt.colorbar(sc1, ax=ax, shrink=0.7, pad=0.02, label='°C')
+    ax.set_title(f'Max Temperature', fontsize=13)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    # Panel 2: Max Wind Speed
+    ax = axes[1]
+    _draw_texas(ax, proj)
+    sc2 = ax.scatter(
+        wind_merged['lon'], wind_merged['lat'], c=wind_merged['value'],
+        cmap='YlGnBu', s=35, edgecolors='k', linewidths=0.3,
+        alpha=0.85, transform=proj, zorder=5)
+    plt.colorbar(sc2, ax=ax, shrink=0.7, pad=0.02, label='m/s')
+    ax.set_title(f'Max Wind Speed', fontsize=13)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    # Panel 3: Max LMP
+    ax = axes[2]
+    _draw_texas(ax, proj)
+    sc3 = ax.scatter(
+        lmp_merged['lon'], lmp_merged['lat'], c=lmp_merged['max_lmp'],
+        cmap='hot_r', s=35, edgecolors='k', linewidths=0.3,
+        alpha=0.85, transform=proj, zorder=5, marker='D')
+    plt.colorbar(sc3, ax=ax, shrink=0.7, pad=0.02, label='$/MWh')
+    ax.set_title(f'Max LMP (Resource Nodes)', fontsize=13)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    fig.suptitle(f'Weather Stations & ERCOT Nodes — {month_name} {year}',
+                 fontsize=16, y=1.02)
+    fig.tight_layout()
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {output_path}")
+
+    plt.show()
+    return fig, axes
+
+
 if __name__ == '__main__':
     dirs = setup_directories()
 
@@ -173,3 +265,6 @@ if __name__ == '__main__':
 
     out_wind = os.path.join(dirs['root'], 'plots', 'max_wind_speed_july_2025.png')
     plot_max_wind_speed_map(output_path=out_wind)
+
+    out_combined = os.path.join(dirs['root'], 'plots', 'combined_map_july_2025.png')
+    plot_combined_map(output_path=out_combined)

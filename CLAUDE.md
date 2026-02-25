@@ -23,10 +23,18 @@ Layout:
 │   ├── weather_stations/       # Step 2: ISD realized observations
 │   │   ├── stations.csv        # 205 Texas station metadata
 │   │   └── 2025/07/            # ~202 per-station hourly CSVs
-│   └── ercot/                  # Step 3: ERCOT market data
-│       ├── dam_lmp/2025/07/    # 31 daily CSVs (~439K records each)
-│       └── rt_spp/2025/07/     # 31 daily CSVs
-└── processed_data/             # Future: cleaned/merged datasets
+│   ├── ercot/                  # Step 3: ERCOT market data
+│   │   ├── dam_lmp/2025/07/    # 31 daily CSVs (~439K records each)
+│   │   ├── rt_spp/2025/07/     # 31 daily CSVs
+│   │   └── np4_160/            # Step 4a: Settlement point mapping (5 CSVs)
+│   └── eia860/                 # Step 4b: EIA Form 860 plant data
+│       └── texas_plants.csv    # 1,369 TX plants with lat/lon
+├── processed_data/
+│   └── node_coordinates.csv    # Step 4c: 398 matched nodes with lat/lon
+└── plots/                      # Generated visualizations
+    ├── max_temp_july_2025.png
+    ├── max_wind_speed_july_2025.png
+    └── combined_map_july_2025.png
 ```
 
 ## Data Sources Summary
@@ -37,6 +45,8 @@ Layout:
 | Realized weather | NCEI ISD API | No | `download_data/pull_weatherstation.py` |
 | Day-ahead LMP | ERCOT API | OAuth2 + subscription key | `download_data/pull_ercot.py` |
 | Real-time SPP | ERCOT API | OAuth2 + subscription key | `download_data/pull_ercot.py` |
+| NP4-160 SP mapping | ERCOT MIS public download | No | `download_data/pull_np4160.py` |
+| EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
 | Validation | All above | — | `download_data/validate_data.py` |
 
 ## Credentials
@@ -51,7 +61,7 @@ Layout:
 
 Changes made:
 - `helper_funcs.py`: Added `raw` and `processed` keys to `setup_directories()`
-- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4` dependencies
+- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4`, `geopandas`, `cartopy`, `openpyxl` dependencies
 - Run `uv sync` to install
 
 Prerequisites: `brew install awscli eccodes`
@@ -183,10 +193,56 @@ uv run python -m download_data.pull_ercot
 
 ---
 
-## Step 4: ERCOT Node-to-Coordinate Mapping (TODO)
+## Step 4: ERCOT Node-to-Coordinate Mapping (DONE)
 
-For the synthetic 123-bus system, bus coordinates may be in `scuc/123bus_case_final.pkl`. For real ERCOT nodes, download from:
-- ERCOT GIS data: https://www.ercot.com/mp/data-products/data-product-details?id=NP4-160-SG
+**Scripts**: `download_data/pull_np4160.py`, `download_data/pull_eia860.py`
+**Processing**: `process_ercot.py` → `build_node_coordinates()`
+
+ERCOT settlement points have names (e.g., `AJAXWIND_RN`) but no geographic coordinates. Two public datasets are combined to build a coordinate mapping:
+
+### 4a: NP4-160-SG Settlement Point Mapping
+- Source: `https://www.ercot.com/misdownload/servlets/mirDownload?mimic_duns=000000000&doclookupId=1197364253`
+- No auth required. Public download.
+- ZIP containing 5 CSVs. Key file: `Resource_Node_to_Unit_*.csv` (1,584 rows)
+- Maps `RESOURCE_NODE → UNIT_SUBSTATION → UNIT_NAME`
+- 937 unique resource nodes, 745 unique substations
+- Output: `{raw}/ercot/np4_160/`
+
+```bash
+uv run python -m download_data.pull_np4160
+```
+
+### 4b: EIA Form 860 Plant Data
+- Source: `https://www.eia.gov/electricity/data/eia860/xls/eia8602024.zip`
+- No auth required. Public download. 22 MB ZIP.
+- Contains `2___Plant_Y2024.xlsx` with lat/lon for every US power plant
+- Filter: `State == 'TX'` or `Balancing Authority Code == 'ERCO'` → 1,369 Texas plants
+- Read with `pd.read_excel(f, skiprows=1)` (requires `openpyxl`)
+- Output: `{raw}/eia860/texas_plants.csv`
+
+```bash
+uv run python -m download_data.pull_eia860
+```
+
+### 4c: Name Matching Pipeline
+`process_ercot.build_node_coordinates()` matches ERCOT substation names to EIA plant names using three strategies in order:
+
+1. **Prefix match**: Strip suffixes (`_ESS`, `_BESS`, `_SLR`, `_WND`, etc.) from ERCOT name, check if it's a prefix of any normalized EIA plant name. (235 matches)
+2. **Substring containment**: Check if cleaned ERCOT name appears anywhere in EIA plant name. (65 matches)
+3. **Fuzzy match**: `difflib.get_close_matches()` with `cutoff=0.7`. (98 matches)
+
+**Result**: 398/937 resource nodes matched (42%). Cached to `{processed}/node_coordinates.csv`.
+
+### What was tried but didn't work well
+- **ERCOT API**: None of the 77 public API endpoints return geographic coordinates. The API is purely for time-series market data.
+- **123-bus pickle file** (`scuc/123bus_case_final.pkl`): Contains PyPower bus data (Pd, Qd, voltage, etc.) but no lat/lon — it's a synthetic system.
+- **NP4-160-SG alone**: Maps settlement points to substations and PSSE bus numbers, but has no coordinates.
+- **Simple fuzzy matching only**: `difflib.SequenceMatcher` at threshold 0.6 produces too many false positives (e.g., `ANSON1` → `Hanson` instead of `Anson`). Threshold 0.7 with the multi-strategy approach works better.
+- **CRR Network Model KML files**: These contain bus polygon geometries with real coordinates, but require IMRE registration at `http://www.ercot.com/services/rq/imre` — a different credential system from the market API. Could improve coverage to ~100% if registered.
+
+### Possible improvements
+- Register as IMRE user → download CRR Network Model KML → parse bus centroids (would cover all nodes)
+- Cross-reference EIA Form 860 generator-level data (`3_1_Generator*.xlsx`) for unit-level matching instead of plant-level
 
 ---
 
@@ -220,9 +276,40 @@ uv run python -m download_data.pull_weatherstation
 # Step 3: ERCOT market data (~30 min)
 uv run python -m download_data.pull_ercot
 
+# Step 4: Node coordinate mapping (~1 min)
+uv run python -m download_data.pull_np4160
+uv run python -m download_data.pull_eia860
+uv run python -c "from process_ercot import build_node_coordinates; build_node_coordinates(force_rebuild=True)"
+
 # Validate
 uv run python -m download_data.validate_data
+
+# Generate plots
+uv run python create_plots.py
 ```
+
+---
+
+## Processing & Visualization Scripts
+
+### `process_ercot.py`
+Functions for reading and processing ERCOT market data:
+- `load_dam_lmp_month(year, month)` — loads all daily DAM LMP CSVs into one DataFrame
+- `load_rt_spp_month(year, month)` — loads all daily RT SPP CSVs into one DataFrame
+- `compute_max_lmp_by_node(year, month)` — max LMP per RN settlement point
+- `build_node_coordinates(force_rebuild=False)` — builds the name-matching pipeline (Step 4c), caches to `{processed}/node_coordinates.csv`
+
+### `create_plots.py`
+Visualization functions using cartopy for Texas maps:
+- `plot_max_temperature_map()` — weather stations colored by max temperature
+- `plot_max_wind_speed_map()` — weather stations colored by max wind speed
+- `plot_combined_map()` — 3-panel figure: max temp, max wind speed, max LMP
+- `map_station_values()` — reusable scatter-map plotter
+- `compute_station_stat()` — generic per-station statistic from ISD data (supports any column/parser/stat_func)
+
+Parsers in `create_plots.py`:
+- `parse_tmp(tmp_str)` — ISD TMP field → °C
+- `parse_wnd_speed(wnd_str)` — ISD WND field → m/s
 
 ---
 
