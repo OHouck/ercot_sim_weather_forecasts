@@ -284,7 +284,8 @@ def build_UC_full_Run2(case_instance,UC_case,load_b_t,line_l_t):
     # Gen_Time Var
     model.p_g_t = Var(model.GEN, model.TIME)
     # model.u_g_t = Var(model.GEN, model.TIME, domain=Binary)
-    model.v_g_t = Var(model.GEN, model.TIME,domain=Binary)  # v_g_t is simplified to non-binary variable
+    # OH: change v_g_t from Binary to NonNegativeReals
+    model.v_g_t = Var(model.GEN, model.TIME,domain=NonNegativeReals)  # v_g_t is simplified to non-binary variable
     model.r_g_t = Var(model.GEN, model.TIME)
     # Line_Time Var
     model.theta_k_t = Var(model.LINE, model.TIME)
@@ -408,8 +409,9 @@ def build_UC_full_Run2(case_instance,UC_case,load_b_t,line_l_t):
 def solve_UC(UC_case,pickle_filename,case_nm,day_num):
     # set the solver
     #UC_solver = SolverFactory('glpk', executable='C:\\Users\\jlu27\\Desktop\\glpk-4.65\\w64\\glpsol.exe')
-    UC_solver = SolverFactory('conopt',
-                                executable='C:\\Users\\lujin\\OneDrive - University Of Houston\\work folder\\ampl new\\ampl_mswin64\\conopt.exe')
+    # UC_solver = SolverFactory('conopt',
+    #                             executable='C:\\Users\\lujin\\OneDrive - University Of Houston\\work folder\\ampl new\\ampl_mswin64\\conopt.exe')
+    UC_solver = SolverFactory('gurobi')
     UC_solver.options.mipgap = 0.01
     results = UC_solver.solve(UC_case)
     print('the solution is found')
@@ -428,8 +430,8 @@ def solve_UC(UC_case,pickle_filename,case_nm,day_num):
 def write_UCresult_day(UC_case, case_nm, day_num):
     ### print power flow result
     flnm_pf = case_nm + '_pf.txt'
-    fdpath = os.getcwd() + '\\UC_results' + '\\Day' + str(day_num)
-    flpath = fdpath + '\\' + flnm_pf
+    fdpath = os.path.join("hourly_dlr_scuc", 'UC_results', 'Day' + str(day_num))
+    flpath = os.path.join(fdpath, flnm_pf)
     # Check whether the specified path exists or not
     isExist = os.path.exists(fdpath)
     if not isExist:
@@ -447,7 +449,7 @@ def write_UCresult_day(UC_case, case_nm, day_num):
     f.close()
     # print p_g_t
     flnm_pgt = case_nm + '_pgt.txt'
-    flpath = fdpath + '\\' + flnm_pgt
+    flpath = os.path.join(fdpath, flnm_pgt)
     f = open(flpath, 'w')
     for g in UC_case.GEN:
         p_g_t_str = ''
@@ -460,7 +462,7 @@ def write_UCresult_day(UC_case, case_nm, day_num):
     f.close()
     # print power flow percentage
     flnm_pf = case_nm + '_pfpct.txt'
-    flpath = fdpath + '\\' + flnm_pf
+    flpath = os.path.join(fdpath, flnm_pf)
     f = open(flpath, 'w')
     for k in UC_case.LINE:
         p_k_t_pct_str = ''
@@ -476,7 +478,7 @@ def write_UCresult_day(UC_case, case_nm, day_num):
     f.close()
     # print LMP
     flnm_lmp = case_nm + '_lmp.txt'
-    flpath = fdpath + '\\' + flnm_lmp
+    flpath = os.path.join(fdpath, flnm_lmp)
     f = open(flpath, 'w')
     for b in UC_case.BUS:
         lmp_str = ''
@@ -491,7 +493,7 @@ def write_UCresult_day(UC_case, case_nm, day_num):
     f.close()
     # print operational cost
     flnm_opcost = case_nm + '_Opcost.txt'
-    flpath = fdpath + '\\' + flnm_opcost
+    flpath = os.path.join(fdpath, flnm_opcost)
     f = open(flpath, 'w')
     Opcost_str = str(UC_case.object())
     f.write(Opcost_str)
