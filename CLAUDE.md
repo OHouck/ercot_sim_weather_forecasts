@@ -24,13 +24,15 @@ Layout:
 │   │   ├── stations.csv        # 205 Texas station metadata
 │   │   └── 2025/07/            # ~202 per-station hourly CSVs
 │   ├── ercot/                  # Step 3: ERCOT market data
-│   │   ├── dam_lmp/2025/07/    # 31 daily CSVs (~439K records each)
+│   │   ├── dam_spp/2025/07/    # 31 daily CSVs (settlement point level)
 │   │   ├── rt_spp/2025/07/     # 31 daily CSVs
 │   │   └── np4_160/            # Step 4a: Settlement point mapping (5 CSVs)
 │   └── eia860/                 # Step 4b: EIA Form 860 plant data
 │       └── texas_plants.csv    # 1,369 TX plants with lat/lon
 ├── processed_data/
-│   └── node_coordinates.csv    # Step 4c: 398 matched nodes with lat/lon
+│   ├── node_coordinates.csv    # Step 4c: 398 matched nodes with lat/lon
+│   ├── unmatched_ercot_settlement_points.csv  # Unmatched ERCOT nodes for review
+│   └── unmatched_eia860_plants.csv            # Unmatched EIA plants for review
 └── plots/                      # Generated visualizations
     ├── max_temp_july_2025.png
     ├── max_wind_speed_july_2025.png
@@ -43,10 +45,11 @@ Layout:
 |---------|--------|------|--------|
 | NDFD forecasts | NOAA S3 `s3://noaa-ndfd-pds/wmo/` | No | `download_data/pull_ndfd.py` |
 | Realized weather | NCEI ISD API | No | `download_data/pull_weatherstation.py` |
-| Day-ahead LMP | ERCOT API | OAuth2 + subscription key | `download_data/pull_ercot.py` |
-| Real-time SPP | ERCOT API | OAuth2 + subscription key | `download_data/pull_ercot.py` |
+| Day-ahead SPP | ERCOT API (NP4-190) | OAuth2 + subscription key | `download_data/pull_ercot.py` |
+| Real-time SPP | ERCOT API (NP6-905) | OAuth2 + subscription key | `download_data/pull_ercot.py` |
 | NP4-160 SP mapping | ERCOT MIS public download | No | `download_data/pull_np4160.py` |
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
+| Node coordinates KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
 | Validation | All above | — | `download_data/validate_data.py` |
 
 ## Credentials
@@ -179,7 +182,7 @@ uv run python -m download_data.pull_ercot
 **Endpoints**:
 | Report | Endpoint | Fields | Records/day |
 |--------|----------|--------|-------------|
-| DAM LMP | `/np4-183-cd/dam_hourly_lmp` | deliveryDate, hourEnding, busName, LMP, DSTFlag | ~439K (18,290 buses × 24h) |
+| DAM SPP | `/np4-190-cd/dam_stlmnt_pnt_prices` | deliveryDate, hourEnding, settlementPoint, settlementPointPrice, settlementPointType, DSTFlag | settlement point level |
 | RT SPP | `/np6-905-cd/spp_node_zone_hub` | deliveryDate, deliveryInterval, settlementPointName, settlementPointPrice, settlementPointType | varies |
 
 **Rate limit**: 30 req/min. Use `time.sleep(2)` between requests.
@@ -187,8 +190,7 @@ uv run python -m download_data.pull_ercot
 **Pagination**: Check `_meta.totalPages`. Loop until `page >= totalPages`.
 
 ### Results for July 2025
-- DAM LMP: 31 files, ~438,960 records/day (18,290 buses × 24 hours)
-- Columns: deliveryDate, hourEnding, busName, LMP, DSTFlag
+- DAM SPP: 31 files (settlement point level prices)
 - RT SPP: 31 files
 
 ---
@@ -224,24 +226,34 @@ uv run python -m download_data.pull_np4160
 uv run python -m download_data.pull_eia860
 ```
 
-### 4c: Name Matching Pipeline
-`process_ercot.build_node_coordinates()` matches ERCOT substation names to EIA plant names using three strategies in order:
+### 4c: Node Coordinate Matching Pipeline
+`process_ercot.build_node_coordinates()` combines two coordinate sources:
 
-1. **Prefix match**: Strip suffixes (`_ESS`, `_BESS`, `_SLR`, `_WND`, etc.) from ERCOT name, check if it's a prefix of any normalized EIA plant name. (235 matches)
-2. **Substring containment**: Check if cleaned ERCOT name appears anywhere in EIA plant name. (65 matches)
-3. **Fuzzy match**: `difflib.get_close_matches()` with `cutoff=0.7`. (98 matches)
+**Source 1: ERCOT KML contour map** (preferred, authoritative)
+- File: `data/rtmLmpPoints.kml` — cached 2019 snapshot from ERCOT's real-time LMP contour map
+- Origin: `https://github.com/arnavgautam/ERCOT-Data-Forecasting/blob/master/rtmLmpPoints.kml`
+- Contains 254 settlement points with lat/lon directly from ERCOT, plus plant names/addresses/counties
+- 195 of these match current NP4-160 resource nodes
+- The original ERCOT KML endpoints (`/content/cdr/contours/rtmLmpPoints.kml` etc.) are now 404
 
-**Result**: 398/937 resource nodes matched (42%). Cached to `{processed}/node_coordinates.csv`.
+**Source 2: EIA Form 860 name matching** (for remaining nodes)
+- Matches ERCOT substation names (from NP4-160) to EIA plant names:
+  1. **Prefix match**: ERCOT abbreviation is prefix of normalized EIA name (~192 matches)
+  2. **Substring containment**: ERCOT name appears in EIA name (~55 matches)
+  3. **Fuzzy match**: `difflib.get_close_matches()` with `cutoff=0.7` (~72 matches)
+
+**Result**: 514/937 resource nodes matched (55%). Cached to `{processed}/node_coordinates.csv`.
+Also saves `unmatched_ercot_settlement_points.csv` and `unmatched_eia860_plants.csv` for manual review.
 
 ### What was tried but didn't work well
 - **ERCOT API**: None of the 77 public API endpoints return geographic coordinates. The API is purely for time-series market data.
+- **ERCOT contour map** (`/content/cdr/contours/rtmLmp.html`): Renders pre-baked PNG images, not interactive JS with data endpoints. No JSON/CSV download. The KML files it formerly served are all 404 now.
 - **123-bus pickle file** (`scuc/123bus_case_final.pkl`): Contains PyPower bus data (Pd, Qd, voltage, etc.) but no lat/lon — it's a synthetic system.
 - **NP4-160-SG alone**: Maps settlement points to substations and PSSE bus numbers, but has no coordinates.
 - **Simple fuzzy matching only**: `difflib.SequenceMatcher` at threshold 0.6 produces too many false positives (e.g., `ANSON1` → `Hanson` instead of `Anson`). Threshold 0.7 with the multi-strategy approach works better.
-- **CRR Network Model KML files**: These contain bus polygon geometries with real coordinates, but require IMRE registration at `http://www.ercot.com/services/rq/imre` — a different credential system from the market API. Could improve coverage to ~100% if registered.
 
 ### Possible improvements
-- Register as IMRE user → download CRR Network Model KML → parse bus centroids (would cover all nodes)
+- **CRR Network Model KML**: Requires free IMRE registration at `https://www.ercot.com/services/rq/imre`. Contains bus polygon geometries for all network buses. Parser exists at `github.com/patrickbrown4/pvvm_pvtos`. Would cover ~100% of nodes.
 - Cross-reference EIA Form 860 generator-level data (`3_1_Generator*.xlsx`) for unit-level matching instead of plant-level
 
 ---
@@ -294,7 +306,7 @@ uv run python create_plots.py
 
 ### `process_ercot.py`
 Functions for reading and processing ERCOT market data:
-- `load_dam_lmp_month(year, month)` — loads all daily DAM LMP CSVs into one DataFrame
+- `load_dam_spp_month(year, month)` — loads all daily DAM SPP CSVs into one DataFrame
 - `load_rt_spp_month(year, month)` — loads all daily RT SPP CSVs into one DataFrame
 - `compute_max_lmp_by_node(year, month)` — max LMP per RN settlement point
 - `build_node_coordinates(force_rebuild=False)` — builds the name-matching pipeline (Step 4c), caches to `{processed}/node_coordinates.csv`

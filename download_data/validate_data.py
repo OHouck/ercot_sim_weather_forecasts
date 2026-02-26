@@ -58,16 +58,16 @@ def validate_july_2025():
         print(f"  Data directory: MISSING")
         all_ok = False
 
-    # 3. ERCOT DAM LMP
-    print("\n--- ERCOT Day-Ahead LMP ---")
-    dam_dir = Path(raw) / 'ercot' / 'dam_lmp' / '2025' / '07'
+    # 3. ERCOT DAM SPP
+    print("\n--- ERCOT Day-Ahead SPP ---")
+    dam_dir = Path(raw) / 'ercot' / 'dam_spp' / '2025' / '07'
     if dam_dir.exists():
         dam_files = sorted(dam_dir.glob("*.csv"))
         status = "ok" if len(dam_files) >= 31 else f"{len(dam_files)}/31"
         print(f"  Files: {len(dam_files)} [{status}]")
         if dam_files:
             df = pd.read_csv(dam_files[0])
-            print(f"  Sample ({dam_files[0].name}): {len(df)} records, {df['busName'].nunique()} buses")
+            print(f"  Sample ({dam_files[0].name}): {len(df)} records, columns: {list(df.columns)}")
         if len(dam_files) < 31:
             all_ok = False
     else:

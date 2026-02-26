@@ -1,6 +1,6 @@
-"""pull_ercot.py — Download ERCOT LMP and settlement point price data.
+"""pull_ercot.py — Download ERCOT settlement point price data.
 
-Downloads day-ahead hourly LMP and real-time settlement point prices
+Downloads day-ahead and real-time settlement point prices
 from the ERCOT Public API. Requires API credentials in ~/keys/.
 
 Authentication flow:
@@ -89,7 +89,7 @@ def ercot_request(endpoint, params, api_key, bearer_token=None, max_pages=100):
     This function combines them into a list of dicts for easy DataFrame creation.
 
     Args:
-        endpoint: API endpoint path (e.g. '/np4-183-cd/dam_hourly_lmp')
+        endpoint: API endpoint path (e.g. '/np4-190-cd/dam_stlmnt_pnt_prices')
         params: Query parameters dict
         api_key: ERCOT API subscription key
         bearer_token: OAuth2 bearer token (if None, tries subscription key only)
@@ -160,8 +160,11 @@ def ercot_request(endpoint, params, api_key, bearer_token=None, max_pages=100):
     return all_records
 
 
-def download_dam_lmp(start_date, end_date, output_dir, api_key, bearer_token=None):
-    """Download day-ahead hourly LMP data.
+def download_dam_spp(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download day-ahead settlement point prices.
+
+    Uses NP4-190-CD endpoint which provides prices at the settlement point
+    level (resource nodes, load zones, hubs) rather than bus level.
 
     Args:
         start_date: 'YYYY-MM-DD' start
@@ -179,21 +182,21 @@ def download_dam_lmp(start_date, end_date, output_dir, api_key, bearer_token=Non
 
     while current <= end:
         date_str = current.strftime('%Y-%m-%d')
-        output_file = os.path.join(output_dir, f"dam_lmp_{date_str}.csv")
+        output_file = os.path.join(output_dir, f"dam_spp_{date_str}.csv")
 
         if os.path.exists(output_file):
             print(f"  Skipping {date_str} (already exists)")
             current += timedelta(days=1)
             continue
 
-        print(f"  Downloading DAM LMP for {date_str}...")
+        print(f"  Downloading DAM SPP for {date_str}...")
         params = {
             'deliveryDateFrom': date_str,
             'deliveryDateTo': date_str,
         }
 
         records = ercot_request(
-            '/np4-183-cd/dam_hourly_lmp', params, api_key, bearer_token
+            '/np4-190-cd/dam_stlmnt_pnt_prices', params, api_key, bearer_token
         )
 
         if records:
@@ -287,10 +290,10 @@ def download_month(year, month):
 
     api_key = creds['api_key']
 
-    # Day-ahead LMP
-    print("--- Day-Ahead Hourly LMP ---")
-    dam_dir = os.path.join(base_dir, 'dam_lmp', str(year), f"{month:02d}")
-    download_dam_lmp(start_date, end_date, dam_dir, api_key, bearer_token)
+    # Day-ahead settlement point prices
+    print("--- Day-Ahead Settlement Point Prices ---")
+    dam_dir = os.path.join(base_dir, 'dam_spp', str(year), f"{month:02d}")
+    download_dam_spp(start_date, end_date, dam_dir, api_key, bearer_token)
 
     # Real-time SPP
     print("\n--- Real-Time Settlement Point Prices ---")
