@@ -49,7 +49,8 @@ Layout:
 | Real-time SPP | ERCOT API (NP6-905) | OAuth2 + subscription key | `download_data/pull_ercot.py` |
 | NP4-160 SP mapping | ERCOT MIS public download | No | `download_data/pull_np4160.py` |
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
-| Node coordinates KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
+| Node coords HTML | ERCOT contour map HTML source | No | `data/rtmLmp_html_source.txt` |
+| Node coords KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
 | Validation | All above | — | `download_data/validate_data.py` |
 
 ## Credentials
@@ -200,7 +201,7 @@ uv run python -m download_data.pull_ercot
 **Scripts**: `download_data/pull_np4160.py`, `download_data/pull_eia860.py`
 **Processing**: `process_ercot.py` → `build_node_coordinates()`
 
-ERCOT settlement points have names (e.g., `AJAXWIND_RN`) but no geographic coordinates. Two public datasets are combined to build a coordinate mapping:
+ERCOT settlement points have names (e.g., `AJAXWIND_RN`) but no geographic coordinates. Three sources are combined to build a coordinate mapping:
 
 ### 4a: NP4-160-SG Settlement Point Mapping
 - Source: `https://www.ercot.com/misdownload/servlets/mirDownload?mimic_duns=000000000&doclookupId=1197364253`
@@ -227,27 +228,37 @@ uv run python -m download_data.pull_eia860
 ```
 
 ### 4c: Node Coordinate Matching Pipeline
-`process_ercot.build_node_coordinates()` combines two coordinate sources:
+`process_ercot.build_node_coordinates()` combines three coordinate sources in priority order:
 
-**Source 1: ERCOT KML contour map** (preferred, authoritative)
-- File: `data/rtmLmpPoints.kml` — cached 2019 snapshot from ERCOT's real-time LMP contour map
+**Source 1: ERCOT HTML contour map** (preferred, current)
+- File: `data/rtmLmp_html_source.txt` — HTML source of ERCOT's real-time LMP contour map
+- Source URL: `https://www.ercot.com/content/cdr/contours/rtmLmp.html`
+- Contains 253 nodes as `<area>` tags with pixel coordinates on a 600x600 PNG
+- Format: `<area shape="circle" coords="x,y,6" title="NODE_NAME: $price">`
+- Pixel coords converted to lat/lon via least-squares affine transformation calibrated
+  against 200 ground control points (nodes common with the 2019 KML)
+- Affine accuracy: mean error 0.9 km, max 1.4 km
+- 198 match current NP4-160 resource nodes (27 are new nodes not in the 2019 KML)
+- Can be updated by re-saving the HTML source from the ERCOT website
+
+**Source 2: ERCOT KML contour map** (2019 snapshot, fills gaps)
+- File: `data/rtmLmpPoints.kml` — cached 2019 snapshot
 - Origin: `https://github.com/arnavgautam/ERCOT-Data-Forecasting/blob/master/rtmLmpPoints.kml`
-- Contains 254 settlement points with lat/lon directly from ERCOT, plus plant names/addresses/counties
-- 195 of these match current NP4-160 resource nodes
-- The original ERCOT KML endpoints (`/content/cdr/contours/rtmLmpPoints.kml` etc.) are now 404
+- Contains 254 settlement points with lat/lon directly from ERCOT
+- 24 additional matches not covered by the HTML source
+- Also used as ground control points for the HTML affine transformation
 
-**Source 2: EIA Form 860 name matching** (for remaining nodes)
+**Source 3: EIA Form 860 name matching** (for remaining nodes)
 - Matches ERCOT substation names (from NP4-160) to EIA plant names:
-  1. **Prefix match**: ERCOT abbreviation is prefix of normalized EIA name (~192 matches)
+  1. **Prefix match**: ERCOT abbreviation is prefix of normalized EIA name (~182 matches)
   2. **Substring containment**: ERCOT name appears in EIA name (~55 matches)
-  3. **Fuzzy match**: `difflib.get_close_matches()` with `cutoff=0.7` (~72 matches)
+  3. **Fuzzy match**: `difflib.get_close_matches()` with `cutoff=0.7` (~70 matches)
 
-**Result**: 514/937 resource nodes matched (55%). Cached to `{processed}/node_coordinates.csv`.
+**Result**: 529/937 resource nodes matched (56%). Cached to `{processed}/node_coordinates.csv`.
 Also saves `unmatched_ercot_settlement_points.csv` and `unmatched_eia860_plants.csv` for manual review.
 
 ### What was tried but didn't work well
 - **ERCOT API**: None of the 77 public API endpoints return geographic coordinates. The API is purely for time-series market data.
-- **ERCOT contour map** (`/content/cdr/contours/rtmLmp.html`): Renders pre-baked PNG images, not interactive JS with data endpoints. No JSON/CSV download. The KML files it formerly served are all 404 now.
 - **123-bus pickle file** (`scuc/123bus_case_final.pkl`): Contains PyPower bus data (Pd, Qd, voltage, etc.) but no lat/lon — it's a synthetic system.
 - **NP4-160-SG alone**: Maps settlement points to substations and PSSE bus numbers, but has no coordinates.
 - **Simple fuzzy matching only**: `difflib.SequenceMatcher` at threshold 0.6 produces too many false positives (e.g., `ANSON1` → `Hanson` instead of `Anson`). Threshold 0.7 with the multi-strategy approach works better.
@@ -255,6 +266,7 @@ Also saves `unmatched_ercot_settlement_points.csv` and `unmatched_eia860_plants.
 ### Possible improvements
 - **CRR Network Model KML**: Requires free IMRE registration at `https://www.ercot.com/services/rq/imre`. Contains bus polygon geometries for all network buses. Parser exists at `github.com/patrickbrown4/pvvm_pvtos`. Would cover ~100% of nodes.
 - Cross-reference EIA Form 860 generator-level data (`3_1_Generator*.xlsx`) for unit-level matching instead of plant-level
+- Re-save `data/rtmLmp_html_source.txt` periodically to capture new nodes added to the ERCOT contour map
 
 ---
 

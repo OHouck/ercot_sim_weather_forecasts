@@ -5,6 +5,7 @@ import re
 import glob
 import difflib
 import xml.etree.ElementTree as ET
+import numpy as np
 import pandas as pd
 from helper_funcs import setup_directories
 
@@ -141,13 +142,92 @@ def _parse_kml_coordinates(kml_path):
     return pd.DataFrame(rows)
 
 
+def _parse_html_contour_map(html_path, kml_path=None):
+    """Parse ERCOT RTM LMP contour map HTML to extract node coordinates.
+
+    The HTML contains an image map with pixel coordinates for each node on a
+    600x600 PNG. This function converts pixel coords to lat/lon using an affine
+    transformation calibrated against known KML coordinates.
+
+    If a KML file is provided, uses nodes common to both sources as ground
+    control points. Otherwise uses hardcoded coefficients derived from the
+    Feb 2026 HTML + 2019 KML pair.
+
+    Args:
+        html_path: Path to the HTML source file
+        kml_path: Optional path to KML file for calibrating the transformation
+
+    Returns:
+        DataFrame with columns: settlement_point, lat, lon, plant_name, match_method
+    """
+    with open(html_path) as f:
+        html = f.read()
+
+    # Extract pixel coordinates and node names from <area> tags
+    html_nodes = {}
+    for m in re.finditer(
+        r'<area\s+shape="circle"\s+coords="(\d+),(\d+),\d+"\s+title="([^:]+):', html
+    ):
+        x, y, name = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        html_nodes[name] = (x, y)
+
+    if not html_nodes:
+        return pd.DataFrame()
+
+    # Fit affine transformation using KML ground control points
+    if kml_path and os.path.exists(kml_path):
+        kml_df = _parse_kml_coordinates(kml_path)
+        kml_coords = {
+            row['settlement_point']: (row['lat'], row['lon'])
+            for _, row in kml_df.iterrows()
+        }
+        common = sorted(set(html_nodes) & set(kml_coords))
+
+        if len(common) >= 10:
+            A = np.array([[1, html_nodes[n][0], html_nodes[n][1]] for n in common])
+            lat_vec = np.array([kml_coords[n][0] for n in common])
+            lon_vec = np.array([kml_coords[n][1] for n in common])
+
+            lat_coeffs, _, _, _ = np.linalg.lstsq(A, lat_vec, rcond=None)
+            lon_coeffs, _, _, _ = np.linalg.lstsq(A, lon_vec, rcond=None)
+            print(f"HTML contour map: fitted affine transform from {len(common)} "
+                  f"ground control points")
+        else:
+            print(f"WARNING: Only {len(common)} common nodes, using hardcoded coefficients")
+            lat_coeffs = np.array([36.796687, 0.000005, -0.018760])
+            lon_coeffs = np.array([-107.009848, 0.023113, -0.000004])
+    else:
+        # Hardcoded coefficients from Feb 2026 HTML + 2019 KML calibration
+        lat_coeffs = np.array([36.796687, 0.000005, -0.018760])
+        lon_coeffs = np.array([-107.009848, 0.023113, -0.000004])
+
+    # Convert all HTML nodes to lat/lon
+    rows = []
+    for name, (px, py) in html_nodes.items():
+        lat = lat_coeffs[0] + lat_coeffs[1] * px + lat_coeffs[2] * py
+        lon = lon_coeffs[0] + lon_coeffs[1] * px + lon_coeffs[2] * py
+        rows.append({
+            'settlement_point': name,
+            'lat': round(float(lat), 4),
+            'lon': round(float(lon), 4),
+            'plant_name': '',
+            'match_method': 'html_contour',
+        })
+
+    print(f"HTML contour map: {len(rows)} nodes converted to lat/lon")
+    return pd.DataFrame(rows)
+
+
 def build_node_coordinates(force_rebuild=False):
     """Build a settlement point to lat/lon coordinate mapping.
 
-    Combines two coordinate sources, preferring the more authoritative one:
-    1. ERCOT KML contour map (data/rtmLmpPoints.kml) — 254 nodes with
-       authoritative coordinates directly from ERCOT. Used first.
-    2. EIA Form 860 name matching via NP4-160 — fills in remaining nodes
+    Combines three coordinate sources in priority order:
+    1. ERCOT HTML contour map (data/rtmLmp_html_source.txt) — current (2026)
+       node positions converted from pixel coords via affine transformation
+       calibrated against KML ground control points. ~253 nodes.
+    2. ERCOT KML contour map (data/rtmLmpPoints.kml) — 2019 snapshot with
+       254 nodes. Fills in any nodes not in the HTML source.
+    3. EIA Form 860 name matching via NP4-160 — fills in remaining nodes
        using prefix, substring, and fuzzy matching of substation names
        to EIA plant names.
 
@@ -178,20 +258,39 @@ def build_node_coordinates(force_rebuild=False):
     nodes = rn_df[['RESOURCE_NODE', 'UNIT_SUBSTATION']].drop_duplicates('RESOURCE_NODE')
     all_rn_names = set(nodes['RESOURCE_NODE'])
 
-    # --- Source 1: KML coordinates (authoritative, from ERCOT contour map) ---
-    kml_path = os.path.join(os.path.dirname(__file__), 'data', 'rtmLmpPoints.kml')
+    data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    kml_path = os.path.join(data_dir, 'rtmLmpPoints.kml')
+
+    # --- Source 1: HTML contour map (current, preferred) ---
+    html_path = os.path.join(data_dir, 'rtmLmp_html_source.txt')
+    html_results = pd.DataFrame()
+    if os.path.exists(html_path):
+        html_all = _parse_html_contour_map(html_path, kml_path)
+        html_results = html_all[html_all['settlement_point'].isin(all_rn_names)].copy()
+        print(f"HTML: {len(html_all)} nodes parsed, {len(html_results)} match current resource nodes")
+    else:
+        print(f"HTML file not found at {html_path}, skipping HTML source")
+
+    matched_so_far = set(html_results['settlement_point']) if len(html_results) > 0 else set()
+
+    # --- Source 2: KML coordinates (2019 snapshot, fills gaps) ---
     kml_results = pd.DataFrame()
     if os.path.exists(kml_path):
         kml_all = _parse_kml_coordinates(kml_path)
-        # Keep only nodes that appear in the current NP4-160 resource node list
-        kml_results = kml_all[kml_all['settlement_point'].isin(all_rn_names)].copy()
-        print(f"KML: {len(kml_all)} nodes parsed, {len(kml_results)} match current resource nodes")
+        # Only keep nodes NOT already matched by HTML
+        kml_new = kml_all[
+            kml_all['settlement_point'].isin(all_rn_names)
+            & ~kml_all['settlement_point'].isin(matched_so_far)
+        ].copy()
+        kml_results = kml_new
+        print(f"KML: {len(kml_all)} nodes parsed, {len(kml_results)} new matches "
+              f"(not in HTML)")
     else:
         print(f"KML file not found at {kml_path}, skipping KML source")
 
-    matched_by_kml = set(kml_results['settlement_point']) if len(kml_results) > 0 else set()
+    matched_so_far |= set(kml_results['settlement_point']) if len(kml_results) > 0 else set()
 
-    # --- Source 2: EIA 860 name matching (for nodes not covered by KML) ---
+    # --- Source 3: EIA 860 name matching (for remaining nodes) ---
     eia_file = os.path.join(dirs['raw'], 'eia860', 'texas_plants.csv')
     if not os.path.exists(eia_file):
         raise FileNotFoundError(
@@ -204,8 +303,8 @@ def build_node_coordinates(force_rebuild=False):
     eia_results = []
     for _, row in nodes.iterrows():
         rn_name = row['RESOURCE_NODE']
-        if rn_name in matched_by_kml:
-            continue  # already have authoritative KML coordinates
+        if rn_name in matched_so_far:
+            continue  # already have coordinates from HTML or KML
 
         sub = row['UNIT_SUBSTATION']
         sub_clean = _clean_substation_name(sub)
@@ -245,8 +344,8 @@ def build_node_coordinates(force_rebuild=False):
 
     eia_df = pd.DataFrame(eia_results)
 
-    # Combine: KML first (authoritative), then EIA matches
-    result_df = pd.concat([kml_results, eia_df], ignore_index=True)
+    # Combine: HTML first (current), then KML (2019), then EIA name matches
+    result_df = pd.concat([html_results, kml_results, eia_df], ignore_index=True)
 
     # Save cache
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
