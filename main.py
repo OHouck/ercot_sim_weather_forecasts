@@ -65,27 +65,38 @@ dirs = setup_directories()
 #   - unmatched_eia860_plants.csv            (EIA plants with no ERCOT match)
 # Requires Steps 4a and 4b.
 # =============================================================================
-from process_ercot import build_node_coordinates
-build_node_coordinates(force_rebuild=True)
+# from process_ercot import build_node_coordinates
+# build_node_coordinates(force_rebuild=True)
 
 # =============================================================================
-# STEP 5: Validate all downloaded data
+# STEP 5: Calculate forecast errors at weather station locations
+# Interpolates NDFD gridded forecasts to station lat/lon (nearest neighbor),
+# compares to ISD hourly observations, and saves per-station error CSVs.
+# Requires Steps 1 and 2. ~2 min.
+# =============================================================================
+# from calculate_forecast_errors import calculate_errors_for_month
+# calculate_errors_for_month(YEAR, MONTH)
+
+# =============================================================================
+# STEP 6: Validate all downloaded data
 # Checks file counts and samples each dataset for completeness.
 # =============================================================================
-from download_data.validate_data import validate_july_2025
-validate_july_2025()
+# from download_data.validate_data import validate_july_2025
+# validate_july_2025()
 
 # =============================================================================
-# STEP 6: Generate plots
+# STEP 7: Generate plots
 # Creates Texas maps of max temperature, max wind speed, and max LMP.
 # Requires Steps 2, 3, 4c.
 # =============================================================================
-# from create_plots import (
-#     plot_max_temperature_map,
-#     plot_max_wind_speed_map,
-#     plot_combined_map,
-# )
-# plot_dir = os.path.join(dirs['root'], 'plots')
+from create_plots import (
+    plot_max_temperature_map,
+    plot_max_wind_speed_map,
+    plot_combined_map,
+    plot_ercot_map,
+)
+plot_dir = os.path.join(dirs['root'], 'plots')
 # plot_max_temperature_map(YEAR, MONTH, output_path=os.path.join(plot_dir, f'max_temp_july_{YEAR}.png'))
 # plot_max_wind_speed_map(YEAR, MONTH, output_path=os.path.join(plot_dir, f'max_wind_speed_july_{YEAR}.png'))
 # plot_combined_map(YEAR, MONTH, output_path=os.path.join(plot_dir, f'combined_map_july_{YEAR}.png'))
+plot_ercot_map()

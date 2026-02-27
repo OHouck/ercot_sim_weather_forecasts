@@ -8,6 +8,7 @@ import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
+import geopandas as gpd
 from helper_funcs import setup_directories
 
 
@@ -255,6 +256,73 @@ def plot_combined_map(year=2025, month=7, output_path=None):
 
     plt.show()
     return fig, axes
+
+
+def plot_ercot_map(output_path=None):
+    """Map the simulated ERCOT grid (TX-123BT buses and lines) alongside matched settlement points.
+
+    Plots transmission lines in gray, simulation bus nodes in blue, matched
+    ERCOT settlement points (from node_coordinates.csv) in red, and weather
+    stations in green.
+
+    Args:
+        output_path: If provided, save figure to this path
+    """
+    from process_ercot import build_node_coordinates
+
+    dirs = setup_directories()
+    gis_dir = os.path.join(dirs['root'], 'Texas_GIS_Data')
+
+    buses = gpd.read_file(os.path.join(gis_dir, 'Bus', 'Bus_Output.shp'))
+    lines = gpd.read_file(os.path.join(gis_dir, 'Line', 'Line_Output.shp'))
+    node_coords = build_node_coordinates()
+    stations = load_station_metadata()
+
+    proj = ccrs.PlateCarree()
+    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw={'projection': proj})
+
+    _draw_texas(ax, proj)
+
+    # Transmission lines
+    for _, row in lines.iterrows():
+        coords = list(row.geometry.coords)
+        lons, lats = zip(*coords)
+        ax.plot(lons, lats, color='#888888', linewidth=0.6, alpha=0.5,
+                transform=proj, zorder=2)
+
+    # Simulation buses
+    ax.scatter(
+        buses['Bus_longit'], buses['Bus_latitu'],
+        c='#1f77b4', s=30, edgecolors='k', linewidths=0.4,
+        alpha=0.9, transform=proj, zorder=4, label=f'Sim buses ({len(buses)})')
+
+    # Matched settlement points
+    ax.scatter(
+        node_coords['lon'], node_coords['lat'],
+        c='#d62728', s=12, edgecolors='none',
+        alpha=0.6, transform=proj, zorder=3, marker='.',
+        label=f'Matched settlement pts ({len(node_coords)})')
+
+    # Weather stations
+    ax.scatter(
+        stations['lon'], stations['lat'],
+        c='#2ca02c', s=40, edgecolors='k', linewidths=0.4,
+        alpha=0.8, transform=proj, zorder=5, marker='^',
+        label=f'Weather stations ({len(stations)})')
+
+    ax.legend(loc='lower left', fontsize=10, framealpha=0.9)
+    ax.set_title('Simulated ERCOT Grid (TX-123BT), Settlement Points & Weather Stations', fontsize=14)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    fig.tight_layout()
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {output_path}")
+
+    plt.show()
+    return fig, ax
 
 
 if __name__ == '__main__':

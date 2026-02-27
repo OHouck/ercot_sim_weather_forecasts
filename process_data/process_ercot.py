@@ -7,6 +7,10 @@ import difflib
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
 
 

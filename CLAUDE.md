@@ -32,7 +32,8 @@ Layout:
 ├── processed_data/
 │   ├── node_coordinates.csv    # Step 4c: 544 matched nodes with lat/lon
 │   ├── unmatched_ercot_settlement_points.csv  # Unmatched ERCOT nodes for review
-│   └── unmatched_eia860_plants.csv            # Unmatched EIA plants for review
+│   ├── unmatched_eia860_plants.csv            # Unmatched EIA plants for review
+│   └── forecast_errors/2025/07/ # Step 5: Per-station forecast error CSVs + error_summary.csv
 └── plots/                      # Generated visualizations
     ├── max_temp_july_2025.png
     ├── max_wind_speed_july_2025.png
@@ -51,6 +52,7 @@ Layout:
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
 | Node coords HTML | ERCOT contour map HTML (4 pages) | No | `data/*_html_source.txt` |
 | Node coords KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
+| Forecast errors | NDFD + ISD (Steps 1+2) | No | `calculate_forecast_errors.py` |
 | Validation | All above | — | `download_data/validate_data.py` |
 
 ## Credentials
@@ -260,7 +262,44 @@ Also saves `unmatched_ercot_settlement_points.csv` and `unmatched_eia860_plants.
 
 ---
 
-## Step 5: Renewable Curtailment Data (TODO)
+## Step 5: Forecast Error Calculation (DONE)
+
+**Script**: `calculate_forecast_errors.py`
+
+Merges NDFD gridded forecasts (Step 1) with ISD station observations (Step 2) to compute per-station, per-hour forecast errors. For each weather station, the nearest NDFD grid point is found via KDTree lookup, and the forecast value is compared to the observed value.
+
+### Run
+```bash
+uv run python -c "from calculate_forecast_errors import calculate_errors_for_month; calculate_errors_for_month(2025, 7)"
+```
+
+### Key implementation details
+
+**Spatial matching**: Loads station metadata as a GeoDataFrame and builds a GeoDataFrame of the NDFD 2D lat/lon grid (~245x258 points). Uses `gpd.sjoin_nearest` (projected to EPSG:3857 for accuracy) to join each station to its nearest grid cell (mean distance ~2.3 km given the 2.5 km grid spacing).
+
+**Temporal matching**: Station observations are rounded to the nearest hour. Only observations at the top of each hour are kept (the observation closest to :00 is selected when multiple exist within the hour).
+
+**Variables compared**:
+- Temperature: NDFD `t2m` (Kelvin → °C) vs ISD `TMP` field (°C)
+- Wind speed: NDFD `si10` (m/s) vs ISD `WND` speed component (m/s)
+- Wind direction: NDFD `wdir10` (degrees) vs ISD `WND` direction component (degrees)
+
+**Error definition**: `error = forecast - observed` (positive = forecast too high)
+
+### Output
+- Per-station CSVs: `{processed}/forecast_errors/{year}/{month:02d}/{station_id}.csv`
+  - Columns: station_id, valid_time, lead_hours, forecast_temp, observed_temp, temp_error, forecast_wspd, observed_wspd, wspd_error, forecast_wdir, observed_wdir, wdir_error
+- Summary: `{processed}/forecast_errors/{year}/{month:02d}/error_summary.csv`
+  - Per-station, per-lead-time MAE and bias for temp and wind speed
+
+### Results for July 2025
+- 202 stations processed, 404 summary rows (2 lead times × 202 stations)
+- Lead 1h: Temp MAE 1.04°C (bias +0.16), Wind MAE 1.19 m/s (bias +0.08)
+- Lead 25h: Temp MAE 1.12°C (bias +0.21), Wind MAE 1.24 m/s (bias +0.03)
+
+---
+
+## Step 6: Renewable Curtailment Data (TODO)
 
 ERCOT publishes 60-Day SCED Disclosure with individual unit output and HSL. Curtailment = HSL - actual output for renewables.
 - Source: https://www.ercot.com/mp/data-products/data-product-details?id=NP3-966-ER
@@ -295,6 +334,9 @@ uv run python -m download_data.pull_np4160
 uv run python -m download_data.pull_eia860
 uv run python -c "from process_ercot import build_node_coordinates; build_node_coordinates(force_rebuild=True)"
 
+# Step 5: Forecast errors (~2 min, requires Steps 1+2)
+uv run python -c "from calculate_forecast_errors import calculate_errors_for_month; calculate_errors_for_month(2025, 7)"
+
 # Validate
 uv run python -m download_data.validate_data
 
@@ -305,6 +347,15 @@ uv run python create_plots.py
 ---
 
 ## Processing & Visualization Scripts
+
+### `calculate_forecast_errors.py`
+Functions for computing NDFD forecast errors at weather station locations:
+- `calculate_errors_for_month(year, month)` — main entry point: loads NDFD grids and ISD observations, computes per-station errors, saves CSVs
+- `load_stations_gdf(raw_dir)` — loads station metadata as a GeoDataFrame with Point geometry
+- `load_all_observations(stations_gdf, year, month, raw_dir)` — loads and resamples all stations' ISD data to hourly
+- `build_ndfd_grid_gdf(sample_nc_path)` — builds GeoDataFrame of NDFD grid points for spatial join
+- `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` to match each station to its nearest grid cell
+- `load_ndfd_forecasts(element_dir, variable_name, year, month)` — loads all NDFD NetCDF files for one element into memory
 
 ### `process_ercot.py`
 Functions for reading and processing ERCOT market data:
