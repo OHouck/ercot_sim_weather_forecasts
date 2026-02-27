@@ -142,37 +142,58 @@ def _parse_kml_coordinates(kml_path):
     return pd.DataFrame(rows)
 
 
-def _parse_html_contour_map(html_path, kml_path=None):
-    """Parse ERCOT RTM LMP contour map HTML to extract node coordinates.
-
-    The HTML contains an image map with pixel coordinates for each node on a
-    600x600 PNG. This function converts pixel coords to lat/lon using an affine
-    transformation calibrated against known KML coordinates.
-
-    If a KML file is provided, uses nodes common to both sources as ground
-    control points. Otherwise uses hardcoded coefficients derived from the
-    Feb 2026 HTML + 2019 KML pair.
+def _extract_html_image_map_nodes(html_text):
+    """Extract node names and pixel coordinates from an ERCOT contour map HTML.
 
     Args:
-        html_path: Path to the HTML source file
+        html_text: Raw HTML string containing <area> tags
+
+    Returns:
+        dict mapping node name -> (x, y) pixel coordinates
+    """
+    nodes = {}
+    for m in re.finditer(
+        r'<area\s+shape="circle"\s+coords="(\d+),(\d+),\d+"\s+title="([^:]+):', html_text
+    ):
+        x, y, name = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        nodes[name] = (x, y)
+    return nodes
+
+
+def _parse_html_contour_maps(html_paths, kml_path=None):
+    """Parse ERCOT contour map HTML files to extract node coordinates.
+
+    ERCOT serves four live contour map pages, each with ~253 nodes on a
+    600x600 PNG image map. Different pages show different subsets of nodes,
+    yielding ~295 unique nodes when combined. Pixel coordinates are converted
+    to lat/lon via an affine transformation calibrated against the 2019 KML.
+
+    Args:
+        html_paths: List of paths to HTML source files (or single path string)
         kml_path: Optional path to KML file for calibrating the transformation
 
     Returns:
         DataFrame with columns: settlement_point, lat, lon, plant_name, match_method
     """
-    with open(html_path) as f:
-        html = f.read()
+    if isinstance(html_paths, str):
+        html_paths = [html_paths]
 
-    # Extract pixel coordinates and node names from <area> tags
+    # Combine nodes from all HTML files (first occurrence wins)
     html_nodes = {}
-    for m in re.finditer(
-        r'<area\s+shape="circle"\s+coords="(\d+),(\d+),\d+"\s+title="([^:]+):', html
-    ):
-        x, y, name = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-        html_nodes[name] = (x, y)
+    for path in html_paths:
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            page_nodes = _extract_html_image_map_nodes(f.read())
+        for name, coords in page_nodes.items():
+            if name not in html_nodes:
+                html_nodes[name] = coords
 
     if not html_nodes:
         return pd.DataFrame()
+
+    print(f"HTML contour maps: {len(html_nodes)} unique nodes from "
+          f"{len(html_paths)} pages")
 
     # Fit affine transformation using KML ground control points
     if kml_path and os.path.exists(kml_path):
@@ -190,10 +211,9 @@ def _parse_html_contour_map(html_path, kml_path=None):
 
             lat_coeffs, _, _, _ = np.linalg.lstsq(A, lat_vec, rcond=None)
             lon_coeffs, _, _, _ = np.linalg.lstsq(A, lon_vec, rcond=None)
-            print(f"HTML contour map: fitted affine transform from {len(common)} "
-                  f"ground control points")
+            print(f"  Affine transform fitted from {len(common)} ground control points")
         else:
-            print(f"WARNING: Only {len(common)} common nodes, using hardcoded coefficients")
+            print(f"  WARNING: Only {len(common)} common nodes, using hardcoded coefficients")
             lat_coeffs = np.array([36.796687, 0.000005, -0.018760])
             lon_coeffs = np.array([-107.009848, 0.023113, -0.000004])
     else:
@@ -214,7 +234,6 @@ def _parse_html_contour_map(html_path, kml_path=None):
             'match_method': 'html_contour',
         })
 
-    print(f"HTML contour map: {len(rows)} nodes converted to lat/lon")
     return pd.DataFrame(rows)
 
 
@@ -261,15 +280,21 @@ def build_node_coordinates(force_rebuild=False):
     data_dir = os.path.join(os.path.dirname(__file__), 'data')
     kml_path = os.path.join(data_dir, 'rtmLmpPoints.kml')
 
-    # --- Source 1: HTML contour map (current, preferred) ---
-    html_path = os.path.join(data_dir, 'rtmLmp_html_source.txt')
+    # --- Source 1: HTML contour maps (current, preferred) ---
+    # ERCOT serves 4 contour map pages with overlapping but different node sets
+    html_files = [
+        os.path.join(data_dir, f)
+        for f in ['rtmLmp_html_source.txt', 'rtmSpp_html_source.txt',
+                   'damSpp2_html_source.txt', 'damSpp7_html_source.txt']
+        if os.path.exists(os.path.join(data_dir, f))
+    ]
     html_results = pd.DataFrame()
-    if os.path.exists(html_path):
-        html_all = _parse_html_contour_map(html_path, kml_path)
+    if html_files:
+        html_all = _parse_html_contour_maps(html_files, kml_path)
         html_results = html_all[html_all['settlement_point'].isin(all_rn_names)].copy()
         print(f"HTML: {len(html_all)} nodes parsed, {len(html_results)} match current resource nodes")
     else:
-        print(f"HTML file not found at {html_path}, skipping HTML source")
+        print("No HTML contour map files found, skipping HTML source")
 
     matched_so_far = set(html_results['settlement_point']) if len(html_results) > 0 else set()
 
