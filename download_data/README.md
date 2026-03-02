@@ -44,11 +44,16 @@ Both groups produce forecasts valid at the same 3-hourly synoptic times (00, 03,
 
 ### Current Download Configuration
 
-We download **only Group B files** because they contain both target lead times:
-- **1-hour lead time**: direct short-range forecast
-- **25-hour lead time**: closest available to 24h (~1 day ahead)
+We download **one 12Z Group A file per day** and keep all 3-hourly steps up to 48h lead time. This gives ~16 steps per file (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47h).
 
-This skips Group A issuance hours (00, 03, 06, 09, 12, 15, 18, 21 UTC), reducing downloads by ~1/3.
+For a given valid_time, two 12Z initializations may cover it:
+- **Same-day** (lead < 24h): the 12Z init from the same calendar day
+- **Day-ahead** (lead >= 24h): the 12Z init from the previous day
+
+This enables comparing same-day vs day-ahead forecast errors at each valid time.
+
+#### Legacy configuration
+The legacy approach downloaded all Group B files (16 per day) keeping only 1h and 25h lead times. Use `download_and_extract_texas_month()` for the legacy approach.
 
 ### Elements Downloaded
 
@@ -113,19 +118,18 @@ YEUZ88_KWBN_YYYYMMDDHHMM
 | T | Guam / Pacific Islands |
 | Y | Oceanic (wind only) |
 
-### Local Output Structure (Texas Extraction)
+### Local Output Structure (12Z Texas Extraction)
 
-After running `pull_ndfd.py`, data is saved as:
+After running `pull_ndfd.py`, data is saved as one file per day:
 
 ```
 {data_dir}/ndfd_data/
 ├── temp/
 │   ├── 2025/
-│   │   ├── 01/
-│   │   │   ├── YEUZ88_KWBN_202501010147_texas.nc
-│   │   │   ├── YEUZ88_KWBN_202501010247_texas.nc
-│   │   │   └── ...
-│   │   ├── 02/
+│   │   ├── 07/
+│   │   │   ├── ndfd_12z_20250701.nc
+│   │   │   ├── ndfd_12z_20250702.nc
+│   │   │   └── ...  (31 files for July)
 │   │   └── ...
 ├── wspd/
 ├── wdir/
@@ -134,21 +138,21 @@ After running `pull_ndfd.py`, data is saved as:
 
 ## NetCDF File Structure
 
-Each extracted `*_texas.nc` file contains:
+Each extracted `ndfd_12z_*.nc` file contains:
 
 ### Dimensions
 | Dimension | Description |
 |-----------|-------------|
-| `step` | Forecast lead time steps (2 steps: 1h and 25h) |
+| `step` | Forecast lead time steps (~16 steps: 2h, 5h, 8h, ..., 47h) |
 | `y` | Grid y-coordinate (~490 points for Texas) |
 | `x` | Grid x-coordinate (~516 points for Texas) |
 
 ### Coordinates
 | Coordinate | Type | Description |
 |------------|------|-------------|
-| `time` | datetime64 | Forecast initialization time (UTC) |
-| `step` | timedelta64 | Lead time from initialization (1h, 25h) |
-| `valid_time` | datetime64 | Valid time for each forecast step |
+| `time` | datetime64 | Forecast initialization time (12Z UTC) |
+| `step` | timedelta64 | Lead time from initialization (2h to 47h, 3-hourly) |
+| `valid_time` | datetime64 | Valid time for each forecast step = time + step |
 | `latitude` | float64 (y, x) | 2D latitude array (Lambert Conformal) |
 | `longitude` | float64 (y, x) | 2D longitude array (converted to -180 to 180) |
 | `heightAboveGround` | float64 | Height of measurement (2m for temperature) |
@@ -157,31 +161,27 @@ Each extracted `*_texas.nc` file contains:
 | Variable | Units | Description |
 |----------|-------|-------------|
 | `t2m` | Kelvin | 2m temperature forecast (for temp element) |
+| `si10` | m/s | 10m wind speed forecast (for wspd element) |
+| `wdir10` | degrees | 10m wind direction forecast (for wdir element) |
 
 ### Example: Reading the Data
 
 ```python
 import xarray as xr
 
-# Open a single file
-ds = xr.open_dataset("ndfd_data/temp/2025/01/YEUZ88_KWBN_202501010147_texas.nc")
+# Open a single 12Z file
+ds = xr.open_dataset("ndfd_data/temp/2025/07/ndfd_12z_20250715.nc")
 
 # Access temperature data (in Kelvin)
-temp_kelvin = ds.t2m.values  # shape: (2, ~490, ~516) for 2 lead times
+temp_kelvin = ds.t2m.values  # shape: (~16, ~490, ~516)
 
-# Convert to Fahrenheit
-temp_fahrenheit = (ds.t2m - 273.15) * 9/5 + 32
+# Get lead times (3-hourly: 2, 5, 8, ..., 47h)
+print(f"Lead times: {ds.step.values}")
 
-# Get lead times
-print(f"Lead times: {ds.step.values}")  # [1h, 25h]
-
-# Get coordinates
-lat = ds.latitude.values  # 2D array
-lon = ds.longitude.values  # 2D array
-
-# Get forecast times
-print(f"Forecast issued: {ds.time.values}")
-print(f"Valid times: {ds.valid_time.values}")
+# Compute valid times
+init_time = ds.time.values
+valid_times = init_time + ds.step.values
+print(f"Init: {init_time}, Valid: {valid_times}")
 
 ds.close()
 ```
@@ -208,24 +208,36 @@ The extraction uses these geographic bounds:
 
 ## Usage
 
-### Download Full Year of Data
+### Download 12Z Forecasts for a Single Month
 
 ```python
-from download_ndfd.pull_ndfd import download_year_data
+from download_data.pull_ndfd import download_12z_forecasts_month
+from helper_funcs import setup_directories
+import os
 
-# Download temp, wspd, wdir for 2025, extracting only Texas
+dirs = setup_directories()
+base_dir = os.path.join(dirs['raw'], 'ndfd_data')
+for element in ['temp', 'wspd', 'wdir']:
+    download_12z_forecasts_month(element, 2025, 7, base_dir)
+```
+
+### Download Full Year of 12Z Data
+
+```python
+from download_data.pull_ndfd import download_year_data
+
 download_year_data(
     year=2025,
     elements=['temp', 'wspd', 'wdir'],
     base_dir='/path/to/output',
-    texas_only=True
+    init_12z=True  # default
 )
 ```
 
-### Download Single Month
+### Legacy: Download All Group B Issuances
 
 ```python
-from download_ndfd.pull_ndfd import download_and_extract_texas_month
+from download_data.pull_ndfd import download_and_extract_texas_month
 
 download_and_extract_texas_month(
     element='temp',
@@ -235,27 +247,13 @@ download_and_extract_texas_month(
 )
 ```
 
-### Plot Forecast Map
-
-```python
-from download_ndfd.pull_ndfd import plot_texas_temp_forecast
-
-# Plot in Fahrenheit
-plot_texas_temp_forecast(
-    nc_file='path/to/texas_data.nc',
-    step_index=0,  # 1h lead time
-    output_file='forecast_map.png',
-    units='F'
-)
-```
-
 ## Data Availability
 
 - **Start**: ~2020 (varies by element)
 - **End**: Current (updated continuously)
-- **Download frequency**: ~16 Group B issuances per day
-- **Lead times extracted**: 1h, 25h
-- **Forecast range in files**: Up to 72h (Days 1-3), but only 1h and 25h steps are kept
+- **Download frequency**: 1 file per day (12Z initialization)
+- **Lead times extracted**: All 3-hourly steps from 2h to 47h (~16 steps)
+- **Forecast range in files**: Up to 72h (Days 1-3), but only steps up to 48h are kept
 
 ## Dependencies
 
@@ -276,4 +274,6 @@ plot_texas_temp_forecast(
 
 4. **Temporary storage**: During download, full CONUS files are downloaded to a temp directory, Texas is extracted, then the temp files are deleted automatically.
 
-5. **Lead time tolerance**: When matching target lead times, a 30-minute tolerance is used. Steps within 30 minutes of 1h or 25h are accepted.
+5. **12Z file selection**: The download finds the file closest to 12:00 UTC within a 2-hour window (11:00-13:00). Exact issuance minutes vary slightly day to day.
+
+6. **Same-day vs day-ahead**: A valid_time at e.g. 17 UTC can be reached by two 12Z forecasts: same-day (lead=5h) and day-ahead from the previous day (lead=29h). The downstream `calculate_forecast_errors.py` handles both via the `(valid_time, lead_hours)` index.

@@ -20,14 +20,16 @@ ELEMENT_WMO_CODES = {
     'wdir': 'B',
 }
 
-# Target lead times to extract from each forecast file (hours)
-# Note: Z88 files are 3-hourly starting at step=1h or step=2h.
-# No file has an exact 24h step; 25h is the closest from Group B files.
-TARGET_LEAD_HOURS = [1, 25]
+# Maximum lead time (hours) to retain from each forecast file.
+# Group A 12Z files have 3-hourly steps: 2, 5, 8, ..., 47h covers 48h.
+MAX_LEAD_HOURS = 48
 
-# Group A issuance hours (steps start at 2h: 2,5,8,...,23,26,...)
-# Group B issuance hours (steps start at 1h: 1,4,7,...,22,25,...)
-# We only want Group B since it has both 1h and 25h steps.
+# Target initialization hours (UTC) to download.
+# 12 UTC is a Group A issuance (steps start at 2h: 2, 5, 8, ..., 71).
+TARGET_INIT_HOURS = [12]
+
+# Legacy constants kept for backward compatibility with old download path
+TARGET_LEAD_HOURS = [1, 25]
 GROUP_A_HOURS = {0, 3, 6, 9, 12, 15, 18, 21}
 
 def check_data_availability(element='maxt', start_year=2020, end_year=2025):
@@ -52,7 +54,8 @@ def check_data_availability(element='maxt', start_year=2020, end_year=2025):
         else:
             print(f"{year}: No data")
 
-def extract_texas_from_grib(grib_file, output_dir, target_lead_hours=None):
+def extract_texas_from_grib(grib_file, output_dir, target_lead_hours=None,
+                            max_lead_hours=None, output_filename=None):
     """Extract Texas bounding box from CONUS GRIB2 file and save as NetCDF.
 
     Handles Lambert Conformal projection with 2D lat/lon arrays.
@@ -61,7 +64,11 @@ def extract_texas_from_grib(grib_file, output_dir, target_lead_hours=None):
     Args:
         grib_file: Path to the GRIB2 file
         output_dir: Directory to save extracted NetCDF files
-        target_lead_hours: List of lead times (hours) to keep. If None, keeps all steps.
+        target_lead_hours: List of exact lead times (hours) to keep. If None, keeps all steps.
+        max_lead_hours: Maximum lead time (hours) to keep. Keeps all steps <= this value.
+            Mutually exclusive with target_lead_hours.
+        output_filename: Override output filename (without directory). If None, uses
+            grib_file stem + '_texas.nc'.
     """
     # Texas bounds
     lat_min, lat_max = 25.8, 36.5
@@ -71,8 +78,19 @@ def extract_texas_from_grib(grib_file, output_dir, target_lead_hours=None):
         # Open with xarray + cfgrib
         ds = xr.open_dataset(str(grib_file), engine='cfgrib')
 
-        # Filter to target lead times if specified
-        if target_lead_hours is not None and 'step' in ds.dims:
+        # Filter steps by max lead time (new approach: keep all steps up to max)
+        if max_lead_hours is not None and 'step' in ds.dims:
+            max_td = np.timedelta64(max_lead_hours, 'h')
+            available_steps = ds.step.values
+            keep_steps = available_steps[available_steps <= max_td]
+            if len(keep_steps) == 0:
+                print(f"  - Skipping {grib_file.name}: no steps within {max_lead_hours}h")
+                ds.close()
+                return None
+            ds = ds.sel(step=keep_steps)
+
+        # Filter to exact target lead times (legacy approach)
+        elif target_lead_hours is not None and 'step' in ds.dims:
             target_steps = [np.timedelta64(h, 'h') for h in target_lead_hours]
             available_steps = ds.step.values
             # Keep only steps that match a target (within 30 min tolerance)
@@ -136,7 +154,10 @@ def extract_texas_from_grib(grib_file, output_dir, target_lead_hours=None):
         )
 
         # Create output filename
-        output_file = os.path.join(output_dir, grib_file.stem + '_texas.nc')
+        if output_filename:
+            output_file = os.path.join(output_dir, output_filename)
+        else:
+            output_file = os.path.join(output_dir, grib_file.stem + '_texas.nc')
 
         # Save as compressed NetCDF
         encoding = {var: {'zlib': True, 'complevel': 5}
@@ -249,13 +270,148 @@ def download_and_extract_texas_month(element, year, month, base_dir):
 
     return True
 
-def download_year_data(year, elements, base_dir, texas_only=True):
-    """Download data for an entire year, optionally extracting only Texas"""
-    
+def _find_best_12z_file(filenames):
+    """From a list of Z88 filenames, find the one closest to 12:00 UTC.
+
+    Parses the YYYYMMDDHHMM timestamp from each filename and returns the
+    filename whose issuance time is closest to 12:00 UTC (within a 2-hour
+    window: 11:00-13:00). Returns None if no file falls in that window.
+    """
+    best_file = None
+    best_dist = None
+
+    for filename in filenames:
+        try:
+            timestamp_str = filename.split('_')[-1]  # e.g. "202507011147"
+            hh = int(timestamp_str[8:10])
+            mm = int(timestamp_str[10:12])
+            minutes_from_noon = abs((hh * 60 + mm) - 12 * 60)
+            if minutes_from_noon <= 120 and (best_dist is None or minutes_from_noon < best_dist):
+                best_dist = minutes_from_noon
+                best_file = filename
+        except (ValueError, IndexError):
+            continue
+
+    return best_file
+
+
+def download_12z_forecasts_month(element, year, month, base_dir):
+    """Download one 12Z NDFD Z88 file per day, extract Texas with all steps up to 48h.
+
+    For each day in the month, finds the CONUS Z88 file closest to 12:00 UTC,
+    downloads it, extracts the Texas bounding box keeping all 3-hourly forecast
+    steps up to MAX_LEAD_HOURS, and saves as a compressed NetCDF.
+
+    Output files: {base_dir}/{element}/{year}/{month:02d}/ndfd_12z_{YYYYMMDD}.nc
+    Each file contains ~16 steps (2, 5, 8, ..., 47h) with the full Texas grid.
+    """
+    wmo_code = ELEMENT_WMO_CODES.get(element)
+    if wmo_code is None:
+        print(f"  Unknown element '{element}' - no WMO code mapping")
+        return False
+
+    conus_prefix = f"Y{wmo_code}UZ88"
+
+    output_dir = os.path.join(base_dir, element, str(year), f"{month:02d}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_days = calendar.monthrange(year, month)[1]
+    total_successful = 0
+    total_skipped = 0
+
+    for day in range(1, num_days + 1):
+        output_filename = f"ndfd_12z_{year}{month:02d}{day:02d}.nc"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Skip if already downloaded
+        if os.path.exists(output_path):
+            total_successful += 1
+            continue
+
+        s3_day_path = f"s3://noaa-ndfd-pds/wmo/{element}/{year}/{month:02d}/{day:02d}/"
+
+        # List files for this day
+        list_cmd = ["aws", "s3", "ls", "--no-sign-request", s3_day_path]
+        list_result = subprocess.run(list_cmd, capture_output=True, text=True)
+
+        if list_result.returncode != 0 or not list_result.stdout.strip():
+            print(f"  {year}-{month:02d}-{day:02d}: no files on S3")
+            total_skipped += 1
+            continue
+
+        # Collect CONUS Z88 filenames
+        conus_files = []
+        for line in list_result.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 4:
+                filename = parts[-1]
+                if filename.startswith(conus_prefix):
+                    conus_files.append(filename)
+
+        # Find file closest to 12:00 UTC
+        best_file = _find_best_12z_file(conus_files)
+        if best_file is None:
+            print(f"  {year}-{month:02d}-{day:02d}: no 12Z file found")
+            total_skipped += 1
+            continue
+
+        # Download and extract
+        with tempfile.TemporaryDirectory() as temp_dir:
+            s3_file = f"{s3_day_path}{best_file}"
+            local_file = os.path.join(temp_dir, best_file)
+
+            cp_cmd = [
+                "aws", "s3", "cp", "--no-sign-request",
+                s3_file, local_file
+            ]
+            cp_result = subprocess.run(cp_cmd, capture_output=True, text=True)
+
+            if cp_result.returncode != 0:
+                print(f"  {year}-{month:02d}-{day:02d}: download failed for {best_file}")
+                total_skipped += 1
+                continue
+
+            result = extract_texas_from_grib(
+                Path(local_file), output_dir,
+                max_lead_hours=MAX_LEAD_HOURS,
+                output_filename=output_filename,
+            )
+            if result:
+                print(f"  {year}-{month:02d}-{day:02d}: extracted from {best_file}")
+                total_successful += 1
+            else:
+                total_skipped += 1
+
+    print(f"\n  {element} {year}-{month:02d}: "
+          f"{total_successful} extracted, {total_skipped} skipped")
+    print(f"  Max lead time: {MAX_LEAD_HOURS}h")
+    print(f"  Saved to: {output_dir}")
+
+    nc_files = list(Path(output_dir).glob("ndfd_12z_*.nc"))
+    if nc_files:
+        texas_size_mb = sum(f.stat().st_size for f in nc_files) / (1024 * 1024)
+        print(f"  NetCDF files: {len(nc_files)} files, {texas_size_mb:.1f} MB")
+
+    return True
+
+
+def download_year_data(year, elements, base_dir, texas_only=True, init_12z=True):
+    """Download data for an entire year.
+
+    Args:
+        year: Year to download
+        elements: List of element names (e.g., ['temp', 'wspd', 'wdir'])
+        base_dir: Base output directory
+        texas_only: If True, extract Texas bounding box (ignored when init_12z=True)
+        init_12z: If True (default), download only 12Z initializations with all
+            steps up to MAX_LEAD_HOURS. If False, use the legacy Group B approach.
+    """
     for element in elements:
         print(f"\n=== Processing {element} for {year} ===")
         for month in range(1, 13):
-            if texas_only:
+            if init_12z:
+                download_12z_forecasts_month(element, year, month, base_dir)
+            elif texas_only:
                 download_and_extract_texas_month(element, year, month, base_dir)
             else:
                 download_ndfd_month(element, year, month, base_dir)
@@ -380,66 +536,47 @@ def plot_texas_temp_forecast(nc_file, step_index=0, output_file=None, units='F')
 
 def main():
     dirs = setup_directories()
-    
+
     # Configuration
     year = 2025
-    texas_only = True  # Set to False if you want full CONUS files instead
-    
-    # Elements to download (CONUS Z88 product, ~hourly issuance, lead times 1h & 24h)
     elements = [
         'temp',      # Temperature (instantaneous 2m)
         'wspd',      # Wind speed (10m)
         'wdir',      # Wind direction (10m)
     ]
-    
+
     output_dir = os.path.join(dirs['raw'], 'ndfd_data')
-    download = True 
 
-    if download:
-        print(f"Starting download for {year}")
-        print(f"Output directory: {output_dir}")
-        print(f"Elements: {', '.join(elements)}")
-        print(f"Product: CONUS 2.5km Z88, Group B only (skip 00/03/06/.../21 UTC)")
-        print(f"Lead times: {TARGET_LEAD_HOURS}h (1h and ~24h)")
-        print(f"Texas extraction: {'ENABLED' if texas_only else 'DISABLED (full CONUS)'}")
-        print(f"\nExpected data: Jan-{datetime.now().strftime('%b')} {year}")
-        
-        # Confirm before starting
-        response = input("\nProceed with download? (yes/no): ")
-        if response.lower() not in ['yes', 'y']:
-            print("Download cancelled.")
-            return
-        
-        download_year_data(year, elements, output_dir, texas_only=texas_only)
-        
-        print("\n=== Download Complete ===")
-        print(f"Data saved to: {output_dir}")
-        
-        # Show summary
-        print("\nSummary:")
-        for element in elements:
-            element_dir = os.path.join(output_dir, element, str(year))
-            if os.path.exists(element_dir):
-                total_files = sum(len(files) for _, _, files in os.walk(element_dir))
-                total_size_mb = sum(
-                    os.path.getsize(os.path.join(dirpath, filename))
-                    for dirpath, _, filenames in os.walk(element_dir)
-                    for filename in filenames
-                ) / (1024 * 1024)
-                print(f"  {element}: {total_files} files, {total_size_mb:.1f} MB")
+    print(f"Starting 12Z download for {year}")
+    print(f"Output directory: {output_dir}")
+    print(f"Elements: {', '.join(elements)}")
+    print(f"Product: CONUS 2.5km Z88, 12Z initialization only")
+    print(f"Max lead time: {MAX_LEAD_HOURS}h (all 3-hourly steps up to 48h)")
+    print(f"Texas extraction: ENABLED")
+    print(f"\nExpected data: Jan-{datetime.now().strftime('%b')} {year}")
 
-    # plot example forecast
-    example_element = 'temp'
-    example_month = 1
-    example_nc_dir = os.path.join(output_dir, example_element, str(year), f"{example_month:02d}")
-    print(example_nc_dir)
-    example_nc_files = list(Path(example_nc_dir).glob("*_texas.nc"))
-    num_files = len(example_nc_files)
-    print(f"\nFound {num_files} example Texas NetCDF files for {example_element}")
-    if example_nc_files:
-        example_nc_file = example_nc_files[0]
-        print(f"\nPlotting example forecast from: {example_nc_file}")
-        plot_texas_temp_forecast(example_nc_file, step_index=0, output_file=None, units='F')
+    response = input("\nProceed with download? (yes/no): ")
+    if response.lower() not in ['yes', 'y']:
+        print("Download cancelled.")
+        return
+
+    download_year_data(year, elements, output_dir, init_12z=True)
+
+    print("\n=== Download Complete ===")
+    print(f"Data saved to: {output_dir}")
+
+    # Show summary
+    print("\nSummary:")
+    for element in elements:
+        element_dir = os.path.join(output_dir, element, str(year))
+        if os.path.exists(element_dir):
+            total_files = sum(len(files) for _, _, files in os.walk(element_dir))
+            total_size_mb = sum(
+                os.path.getsize(os.path.join(dirpath, filename))
+                for dirpath, _, filenames in os.walk(element_dir)
+                for filename in filenames
+            ) / (1024 * 1024)
+            print(f"  {element}: {total_files} files, {total_size_mb:.1f} MB")
 
     
 
