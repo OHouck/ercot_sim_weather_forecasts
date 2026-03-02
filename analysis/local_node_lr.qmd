@@ -285,6 +285,28 @@ available_vars = [v for v in key_vars if v in df.columns]
 print(df[available_vars].describe())
 ```
 
+```{python}
+# extract just the hour from the datetime column
+df['hour_of_day'] = df['hour'].dt.hour
+
+
+# filter the dataframe into two: one with missing temp_error_1h and one with non-missing temp_error_1h
+missing_temp_1h = df[df['temp_error_1h'].isna()]
+non_missing_temp_1h = df[df['temp_error_1h'].notna()]
+
+
+missing_tab = missing_temp_1h['hour_of_day'].value_counts()
+non_missing_tab = non_missing_temp_1h['hour_of_day'].value_counts()
+
+# print(missing_tab)
+print(non_missing_tab)
+
+
+
+
+
+```
+
 ## Prepare Clean Analysis Sample
 
 ```{python}
