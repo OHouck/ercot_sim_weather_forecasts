@@ -420,7 +420,6 @@ def main():
     print(f"Product: CONUS 2.5km Z88, 12Z initialization only")
     print(f"Max lead time: {MAX_LEAD_HOURS}h (all 3-hourly steps up to 48h)")
     print(f"Texas extraction: ENABLED")
-    print(f"\nExpected data: Jan-{datetime.now().strftime('%b')} {year}")
 
     response = input("\nProceed with download? (yes/no): ")
     if response.lower() not in ['yes', 'y']:

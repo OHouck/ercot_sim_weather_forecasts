@@ -1,14 +1,21 @@
 """calculate_forecast_errors.py — Compute forecast errors at weather station locations.
 
-Merges NDFD gridded weather forecasts with ISD weather station observations.
-For each forecast file, loads the gridded xarray dataset and uses xarray's
-nearest-neighbor selection to extract forecast values at station coordinates
-(loaded as a GeoDataFrame). Computes forecast error = forecast - observed.
+Merges gridded weather forecasts (NDFD or HRRR) with ISD weather station
+observations. For each forecast file, loads the gridded xarray dataset and
+uses a spatial join to extract forecast values at station coordinates (loaded
+as a GeoDataFrame). Computes forecast error = forecast - observed.
+
+Supports two forecast models:
+  - NDFD (2.5km): calculate_ndfd_errors_for_month()
+  - HRRR (3km):   calculate_hrrr_errors_for_month()
+
+Each model writes to its own output directory. The shared error computation
+logic is in _compute_and_save_errors().
 
 Only keeps station observations at the top of each hour (rounding to nearest hour)
 to match the hourly forecast valid times.
 
-Output: One CSV per station in {processed}/forecast_errors/{year}/{month:02d}/
+Output: One CSV per station in {processed}/forecast_errors/{model}/{year}/{month:02d}/
 with columns: station_id, valid_time, lead_hours, forecast_temp, observed_temp,
               temp_error, forecast_wspd, observed_wspd, wspd_error,
               forecast_wdir, observed_wdir, wdir_error
@@ -37,6 +44,21 @@ def parse_wnd_direction(wnd_str):
     if len(parts) < 1 or parts[0] == '999':
         return None
     return int(parts[0])
+
+
+def circular_angular_error(fc_wdir, obs_wdir):
+    """Compute the shortest angular distance between two wind directions (0-360°).
+    
+    Returns the error in degrees, always in range [0, 180].
+    E.g., difference between 5° and 350° is 15°, not 345°.
+    """
+    if np.isnan(fc_wdir) or obs_wdir is None:
+        return np.nan
+    diff = abs(fc_wdir - obs_wdir)
+    # Take the shorter arc around the circle
+    if diff > 180:
+        diff = 360 - diff
+    return diff
 
 
 def load_stations_gdf(raw_dir):
@@ -88,9 +110,10 @@ def load_all_observations(stations_gdf, year, month, raw_dir):
     return obs_dict
 
 
-def build_ndfd_grid_gdf(sample_nc_path):
-    """Build a GeoDataFrame of NDFD grid points from a sample NetCDF file.
+def build_forecast_grid_gdf(sample_nc_path):
+    """Build a GeoDataFrame of forecast grid points from a sample NetCDF file.
 
+    Works for any 2D lat/lon grid (NDFD, HRRR, etc.).
     Each row is one grid cell with its (y, x) index and lat/lon as a Point geometry.
     Used for spatial join against station points.
 
@@ -116,8 +139,9 @@ def build_ndfd_grid_gdf(sample_nc_path):
 
 
 def spatial_join_stations_to_grid(stations_gdf, grid_gdf):
-    """Spatially join each station to its nearest NDFD grid point.
+    """Spatially join each station to its nearest forecast grid point.
 
+    Works for any forecast grid (NDFD, HRRR, etc.).
     Projects to EPSG:3857 (meters) for accurate nearest-neighbor distance,
     then returns results in the original CRS.
 
@@ -137,8 +161,11 @@ def spatial_join_stations_to_grid(stations_gdf, grid_gdf):
     return joined[['station_id', 'y_idx', 'x_idx', 'dist_m']].reset_index(drop=True)
 
 
-def load_ndfd_forecasts(element_dir, variable_name, year, month):
-    """Load all NDFD forecast files for one element and extract metadata.
+def load_forecasts(element_dir, variable_name, year, month):
+    """Load all forecast NetCDF files for one element and extract metadata.
+
+    Works for both NDFD (multiple steps per file) and HRRR (single step per file).
+    Handles step as either a dimension or a scalar coordinate.
 
     Returns a list of dicts with keys:
         issuance_time, valid_time, lead_hours, data (2D array)
@@ -173,56 +200,34 @@ def load_ndfd_forecasts(element_dir, variable_name, year, month):
     return records
 
 
-def calculate_errors_for_month(year, month):
-    """Calculate forecast errors at all weather stations for a given month.
+def _compute_and_save_errors(
+    temp_forecasts, wspd_forecasts, wdir_forecasts,
+    station_grid_map, obs_dict, stations_gdf,
+    out_dir, model_name,
+):
+    """Compute forecast errors at station locations and save CSVs.
 
-    1. Load station locations as a GeoDataFrame
-    2. Build a GeoDataFrame of the NDFD grid and spatially join stations to
-       their nearest grid cell
-    3. Load all NDFD forecasts and ISD observations
-    4. For each station and matching forecast valid time, compute error
-    5. Save per-station CSVs and a summary CSV
+    This is the shared core logic used by both calculate_ndfd_errors_for_month()
+    and calculate_hrrr_errors_for_month(). It receives already-loaded forecast
+    records and the station-to-grid mapping, then:
+      1. Indexes forecasts by (valid_time, lead_hours)
+      2. For each station, matches forecast grid values to observations
+      3. Computes error = forecast - observed
+      4. Saves per-station CSVs and a summary CSV
 
-    Returns summary DataFrame with per-station error statistics.
+    Args:
+        temp_forecasts: List of forecast record dicts from load_forecasts() for temperature.
+        wspd_forecasts: Same for wind speed.
+        wdir_forecasts: Same for wind direction.
+        station_grid_map: DataFrame with station_id, y_idx, x_idx from spatial join.
+        obs_dict: Dict mapping station_id -> observation DataFrame.
+        stations_gdf: GeoDataFrame of station metadata.
+        out_dir: Output directory for CSV files.
+        model_name: String label for log messages (e.g. 'NDFD', 'HRRR').
+
+    Returns:
+        Summary DataFrame with per-station, per-lead-time error statistics.
     """
-    dirs = setup_directories()
-    raw_dir = dirs['raw']
-    processed_dir = dirs['processed']
-    ndfd_base = os.path.join(raw_dir, 'ndfd_data')
-
-    # Output directory
-    out_dir = os.path.join(processed_dir, 'forecast_errors', str(year), f"{month:02d}")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Load station metadata as GeoDataFrame
-    stations_gdf = load_stations_gdf(raw_dir)
-    print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
-
-    # Build NDFD grid GeoDataFrame and spatially join stations to nearest grid cell
-    temp_dir = os.path.join(ndfd_base, 'temp', str(year), f"{month:02d}")
-    sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
-    print("Building NDFD grid GeoDataFrame and joining stations...")
-    grid_gdf = build_ndfd_grid_gdf(str(sample_nc))
-    station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
-    print(f"  Joined {len(station_grid_map)} stations to grid (mean dist: "
-          f"{station_grid_map['dist_m'].mean():.0f} m)")
-
-    # Load all observations
-    print("Loading station observations...")
-    obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
-    print(f"  Loaded observations for {len(obs_dict)} stations")
-
-    # Load NDFD forecasts
-    print(f"Loading NDFD forecasts for {year}-{month:02d}...")
-    temp_forecasts = load_ndfd_forecasts(
-        os.path.join(ndfd_base, 'temp'), 't2m', year, month)
-    wspd_forecasts = load_ndfd_forecasts(
-        os.path.join(ndfd_base, 'wspd'), 'si10', year, month)
-    wdir_forecasts = load_ndfd_forecasts(
-        os.path.join(ndfd_base, 'wdir'), 'wdir10', year, month)
-    print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
-          f"{len(wdir_forecasts)} wdir forecast fields")
-
     # Index forecasts by (valid_time, lead_hours) for fast lookup
     temp_index = {(r['valid_time'], r['lead_hours']): r['data'] for r in temp_forecasts}
     wspd_index = {(r['valid_time'], r['lead_hours']): r['data'] for r in wspd_forecasts}
@@ -260,7 +265,7 @@ def calculate_errors_for_month(year, month):
             obs_row = obs[obs['valid_time'] == vt_ts].iloc[0]
 
             # Extract forecast values at station's nearest grid point
-            # NDFD temp is in Kelvin, convert to Celsius
+            # Forecast temp is in Kelvin, convert to Celsius
             fc_temp_k = temp_index[(valid_time, lead_hours)][y_idx, x_idx]
             fc_temp = float(fc_temp_k) - 273.15 if not np.isnan(fc_temp_k) else np.nan
 
@@ -278,12 +283,14 @@ def calculate_errors_for_month(year, month):
                 'forecast_temp': round(fc_temp, 2) if not np.isnan(fc_temp) else np.nan,
                 'observed_temp': obs_temp,
                 'temp_error': round(fc_temp - obs_temp, 2) if (not np.isnan(fc_temp) and obs_temp is not None) else np.nan,
+                'temp_pct_error': round((fc_temp - obs_temp) / obs_temp * 100, 1) if (not np.isnan(fc_temp) and obs_temp not in (None, 0)) else np.nan,
                 'forecast_wspd': round(fc_wspd, 2) if not np.isnan(fc_wspd) else np.nan,
                 'observed_wspd': obs_wspd,
                 'wspd_error': round(fc_wspd - obs_wspd, 2) if (not np.isnan(fc_wspd) and obs_wspd is not None) else np.nan,
+                'wspd_pct_error': round((fc_wspd - obs_wspd) / obs_wspd * 100, 1) if (not np.isnan(fc_wspd) and obs_wspd not in (None, 0)) else np.nan,
                 'forecast_wdir': round(fc_wdir, 1) if not np.isnan(fc_wdir) else np.nan,
                 'observed_wdir': obs_wdir,
-                'wdir_error': round(fc_wdir - obs_wdir, 1) if (not np.isnan(fc_wdir) and obs_wdir is not None) else np.nan,
+                'wdir_degree_error': round(circular_angular_error(fc_wdir, obs_wdir), 1),
                 'lat': station_row['lat'],
                 'lon': station_row['lon'],
             })
@@ -307,6 +314,7 @@ def calculate_errors_for_month(year, month):
                 'temp_bias': subset['temp_error'].mean(),
                 'wspd_mae': subset['wspd_error'].abs().mean(),
                 'wspd_bias': subset['wspd_error'].mean(),
+                'wdir_mae': subset['wdir_degree_error'].abs().mean(),
             })
 
         n_processed += 1
@@ -318,17 +326,136 @@ def calculate_errors_for_month(year, month):
     summary_df = pd.DataFrame(station_summaries)
     summary_path = os.path.join(out_dir, 'error_summary.csv')
     summary_df.to_csv(summary_path, index=False)
-    print(f"\nSaved {len(summary_df)} summary rows to {summary_path}")
+    print(f"\nSaved {len(summary_df)} {model_name} summary rows to {summary_path}")
 
     # Print aggregate stats
     for lead in sorted(summary_df['lead_hours'].unique()):
         s = summary_df[summary_df['lead_hours'] == lead]
-        print(f"\n  Lead {lead}h — {len(s)} stations:")
+        print(f"\n  {model_name} Lead {lead}h — {len(s)} stations:")
         print(f"    Temp MAE:  {s['temp_mae'].mean():.2f} °C  (bias: {s['temp_bias'].mean():+.2f})")
         print(f"    Wspd MAE:  {s['wspd_mae'].mean():.2f} m/s (bias: {s['wspd_bias'].mean():+.2f})")
+        print(f"    Wdir MAE:  {s['wdir_mae'].mean():.2f}°")
 
     return summary_df
 
 
+def calculate_ndfd_errors_for_month(year, month):
+    """Calculate NDFD forecast errors at all weather stations for a given month.
+
+    1. Load station locations as a GeoDataFrame
+    2. Build a GeoDataFrame of the NDFD grid and spatially join stations to
+       their nearest grid cell
+    3. Load all NDFD forecasts and ISD observations
+    4. Compute errors and save per-station CSVs and summary
+
+    Output: {processed}/forecast_errors/ndfd/{year}/{month:02d}/
+
+    Returns summary DataFrame with per-station error statistics.
+    """
+    dirs = setup_directories()
+    raw_dir = dirs['raw']
+    processed_dir = dirs['processed']
+    ndfd_base = os.path.join(raw_dir, 'ndfd_data')
+
+    # Output directory
+    out_dir = os.path.join(processed_dir, 'forecast_errors', 'ndfd', str(year), f"{month:02d}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load station metadata as GeoDataFrame
+    stations_gdf = load_stations_gdf(raw_dir)
+    print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
+
+    # Build NDFD grid GeoDataFrame and spatially join stations to nearest grid cell
+    temp_dir = os.path.join(ndfd_base, 'temp', str(year), f"{month:02d}")
+    sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
+    print("Building NDFD grid GeoDataFrame and joining stations...")
+    grid_gdf = build_forecast_grid_gdf(str(sample_nc))
+    station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
+    print(f"  Joined {len(station_grid_map)} stations to grid (mean dist: "
+          f"{station_grid_map['dist_m'].mean():.0f} m)")
+
+    # Load all observations
+    print("Loading station observations...")
+    obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
+    print(f"  Loaded observations for {len(obs_dict)} stations")
+
+    # Load NDFD forecasts
+    print(f"Loading NDFD forecasts for {year}-{month:02d}...")
+    temp_forecasts = load_forecasts(
+        os.path.join(ndfd_base, 'temp'), 't2m', year, month)
+    wspd_forecasts = load_forecasts(
+        os.path.join(ndfd_base, 'wspd'), 'si10', year, month)
+    wdir_forecasts = load_forecasts(
+        os.path.join(ndfd_base, 'wdir'), 'wdir10', year, month)
+    print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
+          f"{len(wdir_forecasts)} wdir forecast fields")
+
+    return _compute_and_save_errors(
+        temp_forecasts, wspd_forecasts, wdir_forecasts,
+        station_grid_map, obs_dict, stations_gdf,
+        out_dir, 'NDFD',
+    )
+
+
+def calculate_hrrr_errors_for_month(year, month):
+    """Calculate HRRR forecast errors at all weather stations for a given month.
+
+    1. Load station locations as a GeoDataFrame
+    2. Build a GeoDataFrame of the HRRR grid and spatially join stations to
+       their nearest grid cell (HRRR uses a 3km Lambert Conformal grid,
+       different from NDFD's 2.5km grid)
+    3. Load all HRRR forecasts and ISD observations
+    4. Compute errors and save per-station CSVs and summary
+
+    Output: {processed}/forecast_errors/hrrr/{year}/{month:02d}/
+
+    Returns summary DataFrame with per-station error statistics.
+    """
+    dirs = setup_directories()
+    raw_dir = dirs['raw']
+    processed_dir = dirs['processed']
+    hrrr_base = os.path.join(raw_dir, 'hrrr_data')
+
+    # Output directory
+    out_dir = os.path.join(processed_dir, 'forecast_errors', 'hrrr', str(year), f"{month:02d}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load station metadata as GeoDataFrame
+    stations_gdf = load_stations_gdf(raw_dir)
+    print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
+
+    # Build HRRR grid GeoDataFrame and spatially join stations to nearest grid cell
+    temp_dir = os.path.join(hrrr_base, 'temp', str(year), f"{month:02d}")
+    sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
+    print("Building HRRR grid GeoDataFrame and joining stations...")
+    grid_gdf = build_forecast_grid_gdf(str(sample_nc))
+    station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
+    print(f"  Joined {len(station_grid_map)} stations to grid (mean dist: "
+          f"{station_grid_map['dist_m'].mean():.0f} m)")
+
+    # Load all observations
+    print("Loading station observations...")
+    obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
+    print(f"  Loaded observations for {len(obs_dict)} stations")
+
+    # Load HRRR forecasts
+    print(f"Loading HRRR forecasts for {year}-{month:02d}...")
+    temp_forecasts = load_forecasts(
+        os.path.join(hrrr_base, 'temp'), 't2m', year, month)
+    wspd_forecasts = load_forecasts(
+        os.path.join(hrrr_base, 'wspd'), 'si10', year, month)
+    wdir_forecasts = load_forecasts(
+        os.path.join(hrrr_base, 'wdir'), 'wdir10', year, month)
+    print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
+          f"{len(wdir_forecasts)} wdir forecast fields")
+
+    return _compute_and_save_errors(
+        temp_forecasts, wspd_forecasts, wdir_forecasts,
+        station_grid_map, obs_dict, stations_gdf,
+        out_dir, 'HRRR',
+    )
+
+
 if __name__ == '__main__':
-    calculate_errors_for_month(2025, 7)
+    calculate_ndfd_errors_for_month(2025, 7)
+    calculate_hrrr_errors_for_month(2025, 7)

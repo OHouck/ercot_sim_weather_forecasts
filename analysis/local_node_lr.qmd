@@ -53,42 +53,61 @@ print("Setup complete")
 #| label: data-prep-function
 #| echo: true
 
-def prepare_node_level_data(year=2025, month=7, force_rebuild=False):
+def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=False):
     """
     Build a node × hour dataset linking ERCOT LMP to weather forecast errors.
 
     Each ERCOT resource node is spatially matched to its nearest ISD weather
     station using geopandas sjoin_nearest (projected to EPSG:3857 for accurate
-    distance calculation). The station's 1-hour and 25-hour forecast errors are
-    attached as separate columns, along with the distance to that station.
+    distance calculation). The station's short-lead and long-lead forecast
+    errors are attached as separate columns, along with the distance to that
+    station.
+
+    Supports forecast models with different lead times:
+      - ndfd: 1h (short) and 25h (long). forecasts available every 3 hours
+      - hrrr: 1h (short) and 18h (long)
+
+    Output columns use the actual lead hour as suffix (e.g. temp_error_1h,
+    temp_error_25h for NDFD; temp_error_1h, temp_error_18h for HRRR).
 
     Args:
         year: Year of data (default 2025)
         month: Month of data (default 7 for July)
+        model: Forecast model — 'ndfd' or 'hrrr' (default 'ndfd')
         force_rebuild: If True, rebuild even if cached file exists
 
     Returns:
         DataFrame with one row per (settlement_point, hour) and columns for
-        LMP, 1h forecast errors, 25h forecast errors, observed weather, and
-        station distance.
+        LMP, short/long-lead forecast errors, observed weather, and station
+        distance.
     """
+    # Model-specific lead times
+    LEAD_TIMES = {
+        'ndfd': (1, 25),
+        'hrrr': (1, 18),
+    }
+    if model not in LEAD_TIMES:
+        raise ValueError(f"Unknown model '{model}'. Choose from: {list(LEAD_TIMES)}")
+
+    lead_short, lead_long = LEAD_TIMES[model]
+
     dirs = setup_directories()
 
     cache_file = os.path.join(
         dirs['processed'],
-        f'node_hourly_{year}_{month:02d}.csv'
+        f'node_hourly_{model}_{year}_{month:02d}.csv'
     )
 
     if os.path.exists(cache_file) and not force_rebuild:
         print(f"Loading cached node-level data from {cache_file}")
         return pd.read_csv(cache_file, parse_dates=['hour'])
 
-    print("Building node-level dataset from scratch...")
+    print(f"Building node-level dataset from scratch (model={model})...")
 
     # ── Step 1: Load all forecast errors and pivot by lead time ──
     print("Loading forecast errors...")
     forecast_error_dir = os.path.join(
-        dirs['processed'], 'forecast_errors', str(year), f"{month:02d}"
+        dirs['processed'], 'forecast_errors', model, str(year), f"{month:02d}"
     )
     error_files = glob.glob(os.path.join(forecast_error_dir, '*.csv'))
     error_files = [f for f in error_files if not f.endswith('error_summary.csv')]
@@ -99,28 +118,35 @@ def prepare_node_level_data(year=2025, month=7, force_rebuild=False):
     all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
 
     print(f"  Loaded {len(all_errors):,} station-hour-lead observations from "
-          f"{len(error_files)} stations")
+          f"{len(error_files)} stations ({model.upper()})")
 
     # Pivot lead_hours into separate columns
     # Keep one row per (station_id, hour) with columns for each lead time
-    error_cols = ['temp_error', 'wspd_error', 'wdir_error',
-                  'forecast_temp', 'observed_temp',
-                  'forecast_wspd', 'observed_wspd']
+    # Must match column names in calculate_forecast_errors.py output:
+    #   temp_error, temp_pct_error, forecast_temp, observed_temp,
+    #   wspd_error, wspd_pct_error, forecast_wspd, observed_wspd,
+    #   wdir_degree_error, forecast_wdir, observed_wdir
+    error_cols = [c for c in all_errors.columns
+                  if c not in ('station_id', 'valid_time', 'lead_hours',
+                               'hour', 'lat', 'lon')]
 
-    lead1 = all_errors[all_errors['lead_hours'] == 1].copy()
-    lead25 = all_errors[all_errors['lead_hours'] == 25].copy()
+    suffix_short = f'_{lead_short}h'
+    suffix_long = f'_{lead_long}h'
 
-    rename1 = {c: f'{c}_1h' for c in error_cols}
-    rename25 = {c: f'{c}_25h' for c in error_cols}
+    lead_short_df = all_errors[all_errors['lead_hours'] == lead_short].copy()
+    lead_long_df = all_errors[all_errors['lead_hours'] == lead_long].copy()
 
-    lead1 = lead1.rename(columns=rename1)
-    lead25 = lead25.rename(columns=rename25)
+    rename_short = {c: f'{c}{suffix_short}' for c in error_cols}
+    rename_long = {c: f'{c}{suffix_long}' for c in error_cols}
 
-    keep1 = ['station_id', 'hour', 'lat', 'lon'] + list(rename1.values())
-    keep25 = ['station_id', 'hour'] + list(rename25.values())
+    lead_short_df = lead_short_df.rename(columns=rename_short)
+    lead_long_df = lead_long_df.rename(columns=rename_long)
 
-    errors_wide = lead1[keep1].merge(
-        lead25[keep25],
+    keep_short = ['station_id', 'hour', 'lat', 'lon'] + list(rename_short.values())
+    keep_long = ['station_id', 'hour'] + list(rename_long.values())
+
+    errors_wide = lead_short_df[keep_short].merge(
+        lead_long_df[keep_long],
         on=['station_id', 'hour'],
         how='outer'
     )
@@ -227,10 +253,11 @@ def prepare_node_level_data(year=2025, month=7, force_rebuild=False):
     print(f"  Hours: {node_hourly['hour_dt'].min()} to {node_hourly['hour_dt'].max()}")
 
     # Report error coverage
-    for lead, suffix in [('1h', '_1h'), ('25h', '_25h')]:
-        n = node_hourly[f'temp_error{suffix}'].notna().sum()
+    for lead in [lead_short, lead_long]:
+        col = f'temp_error_{lead}h'
+        n = node_hourly[col].notna().sum()
         pct = 100 * n / len(node_hourly)
-        print(f"  temp_error_{lead} non-missing: {n:,} ({pct:.1f}%)")
+        print(f"  {col} non-missing: {n:,} ({pct:.1f}%)")
 
     print(f"Saving to {cache_file}")
     node_hourly.to_csv(cache_file, index=False)
@@ -246,13 +273,19 @@ def prepare_node_level_data(year=2025, month=7, force_rebuild=False):
 
 dirs = setup_directories()
 
-df = prepare_node_level_data(year=2025, month=7, force_rebuild=False)
+# ── Choose forecast model: 'ndfd' or 'hrrr' ──
+MODEL = 'hrrr'
+LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
+LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
+
+df = prepare_node_level_data(year=2025, month=7, model=MODEL, force_rebuild = True)
 
 print(f"\n{'='*60}")
-print(f"Dataset Summary")
+print(f"Dataset Summary ({MODEL.upper()})")
 print(f"{'='*60}")
 print(f"Observations: {len(df):,}")
 print(f"Nodes: {df['settlement_point'].nunique()}")
+print(f"Lead times: {LEAD_SHORT}h (short) / {LEAD_LONG}h (long)")
 print(f"Date range: {df['hour_dt'].min()} to {df['hour_dt'].max()}")
 print(f"\nColumns: {', '.join(df.columns)}")
 ```
@@ -271,51 +304,33 @@ for col in cols:
     missing = df[col].isna().sum()
     print(f"{col}: {missing} missing values ({missing/len(df)*100:.2f}%)")
 
+
 # Summary statistics for key variables
 print("\n" + "="*60)
 print("Summary Statistics")
 print("="*60)
 key_vars = [
     'lmp_mean', 'dist_km',
-    'observed_temp_1h', 'observed_wspd_1h',
-    'temp_error_1h', 'wspd_error_1h',
-    'temp_error_25h', 'wspd_error_25h',
+    f'observed_temp_{LEAD_SHORT}h', f'observed_wspd_{LEAD_SHORT}h',
+    f'temp_error_{LEAD_SHORT}h', f'wspd_error_{LEAD_SHORT}h',
+    f'temp_error_{LEAD_LONG}h', f'wspd_error_{LEAD_LONG}h',
 ]
-available_vars = [v for v in key_vars if v in df.columns]
-print(df[available_vars].describe())
 ```
 
 ```{python}
-# extract just the hour from the datetime column
-df['hour_of_day'] = df['hour'].dt.hour
-
-
-# filter the dataframe into two: one with missing temp_error_1h and one with non-missing temp_error_1h
-missing_temp_1h = df[df['temp_error_1h'].isna()]
-non_missing_temp_1h = df[df['temp_error_1h'].notna()]
-
-
-missing_tab = missing_temp_1h['hour_of_day'].value_counts()
-non_missing_tab = non_missing_temp_1h['hour_of_day'].value_counts()
-
-# print(missing_tab)
-print(non_missing_tab)
-
-
-
-
-
+missing_obs = df[df[f'temp_error_{LEAD_SHORT}h'].isna() | df[f'wspd_error_{LEAD_SHORT}h'].isna()]
 ```
 
 ## Prepare Clean Analysis Sample
-
 ```{python}
 #| label: prepare-analysis
 #| echo: true
 
 def prepare_data(df, depvar, treatments, controls, fe):
     """Drop rows with NaN in any analysis column and return clean DataFrame."""
-    all_cols = [depvar] + treatments + controls + [fe]
+    if fe:
+        fe = fe if isinstance(fe, list) else [fe]
+    all_cols = [depvar] + treatments + controls + fe
     existing_cols = [c for c in all_cols if c in df.columns]
     df_clean = df.dropna(subset=existing_cols).copy()
     print(f"Analysis sample: {len(df_clean):,} observations "
@@ -331,7 +346,7 @@ def build_formula(depvar, treatments, controls, fe=None, interactions=None):
         depvar: dependent variable name
         treatments: list of treatment variable names
         controls: list of control variable names
-        fe: fixed effect variable (or None)
+        fe: fixed effect variables (or None)
         interactions: list of (treatment, x_var) tuples for interaction terms
     """
     rhs_parts = treatments + controls
@@ -341,7 +356,8 @@ def build_formula(depvar, treatments, controls, fe=None, interactions=None):
     rhs = " + ".join(rhs_parts)
     fml = f"{depvar} ~ {rhs}"
     if fe:
-        fml += f" | {fe}"
+        fml += " | "  # pyfixest syntax for fixed effects
+        fml += " + ".join(fe)
     return fml
 ```
 
@@ -351,197 +367,52 @@ def build_formula(depvar, treatments, controls, fe=None, interactions=None):
 #| label: model1
 #| echo: true
 
-DEPVAR = "lmp_mean"
-FE = "settlement_point"
+# Note: positive errors mean forecast was warmer/faster than observed, negative means cooler/slower
+
+leadtime = LEAD_SHORT
+
+# options are lmp_mean, lmp_max, lmp_std
+DEPVAR = "lmp_max"
+FE = ["settlement_point", "hour_of_day"]  # Control for hour-of-day fixed effects
 CLUSTER = "settlement_point"
 
 TREATMENTS = [
-    "temp_error_1h",
-    "wspd_error_1h",
+    f"temp_error_{leadtime}h",
+    f"wspd_error_{leadtime}h",
+    f"wdir_error_{leadtime}h",
 ]
 
 CONTROLS = [
-    "hour_of_day",
+    f"observed_temp",
+    f"observed_wspd",
+    f"observed_wdir",
+    'weekday',
 ]
+INTERACTIONS = [
+    (f"temp_error_{leadtime}h", f'observed_temp'),
+    (f"wspd_error_{leadtime}h", f'observed_wspd'),
+    (f"wdir_error_{leadtime}h", f'observed_wdir'),
+]
+
 
 df_clean = prepare_data(df, DEPVAR, TREATMENTS, CONTROLS, FE)
 
 print("\n" + "=" * 60)
-print("MODEL 1: 1h Forecast Errors -> LMP (base)")
+print(f"MODEL 1: {leadtime}h Forecast Errors -> LMP (base) [{MODEL.upper()}]")
 print("=" * 60)
 
-fml1 = build_formula(DEPVAR, TREATMENTS, CONTROLS, fe=FE)
+fml1 = build_formula(DEPVAR, TREATMENTS, CONTROLS, fe=FE, interactions=INTERACTIONS)
 print(f"  Formula: {fml1}")
 
 model1 = pf.feols(fml=fml1, data=df_clean, vcov={"CRV1": CLUSTER})
 print(model1.summary())
-```
 
-## Model 2: Add Weather Levels
-
-```{python}
-#| label: model2
-#| echo: true
-
-DEPVAR = "lmp_mean"
-FE = "settlement_point"
-CLUSTER = "settlement_point"
-
-TREATMENTS = [
-    "temp_error_1h",
-    "wspd_error_1h",
-]
-
-CONTROLS = [
-    "observed_temp_1h",
-    "observed_wspd_1h",
-    "hour_of_day",
-]
-
-df_clean2 = prepare_data(df, DEPVAR, TREATMENTS, CONTROLS, FE)
-
+# print mean of dependenet variable and treatments for context
 print("\n" + "=" * 60)
-print("MODEL 2: 1h Forecast Errors + Weather Levels -> LMP")
+print("Variable Means (for context)")
 print("=" * 60)
+print(f"{DEPVAR}: {df_clean[DEPVAR].mean():.2f}")
+for t in TREATMENTS:
+    print(f"{t}: {df_clean[t].mean():.2f}")
 
-fml2 = build_formula(DEPVAR, TREATMENTS, CONTROLS, fe=FE)
-print(f"  Formula: {fml2}")
-
-model2 = pf.feols(fml=fml2, data=df_clean2, vcov={"CRV1": CLUSTER})
-print(model2.summary())
-```
-
-## Model 3: Add Day of Week
-
-```{python}
-#| label: model3
-#| echo: true
-
-DEPVAR = "lmp_mean"
-FE = "settlement_point"
-CLUSTER = "settlement_point"
-
-TREATMENTS = [
-    "temp_error_1h",
-    "wspd_error_1h",
-]
-
-CONTROLS = [
-    "observed_temp_1h",
-    "observed_wspd_1h",
-    "hour_of_day",
-    "weekday",
-]
-
-df_clean3 = prepare_data(df, DEPVAR, TREATMENTS, CONTROLS, FE)
-
-print("\n" + "=" * 60)
-print("MODEL 3: Add Day-of-Week Controls")
-print("=" * 60)
-
-fml3 = build_formula(DEPVAR, TREATMENTS, CONTROLS, fe=FE)
-print(f"  Formula: {fml3}")
-
-model3 = pf.feols(fml=fml3, data=df_clean3, vcov={"CRV1": CLUSTER})
-print(model3.summary())
-```
-
-## Model 4: 25h vs 1h Forecast Errors
-
-Test whether 1-hour vs 25-hour forecast errors have different effects.
-
-```{python}
-#| label: model4
-#| echo: true
-
-print("\n" + "=" * 60)
-print("MODEL 4: 25h Forecast Errors -> LMP")
-print("=" * 60)
-
-DEPVAR = "lmp_mean"
-FE = "settlement_point"
-CLUSTER = "settlement_point"
-
-TREATMENTS_25 = [
-    "temp_error_25h",
-    "wspd_error_25h",
-]
-
-CONTROLS = [
-    "observed_temp_25h",
-    "observed_wspd_25h",
-    "hour_of_day",
-    "weekday",
-]
-
-df_clean4 = prepare_data(df, DEPVAR, TREATMENTS_25, CONTROLS, FE)
-
-fml4 = build_formula(DEPVAR, TREATMENTS_25, CONTROLS, fe=FE)
-print(f"  Formula: {fml4}")
-
-model4 = pf.feols(fml=fml4, data=df_clean4, vcov={"CRV1": CLUSTER})
-print(model4.summary())
-```
-
-## Model Comparison Table
-
-```{python}
-#| label: comparison
-#| echo: true
-
-print("\n" + "=" * 60)
-print("MODEL COMPARISON")
-print("=" * 60)
-
-models = [model1, model2, model3, model4]
-model_names = ['Base (1h)', 'Weather Levels (1h)', 'Day-of-Week (1h)', '25h Errors']
-
-try:
-    from pyfixest import etable
-    etable(models, labels=model_names)
-except Exception as e:
-    print(f"etable failed: {e}")
-    for i, (model, name) in enumerate(zip(models, model_names), 1):
-        print(f"\nModel {i} ({name}):")
-        print(model.tidy())
-```
-
-## Summary and Interpretation
-
-```{python}
-#| label: summary
-#| echo: true
-
-print("\n" + "=" * 60)
-print("KEY FINDINGS")
-print("=" * 60)
-
-# Extract coefficients from preferred model (model3, 1h errors with controls)
-coefs = model3.tidy()
-
-print("\nCoefficients from Model 3 (1h errors, preferred specification):")
-print(coefs[['Estimate', 'Std. Error', 't value', 'Pr(>|t|)']])
-
-print("\n" + "=" * 60)
-print("INTERPRETATION")
-print("=" * 60)
-
-if 'temp_error_1h' in coefs.index:
-    temp_error_coef = coefs.loc['temp_error_1h', 'Estimate']
-    temp_error_pval = coefs.loc['temp_error_1h', 'Pr(>|t|)']
-    sig_temp = "significant" if temp_error_pval < 0.05 else "not significant"
-    print(f"\nTemperature forecast error (1h): {temp_error_coef:.3f} ({sig_temp})")
-    print(f"  A 1°C over-forecast of temperature is associated with")
-    print(f"  a ${temp_error_coef:.2f}/MWh change in LMP")
-
-if 'wspd_error_1h' in coefs.index:
-    wspd_error_coef = coefs.loc['wspd_error_1h', 'Estimate']
-    wspd_error_pval = coefs.loc['wspd_error_1h', 'Pr(>|t|)']
-    sig_wspd = "significant" if wspd_error_pval < 0.05 else "not significant"
-    print(f"\nWind speed forecast error (1h): {wspd_error_coef:.3f} ({sig_wspd})")
-    print(f"  A 1 m/s over-forecast of wind speed is associated with")
-    print(f"  a ${wspd_error_coef:.2f}/MWh change in LMP")
-
-print("\nNote: Node fixed effects control for time-invariant node characteristics.")
-print("Standard errors are clustered at the node level.")
 ```
