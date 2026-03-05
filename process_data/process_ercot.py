@@ -109,6 +109,228 @@ def _clean_substation_name(sub):
     return s
 
 
+def _normalize_name(name):
+    """Normalize names for matching by dropping non-alphanumeric chars."""
+    return re.sub(r'[^A-Z0-9]+', '', str(name).upper())
+
+
+def _strip_html_suffix(name):
+    """Strip common HTML contour suffixes (e.g., _CC1, _PUN2, _RN)."""
+    s = str(name).upper()
+    s = re.sub(r'_(CCS?\d+|CC\d+|PUN\d+|RN\d*)$', '', s)
+    return s
+
+
+def _match_html_nodes_to_resource_nodes(html_df, rn_df):
+    """Map HTML contour node names to current NP4-160 resource nodes.
+
+    This resolves cases where HTML names use a different naming convention than
+    NP4-160 RESOURCE_NODE names (e.g. TEN_CC1 -> TEN_CT1_STG) by leveraging
+    UNIT_SUBSTATION and UNIT_NAME fields with conservative similarity checks.
+
+    Args:
+        html_df: DataFrame from _parse_html_contour_maps()
+        rn_df: NP4-160 DataFrame with RESOURCE_NODE, UNIT_SUBSTATION, UNIT_NAME
+
+    Returns:
+        Tuple of:
+        1) DataFrame shaped like html_df but with RESOURCE_NODE names in
+           settlement_point and enriched match_method labels (one row per RN)
+        2) DataFrame with one row per matched HTML node for manual QA
+    """
+    if html_df.empty or rn_df.empty:
+        empty_main = pd.DataFrame(columns=['settlement_point', 'lat', 'lon', 'plant_name', 'match_method'])
+        empty_detail = pd.DataFrame(columns=[
+            'html_settlement_point', 'resource_node', 'unit_substation',
+            'match_method', 'match_score', 'lat', 'lon'
+        ])
+        return empty_main, empty_detail
+
+    # Build per-resource-node matching metadata.
+    grouped = rn_df.groupby('RESOURCE_NODE', as_index=False).agg({
+        'UNIT_SUBSTATION': 'first',
+        'UNIT_NAME': lambda x: sorted(set(str(v) for v in x if pd.notna(v))),
+    })
+
+    rn_meta = {}
+    exact_index = {}
+    substation_index = {}
+    for _, row in grouped.iterrows():
+        rn = row['RESOURCE_NODE']
+        sub = str(row['UNIT_SUBSTATION'])
+        unit_names = row['UNIT_NAME']
+
+        rn_norm = _normalize_name(rn)
+        sub_norm = _normalize_name(_clean_substation_name(sub))
+        unit_norms = [_normalize_name(u) for u in unit_names]
+
+        rn_meta[rn] = {
+            'rn_norm': rn_norm,
+            'sub_norm': sub_norm,
+            'unit_norms': unit_norms,
+        }
+        exact_index.setdefault(rn_norm, []).append(rn)
+        substation_index.setdefault(sub_norm, []).append(rn)
+
+    method_rank = {
+        'html_contour_exact': 4,
+        'html_contour_substation_unique': 3,
+        'html_contour_substation_tiebreak': 3,
+        'html_contour_substation_scored': 2,
+        'html_contour_heuristic': 1,
+    }
+
+    chosen_by_rn = {}
+    html_match_rows = []
+
+    for _, row in html_df.iterrows():
+        html_name = row['settlement_point']
+        html_norm = _normalize_name(html_name)
+        html_base_norm = _normalize_name(_strip_html_suffix(html_name))
+
+        best_rn = None
+        best_method = None
+        best_score = 0.0
+
+        # 1) Exact normalized RESOURCE_NODE match.
+        exact_hits = exact_index.get(html_norm, [])
+        if len(exact_hits) == 1:
+            best_rn = exact_hits[0]
+            best_method = 'html_contour_exact'
+            best_score = 1.0
+        elif len(exact_hits) > 1:
+            best_rn = sorted(exact_hits)[0]
+            best_method = 'html_contour_exact'
+            best_score = 1.0
+        else:
+            # 2) Candidate set driven by substation aliasing around stripped HTML name.
+            candidates = set()
+            for sub_norm, rns in substation_index.items():
+                if (sub_norm == html_base_norm
+                        or sub_norm.startswith(html_base_norm)
+                        or html_base_norm.startswith(sub_norm)):
+                    candidates.update(rns)
+
+            if len(candidates) == 1:
+                best_rn = next(iter(candidates))
+                best_method = 'html_contour_substation_unique'
+                best_score = 0.95
+            else:
+                # If HTML base maps to a substation with multiple units, use a
+                # deterministic tie-break based on unit number proximity.
+                candidate_substations = {rn_meta[rn]['sub_norm'] for rn in candidates}
+                has_substation_family = any(
+                    sub == html_base_norm
+                    or sub.startswith(html_base_norm)
+                    or html_base_norm.startswith(sub)
+                    for sub in candidate_substations
+                )
+
+                if has_substation_family and len(candidates) > 1:
+                    suffix_num_match = re.search(r'_(?:CCS?|CC|PUN|RN)?(\d+)$', str(html_name).upper())
+                    if suffix_num_match:
+                        target_num = int(suffix_num_match.group(1))
+                        ranked = []
+                        for rn in sorted(candidates):
+                            unit_nums = []
+                            for u in rn_meta[rn]['unit_norms']:
+                                num_match = re.search(r'(\d+)$', u)
+                                if num_match:
+                                    unit_nums.append(int(num_match.group(1)))
+                            rn_num_match = re.search(r'(\d+)$', rn_meta[rn]['rn_norm'])
+                            if rn_num_match:
+                                unit_nums.append(int(rn_num_match.group(1)))
+                            if unit_nums:
+                                nearest_delta = min(abs(n - target_num) for n in unit_nums)
+                            else:
+                                nearest_delta = 999
+                            ranked.append((nearest_delta, rn))
+
+                        ranked.sort()
+                        if ranked and ranked[0][0] < 999:
+                            best_rn = ranked[0][1]
+                            best_method = 'html_contour_substation_tiebreak'
+                            # Map small deltas to slightly higher confidence.
+                            best_score = max(0.90, 0.96 - 0.01 * ranked[0][0])
+
+                # 3) Conservative scoring over likely candidates (or all nodes if none).
+                if best_rn is None and not candidates:
+                    candidates = set(rn_meta.keys())
+
+                if best_rn is None:
+                    scored = []
+                    for rn in candidates:
+                        meta = rn_meta[rn]
+                        sub_score = difflib.SequenceMatcher(None, html_base_norm, meta['sub_norm']).ratio()
+                        rn_score = difflib.SequenceMatcher(None, html_norm, meta['rn_norm']).ratio()
+                        unit_score = max(
+                            [difflib.SequenceMatcher(None, html_norm, u).ratio() for u in meta['unit_norms']] or [0.0]
+                        )
+
+                        score = max(sub_score, rn_score, unit_score)
+                        if meta['sub_norm'].startswith(html_base_norm) or html_base_norm.startswith(meta['sub_norm']):
+                            score += 0.08
+                        if meta['rn_norm'].startswith(html_base_norm) or html_base_norm in meta['rn_norm']:
+                            score += 0.05
+
+                        scored.append((score, rn))
+
+                    scored.sort(reverse=True)
+                    if scored:
+                        top_score, top_rn = scored[0]
+                        second_score = scored[1][0] if len(scored) > 1 else 0.0
+
+                        if top_score >= 0.90 and (top_score - second_score) >= 0.03:
+                            best_rn = top_rn
+                            best_method = (
+                                'html_contour_substation_scored' if len(candidates) > 1
+                                else 'html_contour_heuristic'
+                            )
+                            best_score = float(top_score)
+
+        if best_rn is None:
+            continue
+
+        candidate_row = {
+            'settlement_point': best_rn,
+            'lat': row['lat'],
+            'lon': row['lon'],
+            'plant_name': row.get('plant_name', ''),
+            'match_method': best_method,
+            '_match_score': best_score,
+        }
+
+        html_match_rows.append({
+            'html_settlement_point': html_name,
+            'resource_node': best_rn,
+            'unit_substation': rn_df.loc[rn_df['RESOURCE_NODE'] == best_rn, 'UNIT_SUBSTATION'].iloc[0],
+            'match_method': best_method,
+            'match_score': round(float(best_score), 4),
+            'lat': row['lat'],
+            'lon': row['lon'],
+        })
+
+        # If multiple HTML names map to the same RN, keep the strongest match.
+        existing = chosen_by_rn.get(best_rn)
+        if existing is None:
+            chosen_by_rn[best_rn] = candidate_row
+        else:
+            existing_rank = method_rank.get(existing['match_method'], 0)
+            candidate_rank = method_rank.get(candidate_row['match_method'], 0)
+            if (candidate_rank > existing_rank or
+                    (candidate_rank == existing_rank and candidate_row['_match_score'] > existing['_match_score'])):
+                chosen_by_rn[best_rn] = candidate_row
+
+    if not chosen_by_rn:
+        empty_main = pd.DataFrame(columns=['settlement_point', 'lat', 'lon', 'plant_name', 'match_method'])
+        html_match_df = pd.DataFrame(html_match_rows)
+        return empty_main, html_match_df
+
+    matched_df = pd.DataFrame(chosen_by_rn.values())
+    html_match_df = pd.DataFrame(html_match_rows)
+    return matched_df[['settlement_point', 'lat', 'lon', 'plant_name', 'match_method']], html_match_df
+
+
 def _parse_kml_coordinates(kml_path):
     """Parse ERCOT contour map KML file to extract node coordinates.
 
@@ -298,12 +520,31 @@ def build_node_coordinates(force_rebuild=False):
         if os.path.exists(os.path.join(data_dir, f))
     ]
     html_results = pd.DataFrame()
+    html_match_detail = pd.DataFrame()
     if html_files:
         html_all = _parse_html_contour_maps(html_files, kml_path)
-        html_results = html_all[html_all['settlement_point'].isin(all_rn_names)].copy()
-        print(f"HTML: {len(html_all)} nodes parsed, {len(html_results)} match current resource nodes")
+        html_results, html_match_detail = _match_html_nodes_to_resource_nodes(html_all, rn_df)
+        print(f"HTML: {len(html_all)} nodes parsed, {len(html_results)} mapped to current resource nodes")
     else:
         print("No HTML contour map files found, skipping HTML source")
+
+    # Debug output: HTML names still unmatched after current HTML->RN mapping logic.
+    unmatched_html_results = html_all[~html_all['settlement_point'].isin(
+        set(html_match_detail['html_settlement_point'])
+    )]
+    unmatched_html_results.to_csv(os.path.join(dirs['processed'], 'unmatched_html_nodes.csv'), index=False)
+
+    # Debug/manual QA output: inspect HTML->resource mapping quality.
+    html_match_detail.to_csv(
+        os.path.join(dirs['processed'], 'html_resource_node_match_details.csv'),
+        index=False,
+    )
+
+    print(f"Saved {len(html_match_detail)} HTML match detail rows to "
+          f"{os.path.join(dirs['processed'], 'html_resource_node_match_details.csv')}")
+    print(f"Saved {len(unmatched_html_results)} unmatched HTML nodes to "
+          f"{os.path.join(dirs['processed'], 'unmatched_html_nodes.csv')}")
+
 
     matched_so_far = set(html_results['settlement_point']) if len(html_results) > 0 else set()
 
@@ -412,5 +653,3 @@ def build_node_coordinates(force_rebuild=False):
 
 if __name__ == '__main__':
     coords = build_node_coordinates(force_rebuild=True)
-    print(f"\nSample matched nodes:")
-    print(coords.head(10).to_string(index=False))

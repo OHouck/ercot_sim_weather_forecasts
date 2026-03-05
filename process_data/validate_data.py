@@ -7,6 +7,7 @@ import calendar
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
+import geopandas as gpd
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
 
@@ -220,6 +221,41 @@ def _draw_texas(ax, proj):
     ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
 
 
+def _draw_ercot_gis_layers(ax, proj, gis_root):
+    """Overlay ERCOT line and bus shapefiles on a cartopy axis."""
+    line_shp = os.path.join(gis_root, 'Line', 'Line_Output.shp')
+    bus_shp = os.path.join(gis_root, 'Bus', 'Bus_Output.shp')
+
+    if os.path.exists(line_shp):
+        line_gdf = gpd.read_file(line_shp)
+        if line_gdf.crs is not None:
+            line_gdf = line_gdf.to_crs('EPSG:4326')
+        ax.add_geometries(
+            line_gdf.geometry,
+            crs=proj,
+            facecolor='none',
+            edgecolor='#6f6f6f',
+            linewidth=0.35,
+            alpha=0.45,
+            zorder=2,
+        )
+
+    if os.path.exists(bus_shp):
+        bus_gdf = gpd.read_file(bus_shp)
+        if bus_gdf.crs is not None:
+            bus_gdf = bus_gdf.to_crs('EPSG:4326')
+        bus_gdf = bus_gdf[bus_gdf.geometry.notnull()]
+        if len(bus_gdf) > 0:
+            bus_gdf.plot(
+                ax=ax,
+                transform=proj,
+                color='#5a5a5a',
+                markersize=3,
+                alpha=0.45,
+                zorder=3,
+            )
+
+
 def validate_node_coordinate_matching():
     """Validate the ERCOT node-to-coordinate matching pipeline.
 
@@ -311,23 +347,31 @@ def validate_node_coordinate_matching():
     # --- Panel 1: Matched nodes by method ---
     ax = axes[0]
     _draw_texas(ax, proj)
+    _draw_ercot_gis_layers(ax, proj, os.path.join(dirs['root'], 'Texas_GIS_Data'))
+
+    # Plot all HTML-derived match variants as a single class.
+    matched_plot = matched.copy()
+    matched_plot['match_method_plot'] = matched_plot['match_method'].where(
+        ~matched_plot['match_method'].str.startswith('html_contour', na=False),
+        'html_contour'
+    )
 
     method_styles = {
-        'html_contour': {'color': '#2196F3', 'marker': 'o', 'label': 'HTML contour'},
-        'kml':          {'color': '#4CAF50', 'marker': 's', 'label': 'KML (2019)'},
-        'prefix':       {'color': '#FF9800', 'marker': '^', 'label': 'EIA prefix'},
-        'contains':     {'color': '#9C27B0', 'marker': 'D', 'label': 'EIA substring'},
-        'fuzzy':        {'color': '#F44336', 'marker': 'v', 'label': 'EIA fuzzy'},
+        'html_contour': {'color': '#2196F3', 'marker': 'o', 'label': 'HTML contour', 'size': 46, 'alpha': 0.9},
+        'kml':          {'color': '#4CAF50', 'marker': 's', 'label': 'KML (2019)', 'size': 20, 'alpha': 0.8},
+        'prefix':       {'color': '#FF9800', 'marker': '^', 'label': 'EIA prefix', 'size': 20, 'alpha': 0.8},
+        'contains':     {'color': '#9C27B0', 'marker': 'D', 'label': 'EIA substring', 'size': 20, 'alpha': 0.8},
+        'fuzzy':        {'color': '#F44336', 'marker': 'v', 'label': 'EIA fuzzy', 'size': 20, 'alpha': 0.8},
     }
 
     for method, style in method_styles.items():
-        subset = matched[matched['match_method'] == method]
+        subset = matched_plot[matched_plot['match_method_plot'] == method]
         if len(subset) == 0:
             continue
         ax.scatter(
             subset['lon'], subset['lat'],
             c=style['color'], marker=style['marker'],
-            s=30, edgecolors='k', linewidths=0.3, alpha=0.8,
+            s=style['size'], edgecolors='k', linewidths=0.3, alpha=style['alpha'],
             label=f"{style['label']} ({len(subset)})",
             transform=proj, zorder=5)
 
@@ -338,6 +382,7 @@ def validate_node_coordinate_matching():
     # --- Panel 2: Unmatched EIA plants ---
     ax = axes[1]
     _draw_texas(ax, proj)
+    _draw_ercot_gis_layers(ax, proj, os.path.join(dirs['root'], 'Texas_GIS_Data'))
 
     # Show matched EIA plants as light background dots
     eia_matched_names = set(matched['plant_name'].dropna())
@@ -345,7 +390,7 @@ def validate_node_coordinate_matching():
     if len(eia_matched_pts) > 0:
         ax.scatter(
             eia_matched_pts['lon'], eia_matched_pts['lat'],
-            c='#2196F3', marker='o', s=15, alpha=0.3,
+            c='#2196F3', marker='o', s=15, alpha=1.0,
             label=f'EIA matched ({len(eia_matched_pts)})',
             transform=proj, zorder=4)
 
@@ -373,6 +418,6 @@ def validate_node_coordinate_matching():
 
 
 if __name__ == "__main__":
-    validate_data(2025, 1)
-    validate_settlement_point_coverage(2025, 1)
+    # validate_data(2025, 1)
+    # validate_settlement_point_coverage(2025, 1)
     validate_node_coordinate_matching()
