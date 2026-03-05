@@ -201,7 +201,7 @@ uv run python -m download_data.pull_ercot
 ## Step 4: ERCOT Node-to-Coordinate Mapping (DONE)
 
 **Scripts**: `download_data/pull_np4160.py`, `download_data/pull_eia860.py`
-**Processing**: `process_ercot.py` → `build_node_coordinates()`
+**Processing**: `process_data/process_ercot.py` → `build_node_coordinates()`
 
 ERCOT settlement points have names (e.g., `AJAXWIND_RN`) but no geographic coordinates. Three sources are combined to build a coordinate mapping:
 
@@ -255,10 +255,29 @@ See [README_build_node_coordinates.md](README_build_node_coordinates.md) for a d
 **Result**: 544/937 resource nodes matched (58%). Cached to `{processed}/node_coordinates.csv`.
 Also saves `unmatched_ercot_settlement_points.csv` and `unmatched_eia860_plants.csv` for manual review.
 
+### Settlement point types in RT SPP data
+
+The RT SPP data (NP6-905) contains multiple settlement point types. Only RN (Resource Node)
+types are used in the analysis because only RN names appear in NP4-160 and thus in
+`node_coordinates.csv`. The other types use different naming conventions:
+
+| Type | Share | Description | In node_coordinates? |
+|------|-------|-------------|---------------------|
+| RN | ~70% | Resource nodes (generation sites) | Yes — this is what we match |
+| PCCRN | ~15% | Privately Contracted Capacity RN (bilateral contracts, unit-level names) | No |
+| LCCRN | ~7% | Load Curve Capability RN (capacity cost participation, unit-level names) | No |
+| PUN | ~5% | Point of Use Node (demand/load points, different physical locations) | No |
+| LZ/HU/SH/AH | ~3% | Load zones, hubs, sub-hubs (aggregates, not point-level) | No |
+
+PCCRN/LCCRN could theoretically be mapped via NP4-160's `Settlement_Points` file (which has
+a SUBSTATION column), but this is not implemented. PUN nodes would require coordinates from
+the CRR Network Model or similar source.
+
 ### Possible improvements
 - **CRR Network Model KML**: Requires free IMRE registration at `https://www.ercot.com/services/rq/imre`. Contains bus polygon geometries for all network buses. Parser exists at `github.com/patrickbrown4/pvvm_pvtos`. Would cover ~100% of nodes.
 - Cross-reference EIA Form 860 generator-level data (`3_1_Generator*.xlsx`) for unit-level matching instead of plant-level
 - Re-save the 4 HTML source files periodically to capture new nodes added to the ERCOT contour maps
+- Map PCCRN/LCCRN names to coordinates via NP4-160 `Settlement_Points` → SUBSTATION → EIA plants
 
 ---
 
@@ -357,12 +376,18 @@ Functions for computing NDFD forecast errors at weather station locations:
 - `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` to match each station to its nearest grid cell
 - `load_ndfd_forecasts(element_dir, variable_name, year, month)` — loads all NDFD NetCDF files for one element into memory
 
-### `process_ercot.py`
+### `process_data/process_ercot.py`
 Functions for reading and processing ERCOT market data:
 - `load_dam_spp_month(year, month)` — loads all daily DAM SPP CSVs into one DataFrame
 - `load_rt_spp_month(year, month)` — loads all daily RT SPP CSVs into one DataFrame
-- `compute_max_lmp_by_node(year, month)` — max LMP per RN settlement point
+- `compute_max_lmp_by_node(year, month, point_types='RN')` — max LMP per settlement point; accepts a string, list of strings, or None (all types)
 - `build_node_coordinates(force_rebuild=False)` — builds the name-matching pipeline (Step 4c), caches to `{processed}/node_coordinates.csv`
+
+### `download_data/validate_data.py`
+Functions for validating downloaded data:
+- `validate_data(year, month)` — checks file completeness for NDFD, HRRR, weather stations, DAM SPP, RT SPP
+- `validate_settlement_point_coverage(year, month)` — reports settlement point type distribution in RT SPP, RN coordinate coverage, and match method breakdown
+- `validate_node_coordinate_matching()` — detailed matching pipeline validation with map visualization
 
 ### `create_plots.py`
 Visualization functions using cartopy for Texas maps:

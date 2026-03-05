@@ -24,16 +24,18 @@ TX_LAT_MIN, TX_LAT_MAX = 25.8, 36.5
 TX_LON_MIN, TX_LON_MAX = -106.6, -93.5
 
 
-def download_texas_stations(output_path):
+def download_texas_stations(output_path, active_since='20250101'):
     """Download ISD station history and filter to active Texas stations.
 
     Parses the fixed-width ISD history file and filters for:
     - CTRY == 'US' and STATE == 'TX'
-    - Station has data ending on or after 2025-07-01
+    - Station has data ending on or after *active_since*
     - Station has valid lat/lon within Texas bounds
 
     Args:
         output_path: Path to save filtered station list CSV
+        active_since: 'YYYYMMDD' string — only keep stations with END >= this date.
+                      Default '20250101' covers all of 2025.
 
     Returns:
         DataFrame with columns: usaf, wban, station_name, lat, lon, elev, begin, end, station_id
@@ -72,7 +74,7 @@ def download_texas_stations(output_path):
                 continue
 
             # Skip stations that ended before our target period
-            if end_str < '20250701':
+            if end_str < active_since:
                 continue
 
             records.append({
@@ -154,7 +156,8 @@ def download_month(year, month):
         stations = pd.read_csv(stations_file, dtype={'usaf': str, 'wban': str, 'station_id': str})
         print(f"Loaded {len(stations)} stations from {stations_file}")
     else:
-        stations = download_texas_stations(stations_file)
+        active_since = f"{year}{month:02d}01"
+        stations = download_texas_stations(stations_file, active_since=active_since)
 
     # Step 2: Download each station
     num_days = calendar.monthrange(year, month)[1]

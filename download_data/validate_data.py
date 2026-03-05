@@ -1,8 +1,9 @@
-"""validate_data.py — Check completeness of downloaded MVP data for July 2025."""
+"""validate_data.py — Check completeness and coverage of downloaded data."""
 
 import os
 import sys
 import glob
+import calendar
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,19 +14,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
 
 
-def validate_july_2025():
+def validate_data(year=2025, month=7):
+    """Check completeness of downloaded data for a given month.
+
+    Args:
+        year: Integer year (e.g. 2025)
+        month: Integer month (e.g. 7)
+    """
     dirs = setup_directories()
     raw = dirs['raw']
     all_ok = True
+    num_days = calendar.monthrange(year, month)[1]
+    month_str = f"{month:02d}"
+    month_name = calendar.month_name[month]
 
     print("=" * 60)
-    print("MVP Data Validation: July 2025")
+    print(f"Data Validation: {month_name} {year}")
     print("=" * 60)
 
     # 1. NDFD Forecasts
     print("\n--- NDFD Forecasts ---")
     for elem in ['temp', 'wspd', 'wdir']:
-        nc_dir = Path(raw) / 'ndfd_data' / elem / '2025' / '07'
+        nc_dir = Path(raw) / 'ndfd_data' / elem / str(year) / month_str
         if nc_dir.exists():
             nc_files = list(nc_dir.glob("*.nc"))
             status = "ok" if len(nc_files) >= 200 else "LOW"
@@ -36,10 +46,23 @@ def validate_july_2025():
             print(f"  {elem}: MISSING")
             all_ok = False
 
+    # 1b. HRRR Forecasts
+    print("\n--- HRRR Forecasts ---")
+    hrrr_dir = Path(raw) / 'hrrr_data' / str(year) / month_str
+    if hrrr_dir.exists():
+        hrrr_files = list(hrrr_dir.glob("*.nc"))
+        status = "ok" if len(hrrr_files) >= num_days else "LOW"
+        print(f"  NetCDF files: {len(hrrr_files)} [{status}]")
+        if len(hrrr_files) < num_days:
+            all_ok = False
+    else:
+        print(f"  MISSING")
+        all_ok = False
+
     # 2. Weather Stations
     print("\n--- Weather Station Data ---")
     stations_file = Path(raw) / 'weather_stations' / 'stations.csv'
-    ws_dir = Path(raw) / 'weather_stations' / '2025' / '07'
+    ws_dir = Path(raw) / 'weather_stations' / str(year) / month_str
     if stations_file.exists():
         stations = pd.read_csv(stations_file)
         print(f"  Station list: {len(stations)} stations")
@@ -64,15 +87,15 @@ def validate_july_2025():
 
     # 3. ERCOT DAM SPP
     print("\n--- ERCOT Day-Ahead SPP ---")
-    dam_dir = Path(raw) / 'ercot' / 'dam_spp' / '2025' / '07'
+    dam_dir = Path(raw) / 'ercot' / 'dam_spp' / str(year) / month_str
     if dam_dir.exists():
         dam_files = sorted(dam_dir.glob("*.csv"))
-        status = "ok" if len(dam_files) >= 31 else f"{len(dam_files)}/31"
+        status = "ok" if len(dam_files) >= num_days else f"{len(dam_files)}/{num_days}"
         print(f"  Files: {len(dam_files)} [{status}]")
         if dam_files:
             df = pd.read_csv(dam_files[0])
             print(f"  Sample ({dam_files[0].name}): {len(df)} records, columns: {list(df.columns)}")
-        if len(dam_files) < 31:
+        if len(dam_files) < num_days:
             all_ok = False
     else:
         print(f"  MISSING")
@@ -80,15 +103,15 @@ def validate_july_2025():
 
     # 4. ERCOT RT SPP
     print("\n--- ERCOT Real-Time SPP ---")
-    rt_dir = Path(raw) / 'ercot' / 'rt_spp' / '2025' / '07'
+    rt_dir = Path(raw) / 'ercot' / 'rt_spp' / str(year) / month_str
     if rt_dir.exists():
         rt_files = sorted(rt_dir.glob("*.csv"))
-        status = "ok" if len(rt_files) >= 31 else f"{len(rt_files)}/31"
+        status = "ok" if len(rt_files) >= num_days else f"{len(rt_files)}/{num_days}"
         print(f"  Files: {len(rt_files)} [{status}]")
         if rt_files:
             df = pd.read_csv(rt_files[0])
             print(f"  Sample ({rt_files[0].name}): {len(df)} records")
-        if len(rt_files) < 31:
+        if len(rt_files) < num_days:
             all_ok = False
     else:
         print(f"  MISSING")
@@ -97,10 +120,91 @@ def validate_july_2025():
     # Summary
     print("\n" + "=" * 60)
     if all_ok:
-        print("All MVP data present and looks complete.")
+        print(f"All data for {month_name} {year} present and looks complete.")
     else:
         print("Some data missing or incomplete — see above.")
     print("=" * 60)
+
+
+def validate_settlement_point_coverage(year, month):
+    """Report settlement point type distribution and coordinate coverage.
+
+    Loads one day of RT SPP data to show the distribution of settlement point
+    types, then compares RN nodes against node_coordinates.csv to report
+    coordinate coverage.
+
+    Args:
+        year: Integer year (e.g. 2025)
+        month: Integer month (e.g. 7)
+    """
+    dirs = setup_directories()
+    month_str = f"{month:02d}"
+    month_name = calendar.month_name[month]
+
+    print("\n" + "=" * 60)
+    print(f"Settlement Point Coverage: {month_name} {year}")
+    print("=" * 60)
+
+    # Load one day of RT SPP to get type distribution
+    rt_dir = Path(dirs['raw']) / 'ercot' / 'rt_spp' / str(year) / month_str
+    if not rt_dir.exists():
+        print(f"  RT SPP data not found for {year}-{month_str}")
+        return
+
+    rt_files = sorted(rt_dir.glob("rt_spp_*.csv"))
+    if not rt_files:
+        print(f"  No RT SPP files found in {rt_dir}")
+        return
+
+    rt_sample = pd.read_csv(rt_files[0])
+    sample_date = rt_files[0].stem.replace('rt_spp_', '')
+
+    print(f"\n--- Settlement Point Type Distribution (sample: {sample_date}) ---")
+    type_counts = rt_sample['settlementPointType'].value_counts()
+    total_records = len(rt_sample)
+    sp_col = 'settlementPoint' if 'settlementPoint' in rt_sample.columns else 'settlementPointName'
+    for sp_type in type_counts.index:
+        count = type_counts[sp_type]
+        n_unique = rt_sample[rt_sample['settlementPointType'] == sp_type][sp_col].nunique()
+        print(f"  {sp_type:8s}: {count:6d} records ({100*count/total_records:5.1f}%), "
+              f"{n_unique:4d} unique nodes")
+
+    # Load node coordinates and check coverage
+    coords_file = Path(dirs['processed']) / 'node_coordinates.csv'
+    if not coords_file.exists():
+        print(f"\n  node_coordinates.csv not found — run build_node_coordinates() first")
+        return
+
+    coords = pd.read_csv(coords_file)
+    matched_names = set(coords['settlement_point'])
+
+    rn_names = set(rt_sample[rt_sample['settlementPointType'] == 'RN'][sp_col])
+    rn_with_coords = rn_names & matched_names
+    rn_without_coords = rn_names - matched_names
+
+    print(f"\n--- RN Coordinate Coverage ---")
+    print(f"  RN nodes in RT SPP:           {len(rn_names)}")
+    print(f"  RN nodes with coordinates:    {len(rn_with_coords)} "
+          f"({100*len(rn_with_coords)/max(len(rn_names),1):.1f}%)")
+    print(f"  RN nodes without coordinates: {len(rn_without_coords)}")
+
+    print(f"\n--- Node Coordinate Match Methods ---")
+    for method, count in coords['match_method'].value_counts().items():
+        print(f"  {method:20s}: {count:4d}")
+    print(f"  {'TOTAL':20s}: {len(coords):4d}")
+
+    # Show which non-RN types have names that match node_coordinates
+    # (they shouldn't, since coordinates are built from NP4-160 Resource Nodes only)
+    print(f"\n--- Non-RN Settlement Points vs node_coordinates.csv ---")
+    print(f"  (Node coordinates are built from NP4-160, which only contains")
+    print(f"   Resource Nodes. Non-RN types use different naming conventions.)")
+    for sp_type in type_counts.index:
+        if sp_type == 'RN':
+            continue
+        type_names = set(rt_sample[rt_sample['settlementPointType'] == sp_type][sp_col])
+        overlap = type_names & matched_names
+        print(f"  {sp_type:8s}: {len(type_names):4d} unique names, "
+              f"{len(overlap):3d} in node_coordinates")
 
 
 def _draw_texas(ax, proj):
@@ -269,6 +373,6 @@ def validate_node_coordinate_matching():
 
 
 if __name__ == "__main__":
-    validate_july_2025()
+    validate_data(2025, 1)
+    validate_settlement_point_coverage(2025, 1)
     validate_node_coordinate_matching()
-

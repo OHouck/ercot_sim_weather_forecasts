@@ -328,11 +328,11 @@ def plot_ercot_map(output_path=None):
 if __name__ == '__main__':
     dirs = setup_directories()
 
-    out_temp = os.path.join(dirs['root'], 'plots', 'max_temp_july_2025.png')
-    plot_max_temperature_map(output_path=out_temp)
+    # out_temp = os.path.join(dirs['root'], 'plots', 'max_temp_july_2025.png')
+    # plot_max_temperature_map(output_path=out_temp)
 
-    out_wind = os.path.join(dirs['root'], 'plots', 'max_wind_speed_july_2025.png')
-    plot_max_wind_speed_map(output_path=out_wind)
+    # out_wind = os.path.join(dirs['root'], 'plots', 'max_wind_speed_july_2025.png')
+    # plot_max_wind_speed_map(output_path=out_wind)
 
     out_combined = os.path.join(dirs['root'], 'plots', 'combined_map_july_2025.png')
     plot_combined_map(output_path=out_combined)

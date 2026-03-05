@@ -53,7 +53,7 @@ print("Setup complete")
 #| label: data-prep-function
 #| echo: true
 
-def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=False):
+def prepare_node_level_data(months, model='ndfd', force_rebuild=False):
     """
     Build a node × hour dataset linking ERCOT LMP to weather forecast errors.
 
@@ -71,8 +71,8 @@ def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=Fals
     temp_error_25h for NDFD; temp_error_1h, temp_error_18h for HRRR).
 
     Args:
-        year: Year of data (default 2025)
-        month: Month of data (default 7 for July)
+        months: List of (year, month) tuples to include, e.g. [(2025, 1), (2025, 7)].
+                Can also be a single tuple (year, month) for backwards compatibility.
         model: Forecast model — 'ndfd' or 'hrrr' (default 'ndfd')
         force_rebuild: If True, rebuild even if cached file exists
 
@@ -81,51 +81,67 @@ def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=Fals
         LMP, short/long-lead forecast errors, observed weather, and station
         distance.
     """
+    # Accept a single (year, month) tuple for convenience
+    if isinstance(months, tuple) and len(months) == 2 and isinstance(months[0], int):
+        months = [months]
+
     # Model-specific lead times
-    LEAD_TIMES = {
+    MODEL_LEAD_TIMES = {
         'ndfd': (1, 25),
         'hrrr': (1, 18),
     }
-    if model not in LEAD_TIMES:
-        raise ValueError(f"Unknown model '{model}'. Choose from: {list(LEAD_TIMES)}")
+    if model not in MODEL_LEAD_TIMES:
+        raise ValueError(f"Unknown model '{model}'. Choose from: {list(MODEL_LEAD_TIMES)}")
 
-    lead_short, lead_long = LEAD_TIMES[model]
+    lead_short, lead_long = MODEL_LEAD_TIMES[model]
 
     dirs = setup_directories()
 
+    # Build a cache key from the sorted list of months
+    months = sorted(months)
+    if len(months) == 1:
+        year, month = months[0]
+        cache_tag = f"{year}_{month:02d}"
+    else:
+        first_y, first_m = months[0]
+        last_y, last_m = months[-1]
+        cache_tag = f"{first_y}{first_m:02d}_{last_y}{last_m:02d}"
+
     cache_file = os.path.join(
         dirs['processed'],
-        f'node_hourly_{model}_{year}_{month:02d}.csv'
+        f'node_hourly_{model}_{cache_tag}.csv'
     )
 
     if os.path.exists(cache_file) and not force_rebuild:
         print(f"Loading cached node-level data from {cache_file}")
         return pd.read_csv(cache_file, parse_dates=['hour'])
 
-    print(f"Building node-level dataset from scratch (model={model})...")
+    period_str = ", ".join(f"{y}-{m:02d}" for y, m in months)
+    print(f"Building node-level dataset from scratch (model={model}, months={period_str})...")
 
     # ── Step 1: Load all forecast errors and pivot by lead time ──
     print("Loading forecast errors...")
-    forecast_error_dir = os.path.join(
-        dirs['processed'], 'forecast_errors', model, str(year), f"{month:02d}"
-    )
-    error_files = glob.glob(os.path.join(forecast_error_dir, '*.csv'))
-    error_files = [f for f in error_files if not f.endswith('error_summary.csv')]
+    all_error_files = []
+    for year, month in months:
+        forecast_error_dir = os.path.join(
+            dirs['processed'], 'forecast_errors', model, str(year), f"{month:02d}"
+        )
+        month_files = glob.glob(os.path.join(forecast_error_dir, '*.csv'))
+        month_files = [f for f in month_files if not f.endswith('error_summary.csv')]
+        all_error_files.extend(month_files)
+        print(f"  {year}-{month:02d}: {len(month_files)} station files")
 
-    error_dfs = [pd.read_csv(f) for f in error_files]
+    error_dfs = [pd.read_csv(f) for f in all_error_files]
     all_errors = pd.concat(error_dfs, ignore_index=True)
     all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'])
     all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
 
-    print(f"  Loaded {len(all_errors):,} station-hour-lead observations from "
-          f"{len(error_files)} stations ({model.upper()})")
+    print(f"  Total: {len(all_errors):,} station-hour-lead observations "
+          f"({model.upper()}, {len(months)} months)")
 
     # Pivot lead_hours into separate columns
     # Keep one row per (station_id, hour) with columns for each lead time
-    # Must match column names in calculate_forecast_errors.py output:
-    #   temp_error, temp_pct_error, forecast_temp, observed_temp,
-    #   wspd_error, wspd_pct_error, forecast_wspd, observed_wspd,
-    #   wdir_degree_error, forecast_wdir, observed_wdir
+    # Dynamically picks up all data columns from calculate_forecast_errors.py
     error_cols = [c for c in all_errors.columns
                   if c not in ('station_id', 'valid_time', 'lead_hours',
                                'hour', 'lat', 'lon')]
@@ -205,7 +221,23 @@ def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=Fals
 
     # ── Step 5: Load and aggregate RT SPP prices to hourly ──
     print("Loading RT SPP prices...")
-    rt_spp = load_rt_spp_month(year, month)
+    rt_spp_dfs = []
+    for year, month in months:
+        rt_spp_dfs.append(load_rt_spp_month(year, month))
+    rt_spp = pd.concat(rt_spp_dfs, ignore_index=True)
+    # Filter to Resource Node (RN) settlement points only.
+    # RT SPP also contains PCCRN (~15%, bilateral contract units), LCCRN (~7%,
+    # capacity cost participation units), PUN (~5%, demand/load points), and
+    # LZ/HU/SH/AH (~3%, load zone and hub aggregates).
+    #
+    # We filter to RN because:
+    # 1. node_coordinates.csv is built from NP4-160 Resource_Node_to_Unit, which
+    #    only maps resource node names. PCCRN/LCCRN/PUN use different naming
+    #    conventions (unit-level or load-level) that don't appear in coordinates.
+    # 2. RN nodes are physical generation points where weather forecast errors
+    #    directly affect dispatch decisions and locational marginal prices.
+    # 3. PCCRN/LCCRN prices reflect contractual terms, not purely locational.
+    # 4. PUN (demand) nodes lack coordinate mapping and are not generation points.
     rt_spp = rt_spp[rt_spp['settlementPointType'] == 'RN'].copy()
 
     rt_spp['deliveryDate'] = pd.to_datetime(rt_spp['deliveryDate'])
@@ -217,7 +249,7 @@ def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=Fals
     price_hourly = (
         rt_spp
         .groupby(['settlementPoint', 'hour'])['settlementPointPrice']
-        .agg(lmp_mean='mean', lmp_max='max', lmp_std='std')
+        .agg(lmp='first', lmp_mean='mean', lmp_max='max', lmp_std='std')
         .reset_index()
     )
     price_hourly['lmp_std'] = price_hourly['lmp_std'].fillna(0)
@@ -247,6 +279,7 @@ def prepare_node_level_data(year=2025, month=7, model='ndfd', force_rebuild=Fals
     node_hourly['day_of_month'] = node_hourly['hour_dt'].dt.day
     node_hourly['hour_of_day'] = node_hourly['hour_dt'].dt.hour
     node_hourly['weekday'] = node_hourly['hour_dt'].dt.weekday
+    node_hourly['month'] = node_hourly['hour_dt'].dt.month
 
     print(f"\nFinal dataset: {len(node_hourly):,} node-hour observations")
     print(f"  Nodes: {node_hourly['settlement_point'].nunique()}")
@@ -278,7 +311,10 @@ MODEL = 'hrrr'
 LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
 LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
 
-df = prepare_node_level_data(year=2025, month=7, model=MODEL, force_rebuild = True)
+# ── Months to include ──
+MONTHS = [(2025, m) for m in range(1, 13)]
+
+df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
 
 print(f"\n{'='*60}")
 print(f"Dataset Summary ({MODEL.upper()})")
@@ -335,6 +371,14 @@ def prepare_data(df, depvar, treatments, controls, fe):
     df_clean = df.dropna(subset=existing_cols).copy()
     print(f"Analysis sample: {len(df_clean):,} observations "
           f"(dropped {len(df) - len(df_clean):,} with missing values)")
+    observation_cols = ["observed_temp", "observed_wspd", "observed_wdir"]
+    for col in observation_cols:
+        col_short = f"{col}_{LEAD_SHORT}h"
+        col_long = f"{col}_{LEAD_LONG}h"
+        df_clean = df_clean.dropna(subset=[col_short, col_long]) # these aren't captured in the main dropna above since the code is sloppy
+        assert (df_clean[col_short] == df_clean[col_long]).all(), f"Observed {col} should be same for short and long lead columns"
+        # drop the long lead version and rename the short lead version to just observed_temp, observed_wspd, etc.
+        df_clean = df_clean.drop(columns=[col_long]).rename(columns={col_short: col})
     return df_clean
 
 
@@ -359,6 +403,107 @@ def build_formula(depvar, treatments, controls, fe=None, interactions=None):
         fml += " | "  # pyfixest syntax for fixed effects
         fml += " + ".join(fe)
     return fml
+
+
+def plot_coefs(model, data, depvar, treatments, coefs=None, save_path=None, save_dir=None):
+    """
+    Plot coefficient estimates with 95% confidence intervals from a feols model.
+
+    Each coefficient is a row; the x-axis shows the estimate value. A vertical
+    dashed line is drawn at zero for reference. Confidence intervals are drawn
+    as horizontal lines with end caps; point estimates as filled circles.
+
+    A text box in the top-right corner annotates the mean of the dependent
+    variable and each treatment variable, computed from `data`.
+
+    Args:
+        model:      A fitted pyfixest feols model object.
+        data:       DataFrame used to fit the model (for computing variable means).
+        depvar:     Name of the dependent variable column in data.
+        treatments: List of treatment variable names in data.
+        coefs:      Optional list of coefficient names to include. If None,
+                    all coefficients in the model are plotted.
+        save_path:  Optional filename (e.g. 'coef_plot.png'). If provided
+                    without save_dir, saves to the current directory.
+        save_dir:   Optional directory path. If provided without save_path,
+                    saves as 'coef_plot.png' in that directory. If both are
+                    provided, saves as save_dir/save_path.
+
+    Returns:
+        fig, ax — the matplotlib Figure and Axes objects.
+    """
+    tidy = model.tidy()
+
+    # Filter to requested coefficients
+    if coefs is not None:
+        missing = [c for c in coefs if c not in tidy.index]
+        if missing:
+            print(f"Warning: coefficients not found in model and will be skipped: {missing}")
+        tidy = tidy.loc[[c for c in coefs if c in tidy.index]]
+
+    if len(tidy) == 0:
+        raise ValueError("No coefficients to plot after filtering.")
+
+    estimates = tidy['Estimate']
+    se = tidy['Std. Error']
+    ci_lo = estimates - 1.96 * se
+    ci_hi = estimates + 1.96 * se
+    labels = tidy.index.tolist()
+    n = len(labels)
+
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.45 * n + 1)))
+
+    y_pos = list(range(n))
+
+    # Confidence interval lines
+    for i, (lo, hi, est) in enumerate(zip(ci_lo, ci_hi, estimates)):
+        ax.plot([lo, hi], [i, i], color='steelblue', linewidth=1.5, solid_capstyle='butt')
+        # End caps
+        cap_height = 0.18
+        ax.plot([lo, lo], [i - cap_height, i + cap_height], color='steelblue', linewidth=1.5)
+        ax.plot([hi, hi], [i - cap_height, i + cap_height], color='steelblue', linewidth=1.5)
+
+    # Point estimates
+    ax.scatter(estimates, y_pos, color='steelblue', zorder=3, s=40)
+
+    # Zero reference line
+    ax.axvline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel('Coefficient estimate')
+    ax.set_title(f'{depvar} Coefficient Plot (95% CI)')
+    ax.grid(axis='x', linestyle=':', alpha=0.4)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # ── Means annotation (top-right) ──
+    mean_lines = [f"Mean {depvar}: {data[depvar].mean():.3f}"]
+    for t in treatments:
+        if t in data.columns:
+            mean_lines.append(f"Mean {t}: {data[t].mean():.3f}")
+    annotation_text = "\n".join(mean_lines)
+    ax.text(
+        0.98, 0.98, annotation_text,
+        transform=ax.transAxes,
+        fontsize=7,
+        verticalalignment='top',
+        horizontalalignment='right',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='lightgrey', alpha=0.8),
+    )
+
+    plt.tight_layout()
+
+    # Save logic
+    if save_path is not None or save_dir is not None:
+        fname = save_path if save_path is not None else 'coef_plot.png'
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            fname = os.path.join(save_dir, fname)
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved coefficient plot to {fname}")
+
+    return fig, ax
 ```
 
 ## Model 1: Base Specification (1h Forecast Errors)
@@ -372,14 +517,14 @@ def build_formula(depvar, treatments, controls, fe=None, interactions=None):
 leadtime = LEAD_SHORT
 
 # options are lmp_mean, lmp_max, lmp_std
-DEPVAR = "lmp_max"
+DEPVAR = "lmp"
 FE = ["settlement_point", "hour_of_day"]  # Control for hour-of-day fixed effects
 CLUSTER = "settlement_point"
 
 TREATMENTS = [
     f"temp_error_{leadtime}h",
     f"wspd_error_{leadtime}h",
-    f"wdir_error_{leadtime}h",
+    f"wdir_degree_error_{leadtime}h",
 ]
 
 CONTROLS = [
@@ -391,7 +536,7 @@ CONTROLS = [
 INTERACTIONS = [
     (f"temp_error_{leadtime}h", f'observed_temp'),
     (f"wspd_error_{leadtime}h", f'observed_wspd'),
-    (f"wdir_error_{leadtime}h", f'observed_wdir'),
+    (f"wdir_degree_error_{leadtime}h", f'observed_wdir'),
 ]
 
 
@@ -414,5 +559,8 @@ print("=" * 60)
 print(f"{DEPVAR}: {df_clean[DEPVAR].mean():.2f}")
 for t in TREATMENTS:
     print(f"{t}: {df_clean[t].mean():.2f}")
+
+plot_coefs(model1, data=df_clean, depvar=DEPVAR, treatments=TREATMENTS)
+#  save_path=f"coef_plot_{DEPVAR}_{leadtime}h.png", save_dir="figures"
 
 ```

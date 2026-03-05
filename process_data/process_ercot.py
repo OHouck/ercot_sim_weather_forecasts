@@ -67,7 +67,7 @@ def load_rt_spp_month(year, month):
     return df
 
 
-def compute_max_lmp_by_node(year, month, point_type='RN'):
+def compute_max_lmp_by_node(year, month, point_types='RN'):
     """Compute maximum LMP per settlement point for a month.
 
     Uses RT SPP data (settlement points) rather than DAM LMP (buses) since
@@ -76,22 +76,27 @@ def compute_max_lmp_by_node(year, month, point_type='RN'):
     Args:
         year: Integer year
         month: Integer month
-        point_type: Settlement point type filter (default 'RN' for resource nodes)
+        point_types: Settlement point type(s) to include. Can be a string
+            (e.g. 'RN') or a list (e.g. ['RN', 'PCCRN']). If None, includes
+            all types. Default 'RN' for resource nodes only.
 
     Returns:
         DataFrame with columns: settlementPoint, max_lmp
     """
     df = load_rt_spp_month(year, month)
 
-    if point_type:
-        df = df[df['settlementPointType'] == point_type]
+    if point_types is not None:
+        if isinstance(point_types, str):
+            point_types = [point_types]
+        df = df[df['settlementPointType'].isin(point_types)]
 
     max_lmp = (df.groupby('settlementPoint')['settlementPointPrice']
                .max()
                .reset_index()
                .rename(columns={'settlementPointPrice': 'max_lmp'}))
 
-    print(f"Computed max LMP for {len(max_lmp)} {point_type} settlement points")
+    type_label = ','.join(point_types) if point_types else 'ALL'
+    print(f"Computed max LMP for {len(max_lmp)} {type_label} settlement points")
     return max_lmp
 
 
@@ -281,7 +286,7 @@ def build_node_coordinates(force_rebuild=False):
     nodes = rn_df[['RESOURCE_NODE', 'UNIT_SUBSTATION']].drop_duplicates('RESOURCE_NODE')
     all_rn_names = set(nodes['RESOURCE_NODE'])
 
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    data_dir = os.path.join(os.path.dirname(__file__), '..', 'data')
     kml_path = os.path.join(data_dir, 'rtmLmpPoints.kml')
 
     # --- Source 1: HTML contour maps (current, preferred) ---
