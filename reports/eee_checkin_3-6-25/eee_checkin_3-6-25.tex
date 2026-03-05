@@ -1,0 +1,72 @@
+\documentclass[10.95pt, letterpaper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{subcaption}
+
+\begin{document}
+
+\subsection*{Ozma Houck: EEE Check-in  3/6/25}
+
+\textbf{ERCOT Weather Forecast Errors and Nodal Pricing:} How do joint errors in wind and temperature forecasts affect locational marginal prices (LMP) and renewable curtailment in ERCOT? I have made good progress on the data build for LMP, renewable curtailment is more challenging but possible. 
+
+\textbf{Data build Progress:}
+\begin{itemize}
+    \item 1-hour and 18-hour forecasts from NOAA's High-Resolution Rapid Refresh (HRRR) model. Accurate short-run weather model at a 3km resolution. 
+    \item Ground-truth weather observations from 205 active Texas stations. I am considering using gridded ERA5 reanalysis data for a more spatially comprehensive set of weather observations.
+    \item Day-ahead and real-time settlement point prices from ERCOT.
+    \item ERCOT's price data doesn't include geographic coordinates. I matched settlement points to lat/lon using the scraped html from ERCOT's LMP dashboard, a snapshot of nodes from 2019 with coordinates, and EIA plant data. I successfully matched 544 of 937 nodes (58\% coverage) and all but 4 nodes from their dashboard. 
+    \begin{itemize}
+        \item \textbf{Question} Matt Woerman was able to get geographic coordinates for ERCOT nodes. Would it be appropriate to email him and ask the specifics for how he did it?
+    \end{itemize}
+    \item Shapefiles for ERCOT's high voltage transmission lines from recent public simulation model. 
+\end{itemize}
+
+\begin{figure}[H!]
+    \centering
+    \includegraphics[width=0.95\textwidth]{/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/figures/node_coordinate_matching.png}
+    \caption{Left: Map showing matched nodes by source. Large blue dots come from scraping ERCOT's real time price dashboard. The remaining were merged from a 2019 snapshot of nodes with coordinates and EIA plant data. Right: Comparison plants from the EIA-860 plant-level data that I matched to ERCOT nodes and those that I was not able to match. In both plots, the black lines and dots show the locations of nodes and transmission lines in an ERCOT simulation model.}
+\end{figure}
+
+\textbf{Very Early Results:} I link each node to the nearest weather station and run a simple OLS regression of LMP on temperature and wind speed forecast errors, controlling for node and hour-of-day fixed effects. 
+\begin{itemize}
+    \item These local effects are an underestimate due to the lack of network effects. 
+    \item Larger effects for one hour ahead errors and for wind speed. This makes sense since this local analysis will likely mostly pick up the effects of unexpected wind power output. 
+\end{itemize}
+
+\textbf{Next Steps:}
+\begin{itemize}
+    \item I want to run more regressions before fully investing in neural network training. I am interested in clustering nodes and looking at how errors affect the dispersion of prices within and between clusters. 
+    \begin{itemize}
+        \item \textbf{Question} Any other suggestions for regression specifications that would be informative about the network effects of forecast errors?
+    \end{itemize}
+    \item Use simulation transmission lines as a backbone to link nodes together in a graph that I can then fit a GNN to.  
+\end{itemize}
+
+
+\begin{figure}[H!]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/figures/coef_plot_lmp_1h.png}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/figures/coef_plot_lmp_18h.png}
+    \end{subfigure}
+    \caption{OLS regression coefficients for the effect of temperature and wind speed forecasts on LMP with hour-of-day, month, and node fixed effects. Positive errors mean the forecast was warmer/faster than observed, negative means cooler/slower.}
+\end{figure}
+
+
+\textbf{Update on Indian Rice Dryspell Project}: Better understand how the timing and lengths of dryspells impacts rice yields in India. 
+\begin{itemize}
+    \item I recently got access to the district level yield data from CIL's recent climate and agricultural paper.
+    \item Running regressions on the max dryspell length within a growing stage controlling for the total number of dry days in that stage. 
+    \item Preliminary results suggest multiple dry days in a row is most harmful about 30-40 days after planting which is often when rice is moved from the nursery to the field. 
+    \item Hoping to integrate this with the monsoon forecasting group.
+\end{itemize}
+
+
+\end{document}
