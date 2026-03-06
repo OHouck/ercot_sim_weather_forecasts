@@ -408,7 +408,8 @@ def validate_node_coordinate_matching():
     fig.suptitle('Node Coordinate Matching Validation', fontsize=15, y=1.01)
     fig.tight_layout()
 
-    output_path = os.path.join(dirs['root'], 'plots', 'node_coordinate_matching.png')
+    output_path = os.path.join(dirs['figures'], 'node_coordinate_matching.png')
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"\n  Saved plot to {output_path}")

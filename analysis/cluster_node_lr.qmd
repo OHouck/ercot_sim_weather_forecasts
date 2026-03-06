@@ -1,0 +1,549 @@
+---
+title: "Cluster-Level Regression: Weather Forecast Errors and LMP in ERCOT"
+format:
+  html:
+    code-fold: false
+    code-tools: true
+jupyter: python3
+---
+
+## Overview
+
+Cluster-level regression analysis of how weather forecast errors affect LMP in ERCOT.
+
+Unlike the node-level analysis (local_node_lr.qmd), this analysis:
+
+1. Clusters ERCOT resource nodes into geographically contiguous groups with similar LMP patterns
+2. Aggregates data to the cluster x hour level
+3. Runs regressions on cluster-level means
+
+**Clustering approach:** Agglomerative clustering with geographic connectivity constraint
+(from sklearn) ensures no cluster contains nodes from opposite ends of Texas. Features
+combine standardized [lat, lon] (weighted 2x) with LMP summary statistics [mean, std,
+peak-offpeak spread]. Ward linkage minimizes within-cluster variance.
+
+## Setup
+
+```{python}
+#| label: setup
+#| echo: true
+import os
+import sys
+import glob
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import pyfixest as pf
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.neighbors import kneighbors_graph
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path.cwd().parent))
+from helper_funcs import setup_directories
+from process_data.process_ercot import load_rt_spp_month
+from process_data.prepare_node_level_data import prepare_node_level_data
+from process_data.prepare_cluster_level_data import (
+    compute_node_lmp_features, cluster_nodes, sweep_n_clusters, aggregate_to_cluster_hour,
+    build_cluster_polygons, load_station_errors_wide
+)
+
+print("Setup complete")
+```
+
+## Load Data
+
+```{python}
+#| label: load-data
+#| echo: true
+
+dirs = setup_directories()
+
+# ── Choose forecast model: 'ndfd' or 'hrrr' ──
+MODEL = 'hrrr'
+LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
+LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
+
+# ── Months to include ──
+MONTHS = [(2025, m) for m in range(1, 9)]  # Jan to Aug
+
+df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
+
+print(f"\n{'='*60}")
+print(f"Dataset Summary ({MODEL.upper()})")
+print(f"{'='*60}")
+print(f"Observations: {len(df):,}")
+print(f"Nodes: {df['settlement_point'].nunique()}")
+print(f"Lead times: {LEAD_SHORT}h (short) / {LEAD_LONG}h (long)")
+print(f"Date range: {df['hour_dt'].min()} to {df['hour_dt'].max()}")
+```
+
+## Compute Node-Level LMP Features for Clustering
+
+```{python}
+#| label: node-lmp-features
+#| echo: true
+
+node_features = compute_node_lmp_features(df)
+node_features.head()
+```
+
+## Clustering Function
+
+## Choose Number of Clusters
+
+```{python}
+#| label: choose-k
+#| echo: true
+
+print("Sweeping cluster counts...")
+sweep_results, sweep_fig = sweep_n_clusters(node_features, k_range=range(5, 30, 1), geo_weight=10.0, n_neighbors=10)
+```
+
+## Run Clustering
+
+```{python}
+#| label: run-clustering
+#| echo: true
+
+# ── Configuration ──
+N_CLUSTERS = 9 # Adjust based on sweep results above
+GEO_WEIGHT = 10.0       # Weight on geographic features (higher = more spatial coherence)
+N_NEIGHBORS = 8        # Connectivity graph: each node connected to 8 nearest
+
+node_clusters, sil_score = cluster_nodes(
+    node_features,
+    n_clusters=N_CLUSTERS,
+    geo_weight=GEO_WEIGHT,
+    n_neighbors=N_NEIGHBORS
+)
+
+cluster_polygons = build_cluster_polygons(node_clusters)
+
+# Print cluster summary
+print(f"\n{'='*60}")
+print(f"Cluster Summary")
+print(f"{'='*60}")
+cluster_summary = (
+    node_clusters.groupby('cluster')
+    .agg(
+        n_nodes=('settlement_point', 'count'),
+        mean_lat=('lat', 'mean'),
+        mean_lon=('lon', 'mean'),
+        mean_lmp=('mean_lmp', 'mean'),
+        std_lmp_within=('mean_lmp', 'std'),
+    )
+    .round(2)
+)
+print(cluster_summary.to_string())
+```
+
+## Cluster Map
+
+```{python}
+#| label: cluster-map
+#| echo: true
+import cartopy.crs as ccrs
+import cartopy.io.shapereader as shpreader
+
+def plot_cluster_map(node_clusters, n_clusters, sil_score, cluster_polygons=None, save_dir=None):
+    """Plot a map of Texas with nodes colored by cluster assignment."""
+    proj = ccrs.PlateCarree()
+    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw={'projection': proj})
+
+    # Draw Texas outline
+    states_shp = shpreader.natural_earth(
+        resolution='10m', category='cultural', name='admin_1_states_provinces')
+    for record in shpreader.Reader(states_shp).records():
+        if record.attributes.get('name') == 'Texas':
+            ax.add_geometries(
+                [record.geometry], proj,
+                facecolor='#f0f0f0', edgecolor='black', linewidth=1.0)
+            break
+    ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
+
+    # Color map
+    cmap = plt.cm.get_cmap('tab20', n_clusters)
+
+    # Draw cluster polygon outlines
+    if cluster_polygons is not None:
+        for _, row in cluster_polygons.iterrows():
+            cluster_id = row['cluster']
+            color = cmap(cluster_id / max(n_clusters - 1, 1))
+            ax.add_geometries(
+                [row['geometry']], proj,
+                facecolor=(*color[:3], 0.08),   # very faint fill
+                edgecolor=(*color[:3], 0.7),
+                linewidth=1.2,
+                zorder=3
+            )
+
+    scatter = ax.scatter(
+        node_clusters['lon'], node_clusters['lat'],
+        c=node_clusters['cluster'],
+        cmap=cmap, vmin=-0.5, vmax=n_clusters - 0.5,
+        s=40, edgecolors='k', linewidths=0.3, alpha=0.85,
+        transform=proj, zorder=5
+    )
+
+    # Add cluster number labels at centroids
+    centroids = node_clusters.groupby('cluster')[['lat', 'lon']].mean()
+    for cluster_id, row in centroids.iterrows():
+        ax.text(row['lon'], row['lat'], str(cluster_id),
+                fontsize=8, fontweight='bold', ha='center', va='center',
+                transform=proj, zorder=10,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                          edgecolor='gray', alpha=0.7))
+
+    ax.set_title(f'ERCOT Node Clusters (k={n_clusters}, silhouette={sil_score:.3f})',
+                 fontsize=13)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    plt.tight_layout()
+
+    if save_dir:
+        save_path = os.path.join(save_dir, f'cluster_map_k{n_clusters}.png')
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved cluster map to {save_path}")
+
+    return fig, ax
+
+fig, ax = plot_cluster_map(node_clusters, N_CLUSTERS, sil_score,
+                           cluster_polygons=cluster_polygons, save_dir=dirs['figures'])
+```
+
+## Aggregate to Cluster x Hour
+
+```{python}
+#| label: aggregate-to-cluster
+#| echo: true
+
+station_errors = load_station_errors_wide(MONTHS, MODEL, dirs)
+
+cluster_hourly = aggregate_to_cluster_hour(
+    df, node_clusters, LEAD_SHORT, LEAD_LONG,
+    station_errors=station_errors,
+    cluster_polygons=cluster_polygons,
+)
+cluster_hourly.head()
+```
+
+## Data Quality Check
+
+```{python}
+#| label: cluster-data-quality
+#| echo: true
+
+print(f"Cluster-hour dataset shape: {cluster_hourly.shape}")
+print(f"\nMissing values:")
+for col in cluster_hourly.columns:
+    missing = cluster_hourly[col].isna().sum()
+    if missing > 0:
+        print(f"  {col}: {missing} ({100*missing/len(cluster_hourly):.1f}%)")
+
+print(f"\nSummary statistics for key variables:")
+key_vars = ['lmp', f'temp_error_{LEAD_SHORT}h', f'wspd_error_{LEAD_SHORT}h',
+            f'temp_error_{LEAD_LONG}h', f'wspd_error_{LEAD_LONG}h',
+            'n_nodes_in_hour']
+existing_vars = [v for v in key_vars if v in cluster_hourly.columns]
+print(cluster_hourly[existing_vars].describe().round(3).to_string())
+```
+
+## Regression Helper Functions
+
+```{python}
+#| label: helper-functions
+#| echo: true
+
+def prepare_data(df, depvar, treatments, controls, fe):
+    """Drop rows with NaN in any analysis column and return clean DataFrame."""
+    if fe:
+        fe = fe if isinstance(fe, list) else [fe]
+    all_cols = [depvar] + treatments + controls + fe
+    existing_cols = [c for c in all_cols if c in df.columns]
+    df_clean = df.dropna(subset=existing_cols).copy()
+    print(f"Analysis sample: {len(df_clean):,} observations "
+          f"(dropped {len(df) - len(df_clean):,} with missing values)")
+    observation_cols = ["observed_temp", "observed_wspd", "observed_wdir"]
+    for col in observation_cols:
+        col_short = f"{col}_{LEAD_SHORT}h"
+        col_long = f"{col}_{LEAD_LONG}h"
+        df_clean = df_clean.dropna(subset=[col_short, col_long])
+        assert (df_clean[col_short] == df_clean[col_long]).all(), f"Observed {col} should be same for short and long lead columns"
+        df_clean = df_clean.drop(columns=[col_long]).rename(columns={col_short: col})
+    return df_clean
+
+
+def build_formula(depvar, treatments, controls, fe=None, interactions=None):
+    """
+    Build a pyfixest formula string.
+
+    Args:
+        depvar: dependent variable name
+        treatments: list of treatment variable names
+        controls: list of control variable names
+        fe: fixed effect variables (or None)
+        interactions: list of (treatment, x_var) tuples for interaction terms
+    """
+    rhs_parts = treatments + controls
+    if interactions:
+        for tname, xname in interactions:
+            rhs_parts.append(f"{tname}:{xname}")
+    rhs = " + ".join(rhs_parts)
+    fml = f"{depvar} ~ {rhs}"
+    if fe:
+        fml += " | "  # pyfixest syntax for fixed effects
+        fml += " + ".join(fe)
+    return fml
+
+
+def plot_coefs(model, data, depvar, treatments, coefs=None, save_path=None, save_dir=None):
+    """
+    Plot coefficient estimates with 95% confidence intervals from a feols model.
+    """
+    tidy = model.tidy()
+
+    # Filter to requested coefficients
+    if coefs is not None:
+        missing = [c for c in coefs if c not in tidy.index]
+        if missing:
+            print(f"Warning: coefficients not found in model and will be skipped: {missing}")
+        tidy = tidy.loc[[c for c in coefs if c in tidy.index]]
+
+    if len(tidy) == 0:
+        raise ValueError("No coefficients to plot after filtering.")
+
+    estimates = tidy['Estimate']
+    se = tidy['Std. Error']
+    ci_lo = estimates - 1.96 * se
+    ci_hi = estimates + 1.96 * se
+    labels = tidy.index.tolist()
+    n = len(labels)
+
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.45 * n + 1)))
+
+    y_pos = list(range(n))
+
+    # Confidence interval lines
+    for i, (lo, hi, est) in enumerate(zip(ci_lo, ci_hi, estimates)):
+        ax.plot([lo, hi], [i, i], color='steelblue', linewidth=1.5, solid_capstyle='butt')
+        # End caps
+        cap_height = 0.18
+        ax.plot([lo, lo], [i - cap_height, i + cap_height], color='steelblue', linewidth=1.5)
+        ax.plot([hi, hi], [i - cap_height, i + cap_height], color='steelblue', linewidth=1.5)
+
+    # Point estimates
+    ax.scatter(estimates, y_pos, color='steelblue', zorder=3, s=40)
+
+    # Zero reference line
+    ax.axvline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel('Coefficient estimate')
+    ax.set_title(f'{depvar} Coefficient Plot (95% CI)')
+    ax.grid(axis='x', linestyle=':', alpha=0.4)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # ── Means annotation (top-right) ──
+    mean_lines = [f"Mean {depvar}: {data[depvar].mean():.3f}"]
+    for t in treatments:
+        if t in data.columns:
+            mean_lines.append(f"Mean {t}: {data[t].mean():.3f}")
+    annotation_text = "\n".join(mean_lines)
+    ax.text(
+        0.98, 0.98, annotation_text,
+        transform=ax.transAxes,
+        fontsize=7,
+        verticalalignment='top',
+        horizontalalignment='right',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='lightgrey', alpha=0.8),
+    )
+
+    plt.tight_layout()
+
+    # Save logic
+    if save_path is not None or save_dir is not None:
+        fname = save_path if save_path is not None else 'coef_plot.png'
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            fname = os.path.join(save_dir, fname)
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved coefficient plot to {fname}")
+
+    return fig, ax
+```
+
+## Model 1: Cluster-Level Regression (Short Lead)
+
+```{python}
+#| label: model-cluster-short
+#| echo: true
+
+leadtime = LEAD_SHORT
+
+DEPVAR = "lmp"
+FE = ["cluster", "hour_of_day", "month"]
+CLUSTER_SE = "cluster"
+
+TREATMENTS = [
+    f"temp_error_{leadtime}h",
+    f"wspd_error_{leadtime}h",
+    f"wdir_degree_error_{leadtime}h",
+]
+
+CONTROLS = [
+    "observed_temp",
+    "observed_wspd",
+    "observed_wdir",
+    "weekday",
+]
+
+INTERACTIONS = [
+    (f"temp_error_{leadtime}h", "observed_temp"),
+    (f"wspd_error_{leadtime}h", "observed_wspd"),
+    (f"wdir_degree_error_{leadtime}h", "observed_wdir"),
+]
+
+df_clean = prepare_data(cluster_hourly, DEPVAR, TREATMENTS, CONTROLS, FE)
+
+print(f"\n{'='*60}")
+print(f"CLUSTER MODEL: {leadtime}h Forecast Errors -> LMP [{MODEL.upper()}]")
+print(f"{'='*60}")
+
+fml = build_formula(DEPVAR, TREATMENTS, CONTROLS, fe=FE, interactions=INTERACTIONS)
+print(f"  Formula: {fml}")
+
+model_short = pf.feols(fml=fml, data=df_clean, vcov={"CRV1": CLUSTER_SE})
+print(model_short.summary())
+
+print(f"\nVariable Means:")
+print(f"  {DEPVAR}: {df_clean[DEPVAR].mean():.2f}")
+for t in TREATMENTS:
+    print(f"  {t}: {df_clean[t].mean():.2f}")
+
+plot_coefs(model_short, data=df_clean, depvar=DEPVAR, treatments=TREATMENTS,
+           save_path=f"cluster_coef_{DEPVAR}_{leadtime}h.png", save_dir=dirs["figures"])
+```
+
+## Model 2: Cluster-Level Regression (Long Lead)
+
+```{python}
+#| label: model-cluster-long
+#| echo: true
+
+leadtime = LEAD_LONG
+
+TREATMENTS_LONG = [
+    f"temp_error_{leadtime}h",
+    f"wspd_error_{leadtime}h",
+    f"wdir_degree_error_{leadtime}h",
+]
+
+INTERACTIONS_LONG = [
+    (f"temp_error_{leadtime}h", "observed_temp"),
+    (f"wspd_error_{leadtime}h", "observed_wspd"),
+    (f"wdir_degree_error_{leadtime}h", "observed_wdir"),
+]
+
+df_clean_long = prepare_data(cluster_hourly, DEPVAR, TREATMENTS_LONG, CONTROLS, FE)
+
+print(f"\n{'='*60}")
+print(f"CLUSTER MODEL: {leadtime}h Forecast Errors -> LMP [{MODEL.upper()}]")
+print(f"{'='*60}")
+
+fml_long = build_formula(DEPVAR, TREATMENTS_LONG, CONTROLS, fe=FE, interactions=INTERACTIONS_LONG)
+print(f"  Formula: {fml_long}")
+
+model_long = pf.feols(fml=fml_long, data=df_clean_long, vcov={"CRV1": CLUSTER_SE})
+print(model_long.summary())
+
+print(f"\nVariable Means:")
+print(f"  {DEPVAR}: {df_clean_long[DEPVAR].mean():.2f}")
+for t in TREATMENTS_LONG:
+    print(f"  {t}: {df_clean_long[t].mean():.2f}")
+
+plot_coefs(model_long, data=df_clean_long, depvar=DEPVAR, treatments=TREATMENTS_LONG,
+           save_path=f"cluster_coef_{DEPVAR}_{leadtime}h.png", save_dir=dirs["figures"])
+```
+
+## Comparison: Node-Level vs Cluster-Level
+
+```{python}
+#| label: comparison
+#| echo: true
+
+print(f"{'='*60}")
+print("Comparison: Node-Level vs Cluster-Level")
+print(f"{'='*60}")
+print(f"\nNode-level data: {len(df):,} obs ({df['settlement_point'].nunique()} nodes)")
+print(f"Cluster-level data: {len(cluster_hourly):,} obs ({cluster_hourly['cluster'].nunique()} clusters)")
+print(f"Reduction factor: {len(df)/len(cluster_hourly):.1f}x")
+print(f"\nCluster-level aggregation averages out idiosyncratic node-level noise,")
+print(f"providing estimates of the average effect of forecast errors on LMP")
+print(f"within geographically coherent regions of the ERCOT grid.")
+```
+
+## Heterogeneity by Region
+
+```{python}
+#| label: heterogeneity-by-region
+#| echo: true
+
+# Split clusters into rough geographic regions based on centroid longitude
+# West Texas (< -100), Central (-100 to -97), East/Coast (> -97)
+centroids = node_clusters.groupby('cluster')[['lat', 'lon']].mean()
+centroids['region'] = pd.cut(
+    centroids['lon'],
+    bins=[-110, -100, -97, -90],
+    labels=['West', 'Central', 'East/Coast']
+)
+
+# Merge region into cluster-hourly data
+df_reg_region = cluster_hourly.merge(
+    centroids[['region']].reset_index(),
+    on='cluster', how='left'
+)
+
+# Deduplicate observed columns for regression
+observation_cols = ["observed_temp", "observed_wspd", "observed_wdir"]
+for col in observation_cols:
+    col_short = f"{col}_{LEAD_SHORT}h"
+    col_long = f"{col}_{LEAD_LONG}h"
+    if col_short in df_reg_region.columns and col_long in df_reg_region.columns:
+        df_reg_region = df_reg_region.drop(columns=[col_long]).rename(columns={col_short: col})
+
+leadtime = LEAD_SHORT
+TREATMENTS_SHORT = [
+    f"temp_error_{leadtime}h",
+    f"wspd_error_{leadtime}h",
+    f"wdir_degree_error_{leadtime}h",
+]
+
+for region in ['West', 'Central', 'East/Coast']:
+    subset = df_reg_region[df_reg_region['region'] == region].copy()
+    if len(subset) < 100:
+        print(f"Skipping {region}: only {len(subset)} observations")
+        continue
+
+    all_cols = [DEPVAR] + TREATMENTS_SHORT + CONTROLS + FE
+    existing_cols = [c for c in all_cols if c in subset.columns]
+    subset_clean = subset.dropna(subset=existing_cols)
+
+    fml = build_formula(DEPVAR, TREATMENTS_SHORT, CONTROLS, fe=FE)
+
+    try:
+        m = pf.feols(fml=fml, data=subset_clean, vcov={"CRV1": CLUSTER_SE})
+        print(f"\n{'='*60}")
+        print(f"Region: {region} ({subset_clean['cluster'].nunique()} clusters, "
+              f"{len(subset_clean):,} obs)")
+        print(f"{'='*60}")
+        print(m.summary())
+    except Exception as e:
+        print(f"Region {region} failed: {e}")
+```

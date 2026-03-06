@@ -16,6 +16,7 @@ def setup_directories():
         'root': root,
         'raw': os.path.join(root, 'raw_data'),
         'processed': os.path.join(root, 'processed_data'),
+        'figures': os.path.join(root, 'figures'),
     }
 
     for path in dirs.values():

@@ -18,7 +18,7 @@ from helper_funcs import setup_directories
 # ── Time period ─────────────────────────────────────────────────────────────
 # List of (year, month) tuples to process. Every per-month step loops over
 # this list.  Change this single variable to expand or restrict the period.
-MONTHS = [(2025, m) for m in range(1, 13)]
+MONTHS = [(2025, m) for m in range(1, 9)] # stopping before september since no weather station data after
 
 dirs = setup_directories()
 
@@ -48,9 +48,12 @@ dirs = setup_directories()
 # Pulls hourly temperature and wind data for ~200 Texas weather stations.
 # ~1 min per month. Skips stations already downloaded.
 # =============================================================================
-# from download_data.pull_weatherstation import download_month as download_weather
-# for year, month in MONTHS:
-#     download_weather(year, month)
+from download_data.pull_weatherstation import download_month as download_weather
+for year, month in MONTHS:
+    print(f"\n=== Downloading ISD weather station data for {year}-{month:02d} ===")
+    download_weather(year, month)
+
+exit()
 
 # =============================================================================
 # STEP 3: Download ERCOT market data (DAM SPP + RT SPP)
