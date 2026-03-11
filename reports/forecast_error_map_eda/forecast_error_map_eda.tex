@@ -1,0 +1,185 @@
+\documentclass[11pt]{article}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\geometry{margin=0.75in, top=0.6in, bottom=0.6in}
+\setlength{\parskip}{0pt}
+\setlength{\intextsep}{6pt}
+\graphicspath{{/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/figures/forecast_error_map_eda/}}
+
+\begin{document}
+
+\title{Forecast Error Map EDA \\[4pt]
+\large Temperature errors, lead 1h (HRRR)}
+\author{}
+\date{\today}
+\maketitle
+
+\section*{Configuration}
+\begin{tabular}{ll}
+\toprule
+Weather variable & \texttt{temp} (temperature, °C) \\
+Lead time & 1h \\
+Model & HRRR \\
+Months & 2025-01 to 2025-08 \\
+Clusters & 9 \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+For each cluster, the \textbf{treatment} map shows the hour with the
+largest absolute mean temperature forecast error in that cluster.
+The \textbf{control} map shows a nearby hour (within 14 days)
+at the same hour of day with temperature error close to the cluster mean.
+Node colors show real-time LMP (\$/MWh); the color scale is shared between
+treatment and control within each cluster.
+Annotations report the temperature error for that hour alongside both wind
+speed and temperature errors for reference.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster00_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster00_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 0: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster01_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster01_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 1: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster02_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster02_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 2: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster03_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster03_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 3: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster04_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster04_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 4: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster05_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster05_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 5: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster06_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster06_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 6: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster07_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster07_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 7: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster08_treatment.png}
+    \caption{Treatment (large error)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{temp_1h_cluster08_control.png}
+    \caption{Control (near-mean error)}
+  \end{subfigure}
+  \caption{Cluster 8: LMP maps for treatment vs.\ control hours (temperature error, lead 1h).}
+\end{figure}
+\vspace{-8pt}
+\end{document}
