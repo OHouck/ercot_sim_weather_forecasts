@@ -3,12 +3,17 @@
 import os
 import glob
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
 import geopandas as gpd
+import xarray as xr
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
 
 
@@ -325,6 +330,102 @@ def plot_ercot_map(output_path=None):
     return fig, ax
 
 
+def map_power_grid(ds, variables, title=None, cmap='viridis', figsize=(10, 8),
+                   output_path=None):
+    """Map gridded power variables over Texas.
+
+    Args:
+        ds: xarray Dataset loaded from gridded_generation_map.nc.
+        variables: Variable name string or list of variable names to combine.
+            If a list is provided, values are summed cell-wise.
+        title: Optional plot title. If None, generated from variables.
+        cmap: Matplotlib colormap name.
+        figsize: Figure size tuple.
+        output_path: If provided, save figure to this path.
+
+    Returns:
+        (fig, ax, combined_da): Matplotlib figure/axis and combined DataArray.
+    """
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise ImportError("xarray is required for map_power_grid") from exc
+
+    if not isinstance(ds, xr.Dataset):
+        raise TypeError("ds must be an xarray.Dataset")
+
+    if isinstance(variables, str):
+        variables = [variables]
+    elif not isinstance(variables, (list, tuple)) or len(variables) == 0:
+        raise ValueError("variables must be a non-empty string or list of strings")
+
+    missing = [v for v in variables if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in dataset: {missing}")
+
+    lat_name = 'latitude' if 'latitude' in ds.coords else 'lat'
+    lon_name = 'longitude' if 'longitude' in ds.coords else 'lon'
+    if lat_name not in ds.coords or lon_name not in ds.coords:
+        raise KeyError("Dataset must contain latitude/longitude or lat/lon coordinates")
+
+    # Combine the requested layers with a cell-wise sum.
+    arrays = [ds[v].astype(float) for v in variables]
+    combined_da = arrays[0].copy()
+    for arr in arrays[1:]:
+        combined_da = combined_da + arr
+
+    # Ensure we are plotting a 2D raster only.
+    expected_dims = {lat_name, lon_name}
+    if set(combined_da.dims) != expected_dims:
+        raise ValueError(
+            f"Combined variable must have dims {expected_dims}, got {combined_da.dims}"
+        )
+
+    lats = ds[lat_name].values
+    lons = ds[lon_name].values
+    values = combined_da.values
+    masked_values = np.ma.masked_where(~np.isfinite(values) | (values == 0), values)
+
+    plot_cmap = plt.get_cmap(cmap)
+    if hasattr(plot_cmap, 'copy'):
+        plot_cmap = plot_cmap.copy()
+    plot_cmap.set_bad((0, 0, 0, 0))
+
+    if title is None:
+        joined = ' + '.join(variables)
+        title = f'Power Grid Map: {joined}'
+
+    proj = ccrs.PlateCarree()
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw={'projection': proj})
+
+    _draw_texas(ax, proj)
+
+    mesh = ax.pcolormesh(
+        lons,
+        lats,
+        masked_values,
+        cmap=plot_cmap,
+        shading='auto',
+        transform=proj,
+        zorder=3,
+    )
+
+    cbar = plt.colorbar(mesh, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label('Combined Value', fontsize=11)
+
+    ax.set_title(title, fontsize=14)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+    fig.tight_layout()
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {output_path}")
+
+    plt.show()
+    return fig, ax, combined_da
+
+
 if __name__ == '__main__':
     dirs = setup_directories()
 
@@ -334,5 +435,34 @@ if __name__ == '__main__':
     # out_wind = os.path.join(dirs['root'], 'plots', 'max_wind_speed_july_2025.png')
     # plot_max_wind_speed_map(output_path=out_wind)
 
-    out_combined = os.path.join(dirs['root'], 'plots', 'combined_map_july_2025.png')
-    plot_combined_map(output_path=out_combined)
+    # out_combined = os.path.join(dirs['root'], 'plots', 'combined_map_july_2025.png')
+    # plot_combined_map(output_path=out_combined)
+    
+    gridded_generation_path = os.path.join(dirs['processed'], 'gridded_generation_map.nc')
+    ds = xr.open_dataset(gridded_generation_path)
+    data_vars = list(ds.data_vars)
+    solar = ["nameplate_mw_tech_solar_photovoltaic"]
+    wind = ["nameplate_mw_tech_onshore_wind_turbine"]
+    transmission = ["has_transmission_line"]
+    load = ["load_center"]
+    gas = ["nameplate_mw_tech_natural_gas_fired_combustion_turbine", "nameplate_mw_tech_natural_gas_fired_combined_cycle", "nameplate_mw_tech_natural_gas_steam_turbine", "nameplate_mw_tech_natural_gas_internal_combustion_engine"]
+    coal = ["nameplate_mw_tech_conventional_steam_coal"]
+    oil = ["nameplate_mw_tech_petroleum_liquids", "nameplate_mw_tech_petroleum_coke"]
+    nuclear = ["nameplate_mw_tech_nuclear"]
+    batteries = ["nameplate_mw_tech_batteries"]
+    total_generation = ["total_capacity_mw"]
+    number_of_generators = ["n_generators"]
+    other = set(data_vars) - set(solar + wind + transmission + load + gas + coal + oil + total_generation + batteries + number_of_generators + nuclear)
+    print(other)
+    # map_power_grid(ds, variables = solar , title='Solar', cmap='inferno')
+    # map_power_grid(ds, variables = wind, title='Wind', cmap='inferno')
+    # map_power_grid(ds, variables = gas, title='Natural Gas', cmap='inferno')
+    # map_power_grid(ds, variables = coal, title='Coal', cmap='inferno')
+    # map_power_grid(ds, variables = oil, title='Oil', cmap='inferno')
+    # map_power_grid(ds, variables = nuclear, title='Nuclear', cmap='inferno')
+    # map_power_grid(ds, variables = batteries, title='Batteries', cmap='inferno')
+    # map_power_grid(ds, variables = transmission, title='Transmission Lines', cmap='gray')
+    # map_power_grid(ds, variables = load, title='Load Centers', cmap='Reds')
+    # map_power_grid(ds, variables = total_generation, title='Total Generation Capacity', cmap='inferno')
+
+

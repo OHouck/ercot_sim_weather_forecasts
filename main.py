@@ -18,7 +18,7 @@ from helper_funcs import setup_directories
 # ── Time period ─────────────────────────────────────────────────────────────
 # List of (year, month) tuples to process. Every per-month step loops over
 # this list.  Change this single variable to expand or restrict the period.
-MONTHS = [(2025, m) for m in range(1, 9)] # stopping before september since no weather station data after
+MONTHS = [(2025, m) for m in range(1, 13)] # stopping before september since no weather station data after
 
 dirs = setup_directories()
 
@@ -44,16 +44,26 @@ dirs = setup_directories()
 #     download_hrrr_month(year, month, hrrr_base)
 
 # =============================================================================
+# STEP 1c: Download ERA5-Land hourly reanalysis for Texas
+# Downloads 2m_temperature and 10m_u/v_wind from the Copernicus CDS API.
+# Derives wind speed and direction and saves as compressed NetCDF.
+# Requires ~/.cdsapirc with a valid API key (https://cds.climate.copernicus.eu).
+# ~10-30 min per month (~50-100 MB per request). Skips files that already exist.
+# =============================================================================
+# from download_data.pull_era5 import download_era5_month
+# for year, month in MONTHS:
+#     download_era5_month(year, month, base_dir=dirs['raw'])
+
+# =============================================================================
 # STEP 2: Download realized weather observations from NOAA ISD
 # Pulls hourly temperature and wind data for ~200 Texas weather stations.
 # ~1 min per month. Skips stations already downloaded.
 # =============================================================================
-from download_data.pull_weatherstation import download_month as download_weather
-for year, month in MONTHS:
-    print(f"\n=== Downloading ISD weather station data for {year}-{month:02d} ===")
-    download_weather(year, month)
+# from download_data.pull_weatherstation import download_month as download_weather
+# for year, month in MONTHS:
+#     print(f"\n=== Downloading ISD weather station data for {year}-{month:02d} ===")
+#     download_weather(year, month)
 
-exit()
 
 # =============================================================================
 # STEP 3: Download ERCOT market data (DAM SPP + RT SPP)
@@ -98,29 +108,46 @@ exit()
 # compares to ISD hourly observations, and saves per-station error CSVs.
 # Requires Steps 1 and 2. ~2 min per month per model.
 # =============================================================================
-from process_data.calculate_forecast_errors import (
-    calculate_ndfd_errors_for_month,
-    calculate_hrrr_errors_for_month,
-)
-for year, month in MONTHS:
+# from process_data.calculate_forecast_errors import (
+#     calculate_ndfd_errors_for_month,
+#     calculate_hrrr_errors_for_month,
+# )
+# for year, month in MONTHS:
     # calculate_ndfd_errors_for_month(year, month) # not using atm
-    calculate_hrrr_errors_for_month(year, month)
+    # calculate_hrrr_errors_for_month(year, month)
 
 # =============================================================================
-# STEP 6: Generate plots
-# Creates Texas maps of max temperature, max wind speed, and max LMP.
-# Requires Steps 2, 3, 4c.
+# STEP 5b: Calculate ERA5-based gridded forecast errors
+# Uses ERA5-Land reanalysis as ground truth instead of ISD weather stations.
+# Provides dense spatial coverage (~14,000 ERA5 cells vs ~202 stations).
+# Output: compressed NetCDF at
+#   {processed}/forecast_errors_era5/{model}/{year}/{month:02d}/era5_errors_{YYYYMM}.nc
+#   plus a human-readable error_summary.csv per month.
+# All valid_time values are US/Central (tz-naive).
+# Requires Step 1 (HRRR or NDFD data) AND Step 1c (ERA5-Land data).
+# ~10-20 min per month per model.
 # =============================================================================
-# from create_plots import (
-#     plot_max_temperature_map,
-#     plot_max_wind_speed_map,
-#     plot_combined_map,
-#     plot_ercot_map,
-# )
-# plot_dir = os.path.join(dirs['root'], 'plots')
+# from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
 # for year, month in MONTHS:
-#     tag = f"{year}_{month:02d}"
-#     plot_max_temperature_map(year, month, output_path=os.path.join(plot_dir, f'max_temp_{tag}.png'))
-#     plot_max_wind_speed_map(year, month, output_path=os.path.join(plot_dir, f'max_wind_speed_{tag}.png'))
-#     plot_combined_map(year, month, output_path=os.path.join(plot_dir, f'combined_map_{tag}.png'))
-# plot_ercot_map()
+#     calculate_era5_errors_for_month(year, month, model='hrrr')
+#     # calculate_era5_errors_for_month(year, month, model='ndfd')
+
+# =============================================================================
+# Map generation data to a grid and save as NetCDF
+# Uses the node_coordinates.csv mapping to assign generation values to lat/lon grid.
+# Output: gridded_generation_map.nc 
+# =============================================================================
+# from process_data.gridded_generation_mapping import map_generation_to_grid
+# map_generation_to_grid(force_rebuild=False)
+
+# =============================================================================
+# Combine gridded generation data with forecast errrors and lmp data into single
+# montly parquet files
+# Output: pixel_hourly_{model}_{YYYYMM}.parquet
+# =============================================================================
+from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset 
+for year, month in MONTHS:
+    build_pixel_hourly_dataset(
+        year, month, model='hrrr', force_rebuild=False
+    )
+

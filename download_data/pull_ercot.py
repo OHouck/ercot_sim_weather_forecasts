@@ -1,7 +1,7 @@
-"""pull_ercot.py — Download ERCOT settlement point price data.
+"""pull_ercot.py — Download ERCOT market and demand data.
 
-Downloads day-ahead and real-time settlement point prices
-from the ERCOT Public API. Requires API credentials in ~/keys/.
+Downloads day-ahead and real-time settlement point prices, actual system load,
+and demand forecasts from the ERCOT Public API. Requires API credentials in ~/keys/.
 
 Authentication flow:
 1. Get OAuth2 Bearer token via Azure B2C ROPC flow using username/password
@@ -257,6 +257,111 @@ def download_rt_spp(start_date, end_date, output_dir, api_key, bearer_token=None
         time.sleep(2)
 
 
+def download_actual_load(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download actual hourly system load by weather zone (NP6-345-CD).
+
+    Downloads one month at a time. Each month produces ~744 rows (24 hours x ~31 days).
+
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        output_dir: Directory to save monthly CSV files
+        api_key: ERCOT API key
+        bearer_token: OAuth2 bearer token
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Parse into months and download each
+    current = datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+
+    while current <= end:
+        import calendar
+        month_end_day = calendar.monthrange(current.year, current.month)[1]
+        month_start = current.replace(day=1)
+        month_end = min(current.replace(day=month_end_day), end)
+
+        month_str = month_start.strftime('%Y-%m')
+        output_file = os.path.join(output_dir, f"actual_load_{month_str}.csv")
+
+        if os.path.exists(output_file):
+            print(f"  Skipping {month_str} (already exists)")
+            current = month_end + timedelta(days=1)
+            continue
+
+        print(f"  Downloading actual load for {month_str}...")
+        params = {
+            'operatingDayFrom': month_start.strftime('%Y-%m-%d'),
+            'operatingDayTo': month_end.strftime('%Y-%m-%d'),
+        }
+
+        records = ercot_request(
+            '/np6-345-cd/act_sys_load_by_wzn', params, api_key, bearer_token
+        )
+
+        if records:
+            df = pd.DataFrame(records)
+            df.to_csv(output_file, index=False)
+            print(f"    Saved {len(df)} records")
+        else:
+            print(f"    No data for {month_str}")
+
+        current = month_end + timedelta(days=1)
+        time.sleep(2)
+
+
+def download_demand_forecasts(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download demand forecasts by model and weather zone (NP3-565-CD).
+
+    Downloads forecasts with inUseFlag=true for each day. Saves raw data
+    including all posted times; lead times are computed in post-processing.
+
+    Each day produces ~4,608 rows (192 posted times x 24 delivery hours,
+    filtered to the active model at each issuance).
+
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        output_dir: Directory to save daily CSV files
+        api_key: ERCOT API key
+        bearer_token: OAuth2 bearer token
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    current = datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        output_file = os.path.join(output_dir, f"demand_forecast_{date_str}.csv")
+
+        if os.path.exists(output_file):
+            print(f"  Skipping {date_str} (already exists)")
+            current += timedelta(days=1)
+            continue
+
+        print(f"  Downloading demand forecasts for {date_str}...")
+        params = {
+            'deliveryDateFrom': date_str,
+            'deliveryDateTo': date_str,
+            'inUseFlag': 'true',
+        }
+
+        records = ercot_request(
+            '/np3-565-cd/lf_by_model_weather_zone', params, api_key, bearer_token
+        )
+
+        if records:
+            df = pd.DataFrame(records)
+            df.to_csv(output_file, index=False)
+            print(f"    Saved {len(df)} records")
+        else:
+            print(f"    No data for {date_str}")
+
+        current += timedelta(days=1)
+        time.sleep(2)
+
+
 def download_month(year, month):
     """Download all ERCOT data for a given month.
 
@@ -300,7 +405,27 @@ def download_month(year, month):
     rt_dir = os.path.join(base_dir, 'rt_spp', str(year), f"{month:02d}")
     download_rt_spp(start_date, end_date, rt_dir, api_key, bearer_token)
 
+    # Actual system load
+    print("\n--- Actual System Load ---")
+    load_dir = os.path.join(base_dir, 'actual_load', str(year), f"{month:02d}")
+    download_actual_load(start_date, end_date, load_dir, api_key, bearer_token)
+
+    # Demand forecasts
+    print("\n--- Demand Forecasts ---")
+    forecast_dir = os.path.join(base_dir, 'demand_forecast', str(year), f"{month:02d}")
+    download_demand_forecasts(start_date, end_date, forecast_dir, api_key, bearer_token)
+
     print("\n=== ERCOT Download Complete ===")
+
+
+def download_year(year):
+    """Download all ERCOT data for a full year.
+
+    Args:
+        year: Integer year (e.g. 2025)
+    """
+    for month in range(1, 13):
+        download_month(year, month)
 
 
 if __name__ == "__main__":

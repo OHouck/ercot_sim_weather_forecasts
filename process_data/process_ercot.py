@@ -100,6 +100,138 @@ def compute_max_lmp_by_node(year, month, point_types='RN'):
     return max_lmp
 
 
+def load_actual_load_month(year, month):
+    """Load actual hourly system load for a month.
+
+    Args:
+        year: Integer year
+        month: Integer month
+
+    Returns:
+        DataFrame with columns: operatingDay, hourEnding, coast, east,
+        farWest, north, northC, southern, southC, west, total, DSTFlag
+    """
+    dirs = setup_directories()
+    data_dir = os.path.join(dirs['raw'], 'ercot', 'actual_load', str(year), f"{month:02d}")
+    csv_files = sorted(glob.glob(os.path.join(data_dir, 'actual_load_*.csv')))
+
+    if not csv_files:
+        raise FileNotFoundError(f"No actual load files found in {data_dir}")
+
+    dfs = [pd.read_csv(f) for f in csv_files]
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"Loaded {len(df):,} actual load records from {len(csv_files)} files")
+    return df
+
+
+def load_demand_forecasts_month(year, month):
+    """Load all daily demand forecast CSVs for a month.
+
+    Args:
+        year: Integer year
+        month: Integer month
+
+    Returns:
+        DataFrame with columns: postedDatetime, deliveryDate, hourEnding,
+        coast, east, farWest, north, northCentral, southCentral, southern,
+        west, systemTotal, model, inUseFlag, DSTFlag
+    """
+    dirs = setup_directories()
+    data_dir = os.path.join(dirs['raw'], 'ercot', 'demand_forecast', str(year), f"{month:02d}")
+    csv_files = sorted(glob.glob(os.path.join(data_dir, 'demand_forecast_*.csv')))
+
+    if not csv_files:
+        raise FileNotFoundError(f"No demand forecast files found in {data_dir}")
+
+    dfs = [pd.read_csv(f) for f in csv_files]
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"Loaded {len(df):,} demand forecast records from {len(csv_files)} files")
+    return df
+
+
+def _parse_delivery_datetime(row):
+    """Convert deliveryDate + hourEnding to a datetime.
+
+    hourEnding '24:00' means midnight of the next day.
+    """
+    from datetime import datetime, timedelta
+    he = str(row['hourEnding']).strip()
+    if he == '24:00':
+        dt = datetime.strptime(row['deliveryDate'], '%Y-%m-%d')
+        return dt + timedelta(days=1)
+    return datetime.strptime(f"{row['deliveryDate']} {he}", '%Y-%m-%d %H:%M')
+
+
+def extract_demand_forecast_lead_times(year, month, lead_hours=None):
+    """Extract demand forecasts at specific lead times.
+
+    For each delivery hour, finds the forecast issuance closest to the
+    target lead time. Since forecasts are issued at :30, the actual lead
+    times are target + 0.5 hours (e.g., 1.5h for 1h-ahead, 18.5h for 18h-ahead).
+
+    Args:
+        year: Integer year
+        month: Integer month
+        lead_hours: List of target lead hours (default [1, 18])
+
+    Returns:
+        DataFrame with columns: deliveryDate, hourEnding, delivery_datetime,
+        lead_target, lead_actual, postedDatetime, model, systemTotal,
+        coast, east, farWest, north, northCentral, southCentral, southern, west
+    """
+    from datetime import datetime
+
+    if lead_hours is None:
+        lead_hours = [1, 18]
+
+    df = load_demand_forecasts_month(year, month)
+
+    # Parse timestamps
+    df['posted_dt'] = pd.to_datetime(df['postedDatetime'])
+    df['delivery_dt'] = df.apply(_parse_delivery_datetime, axis=1)
+    df['lead_h'] = (df['delivery_dt'] - df['posted_dt']).dt.total_seconds() / 3600
+
+    # Filter out backcasts (negative lead times)
+    df = df[df['lead_h'] > 0].copy()
+
+    results = []
+    # Target lead times are offset by 0.5h since forecasts are issued at :30
+    for target in lead_hours:
+        target_actual = target + 0.5
+
+        # For each delivery hour, find the closest forecast to the target lead
+        grouped = df.copy()
+        grouped['lead_diff'] = (grouped['lead_h'] - target_actual).abs()
+
+        # Get the index of the row with minimum lead_diff per delivery_dt
+        idx = grouped.groupby('delivery_dt')['lead_diff'].idxmin()
+        selected = grouped.loc[idx].copy()
+        selected['lead_target'] = target
+        selected['lead_actual'] = selected['lead_h']
+        results.append(selected)
+
+    result = pd.concat(results, ignore_index=True)
+
+    # Clean up output columns
+    output_cols = [
+        'deliveryDate', 'hourEnding', 'delivery_dt', 'lead_target', 'lead_actual',
+        'postedDatetime', 'model', 'systemTotal',
+        'coast', 'east', 'farWest', 'north', 'northCentral',
+        'southCentral', 'southern', 'west',
+    ]
+    result = result[[c for c in output_cols if c in result.columns]]
+    result = result.sort_values(['lead_target', 'delivery_dt']).reset_index(drop=True)
+
+    for target in lead_hours:
+        subset = result[result['lead_target'] == target]
+        actual_leads = subset['lead_actual']
+        print(f"Lead {target}h: {len(subset)} hours, "
+              f"actual lead mean={actual_leads.mean():.1f}h, "
+              f"range=[{actual_leads.min():.1f}, {actual_leads.max():.1f}]")
+
+    return result
+
+
 def _clean_substation_name(sub):
     """Strip common ERCOT substation suffixes for name matching."""
     s = sub.replace('_', '')
@@ -471,13 +603,16 @@ def _parse_html_contour_maps(html_paths, kml_path=None):
 def build_node_coordinates(force_rebuild=False):
     """Build a settlement point to lat/lon coordinate mapping.
 
-    Combines three coordinate sources in priority order:
+    Combines four coordinate sources in priority order:
     1. ERCOT HTML contour map (data/rtmLmp_html_source.txt) — current (2026)
        node positions converted from pixel coords via affine transformation
        calibrated against KML ground control points. ~253 nodes.
     2. ERCOT KML contour map (data/rtmLmpPoints.kml) — 2019 snapshot with
        254 nodes. Fills in any nodes not in the HTML source.
-    3. EIA Form 860 name matching via NP4-160 — fills in remaining nodes
+    3. EIA 860 generator LMP node designation — direct match of resource node
+       names to the "RTO/ISO LMP Node Designation" field in EIA generator data,
+       which provides the plant's lat/lon.
+    4. EIA Form 860 name matching via NP4-160 — fills in remaining nodes
        using prefix, substring, and fuzzy matching of substation names
        to EIA plant names.
 
@@ -565,13 +700,53 @@ def build_node_coordinates(force_rebuild=False):
 
     matched_so_far |= set(kml_results['settlement_point']) if len(kml_results) > 0 else set()
 
-    # --- Source 3: EIA 860 name matching (for remaining nodes) ---
+    # --- Source 3: EIA 860 generator LMP node designation (direct match) ---
     eia_file = os.path.join(dirs['raw'], 'eia860', 'texas_plants.csv')
+    gens_file = os.path.join(dirs['raw'], 'eia860', 'texas_generators.csv')
     if not os.path.exists(eia_file):
         raise FileNotFoundError(
             f"EIA 860 data not found at {eia_file}. "
             "Run: uv run python -m download_data.pull_eia860")
     eia = pd.read_csv(eia_file)
+
+    lmp_results = pd.DataFrame()
+    if os.path.exists(gens_file):
+        gens = pd.read_csv(gens_file)
+        # Build mapping: LMP node designation → generator row (with lat/lon)
+        gens_with_lmp = gens[gens['lmp_node_designation'].notna()].copy()
+        # Deduplicate: if multiple generators share the same LMP node, take the first
+        lmp_lookup = gens_with_lmp.drop_duplicates(subset='lmp_node_designation')
+        lmp_map = {}
+        for _, grow in lmp_lookup.iterrows():
+            lmp_map[grow['lmp_node_designation']] = {
+                'lat': float(grow['lat']),
+                'lon': float(grow['lon']),
+                'plant_name': grow['plant_name'],
+            }
+
+        lmp_matches = []
+        for rn_name in all_rn_names:
+            if rn_name in matched_so_far:
+                continue
+            if rn_name in lmp_map:
+                info = lmp_map[rn_name]
+                lmp_matches.append({
+                    'settlement_point': rn_name,
+                    'lat': info['lat'],
+                    'lon': info['lon'],
+                    'plant_name': info['plant_name'],
+                    'match_method': 'eia_lmp_node',
+                })
+
+        lmp_results = pd.DataFrame(lmp_matches)
+        print(f"EIA LMP node: {len(lmp_map)} generators with LMP designations, "
+              f"{len(lmp_results)} new resource node matches")
+    else:
+        print(f"Generator file not found at {gens_file}, skipping LMP node matching")
+
+    matched_so_far |= set(lmp_results['settlement_point']) if len(lmp_results) > 0 else set()
+
+    # --- Source 4: EIA 860 name matching (for remaining nodes) ---
     eia['norm_name'] = eia['plant_name'].str.upper().str.replace(r'[^A-Z0-9]', '', regex=True)
     eia_norms = eia['norm_name'].tolist()
 
@@ -579,7 +754,7 @@ def build_node_coordinates(force_rebuild=False):
     for _, row in nodes.iterrows():
         rn_name = row['RESOURCE_NODE']
         if rn_name in matched_so_far:
-            continue  # already have coordinates from HTML or KML
+            continue  # already have coordinates from HTML, KML, or LMP node
 
         sub = row['UNIT_SUBSTATION']
         sub_clean = _clean_substation_name(sub)
@@ -619,8 +794,8 @@ def build_node_coordinates(force_rebuild=False):
 
     eia_df = pd.DataFrame(eia_results)
 
-    # Combine: HTML first (current), then KML (2019), then EIA name matches
-    result_df = pd.concat([html_results, kml_results, eia_df], ignore_index=True)
+    # Combine: HTML (current), KML (2019), LMP node (EIA generator), EIA name matches
+    result_df = pd.concat([html_results, kml_results, lmp_results, eia_df], ignore_index=True)
 
     # Save cache
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)

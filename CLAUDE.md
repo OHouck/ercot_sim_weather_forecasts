@@ -16,10 +16,16 @@ Layout:
 ```
 {root}/
 ├── raw_data/
-│   ├── ndfd_data/              # Step 1: NDFD weather forecasts
+│   ├── ndfd_data/              # Step 1a: NDFD weather forecasts
 │   │   ├── temp/2025/07/       # ~248 NetCDF files
 │   │   ├── wspd/2025/07/       # ~248 NetCDF files
 │   │   └── wdir/2025/07/       # ~248 NetCDF files
+│   ├── hrrr_data/              # Step 1b: HRRR weather forecasts
+│   │   ├── temp/2025/07/       # NetCDF files (one per cycle × lead time)
+│   │   ├── wspd/2025/07/
+│   │   └── wdir/2025/07/
+│   ├── era5_land/              # Step 1c: ERA5-Land reanalysis
+│   │   └── 2025/07/            # era5_land_202507.nc (hourly, all vars)
 │   ├── weather_stations/       # Step 2: ISD realized observations
 │   │   ├── stations.csv        # 205 Texas station metadata
 │   │   └── 2025/07/            # ~202 per-station hourly CSVs
@@ -33,7 +39,8 @@ Layout:
 │   ├── node_coordinates.csv    # Step 4c: 544 matched nodes with lat/lon
 │   ├── unmatched_ercot_settlement_points.csv  # Unmatched ERCOT nodes for review
 │   ├── unmatched_eia860_plants.csv            # Unmatched EIA plants for review
-│   └── forecast_errors/2025/07/ # Step 5: Per-station forecast error CSVs + error_summary.csv
+│   ├── forecast_errors/{model}/2025/07/       # Step 5a: Per-station error CSVs + summary
+│   └── forecast_errors_era5/{model}/2025/07/  # Step 5b: ERA5 gridded errors (NetCDF + summary)
 └── plots/                      # Generated visualizations
     ├── max_temp_july_2025.png
     ├── max_wind_speed_july_2025.png
@@ -45,6 +52,8 @@ Layout:
 | Dataset | Source | Auth | Script |
 |---------|--------|------|--------|
 | NDFD forecasts | NOAA S3 `s3://noaa-ndfd-pds/wmo/` | No | `download_data/pull_ndfd.py` |
+| HRRR forecasts | AWS S3 `noaa-hrrr-bdp-pds` | No | `download_data/pull_hrrr.py` |
+| ERA5-Land reanalysis | Copernicus CDS API | CDS API key | `download_data/pull_era5.py` |
 | Realized weather | NCEI ISD API | No | `download_data/pull_weatherstation.py` |
 | Day-ahead SPP | ERCOT API (NP4-190) | OAuth2 + subscription key | `download_data/pull_ercot.py` |
 | Real-time SPP | ERCOT API (NP6-905) | OAuth2 + subscription key | `download_data/pull_ercot.py` |
@@ -52,7 +61,8 @@ Layout:
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
 | Node coords HTML | ERCOT contour map HTML (4 pages) | No | `data/*_html_source.txt` |
 | Node coords KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
-| Forecast errors | NDFD + ISD (Steps 1+2) | No | `calculate_forecast_errors.py` |
+| Station forecast errors | NDFD/HRRR + ISD (Steps 1+2) | No | `process_data/calculate_forecast_errors.py` |
+| ERA5 gridded errors | NDFD/HRRR + ERA5 (Steps 1+1c) | No | `process_data/calculate_forecast_errors.py` |
 | Validation | All above | — | `download_data/validate_data.py` |
 
 ## Credentials
@@ -60,6 +70,7 @@ Layout:
 - `~/keys/ercot_api_secondary_key.txt` — backup subscription key
 - `~/keys/ercot_user.txt` — ERCOT account username
 - `~/keys/ercot_pwd.txt` — ERCOT account password
+- `~/.cdsapirc` — Copernicus CDS API key for ERA5-Land downloads (new-style endpoint: `url: https://cds.climate.copernicus.eu/api`)
 
 ---
 
@@ -67,7 +78,7 @@ Layout:
 
 Changes made:
 - `helper_funcs.py`: Added `raw` and `processed` keys to `setup_directories()`
-- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4`, `geopandas`, `cartopy`, `openpyxl` dependencies
+- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4`, `geopandas`, `cartopy`, `openpyxl`, `cdsapi` dependencies
 - Run `uv sync` to install
 
 Prerequisites: `brew install awscli eccodes`
@@ -281,40 +292,90 @@ the CRR Network Model or similar source.
 
 ---
 
-## Step 5: Forecast Error Calculation (DONE)
+## Step 1c: ERA5-Land Reanalysis (DONE)
 
-**Script**: `calculate_forecast_errors.py`
+**Script**: `download_data/pull_era5.py`
 
-Merges NDFD gridded forecasts (Step 1) with ISD station observations (Step 2) to compute per-station, per-hour forecast errors. For each weather station, the nearest NDFD grid point is found via KDTree lookup, and the forecast value is compared to the observed value.
+Downloads ERA5-Land hourly reanalysis for the Texas bounding box (lat 25.8–36.5, lon -106.6 to -93.5) from the Copernicus CDS API. ERA5-Land provides gap-free gridded observations at ~9 km (0.1°) resolution and serves as a dense ground truth alternative to the ~202 ISD weather stations.
 
 ### Run
 ```bash
-uv run python -c "from calculate_forecast_errors import calculate_errors_for_month; calculate_errors_for_month(2025, 7)"
+uv run python -m download_data.pull_era5 --year 2025 --month 7
 ```
 
 ### Key implementation details
 
-**Spatial matching**: Loads station metadata as a GeoDataFrame and builds a GeoDataFrame of the NDFD 2D lat/lon grid (~245x258 points). Uses `gpd.sjoin_nearest` (projected to EPSG:3857 for accuracy) to join each station to its nearest grid cell (mean distance ~2.3 km given the 2.5 km grid spacing).
+**CDS API request** (`download_era5_month()`):
+- Dataset: `reanalysis-era5-land`
+- Variables requested: `2m_temperature`, `10m_u_component_of_wind`, `10m_v_component_of_wind`
+- Area: `[north, west, south, east]` = `[36.5, -106.6, 25.8, -93.5]`
+- `data_format: netcdf`, `download_format: unarchived` (new CDS API ≥ 0.7 syntax)
+- Requires `~/.cdsapirc` with the new-style URL (`https://cds.climate.copernicus.eu/api`)
 
-**Temporal matching**: Station observations are rounded to the nearest hour. Only observations at the top of each hour are kept (the observation closest to :00 is selected when multiple exist within the hour).
+**Derived variables** added before saving:
+- `wspd = sqrt(u10² + v10²)` — wind speed [m/s]
+- `wdir = atan2(-u10, -v10) * 180/π (mod 360)` — meteorological wind direction [degrees], matching NDFD/HRRR `wdir10` convention
 
-**Variables compared**:
-- Temperature: NDFD `t2m` (Kelvin → °C) vs ISD `TMP` field (°C)
-- Wind speed: NDFD `si10` (m/s) vs ISD `WND` speed component (m/s)
-- Wind direction: NDFD `wdir10` (degrees) vs ISD `WND` direction component (degrees)
-
-**Error definition**: `error = forecast - observed` (positive = forecast too high)
+**Output NetCDF variables**: `t2m` [K], `u10`, `v10`, `wspd`, `wdir` [m/s / degrees]; times stored in UTC; saved with zlib compression (complevel=5).
 
 ### Output
-- Per-station CSVs: `{processed}/forecast_errors/{year}/{month:02d}/{station_id}.csv`
-  - Columns: station_id, valid_time, lead_hours, forecast_temp, observed_temp, temp_error, forecast_wspd, observed_wspd, wspd_error, forecast_wdir, observed_wdir, wdir_error
-- Summary: `{processed}/forecast_errors/{year}/{month:02d}/error_summary.csv`
-  - Per-station, per-lead-time MAE and bias for temp and wind speed
+- `{raw}/era5_land/{year}/{month:02d}/era5_land_{YYYYMM}.nc`
+- ~109 lat × ~132 lon = ~14,388 grid cells covering Texas; 744 hourly steps per month
 
-### Results for July 2025
-- 202 stations processed, 404 summary rows (2 lead times × 202 stations)
+---
+
+## Step 5: Forecast Error Calculation (DONE)
+
+**Script**: `process_data/calculate_forecast_errors.py`
+
+Merges gridded weather forecasts (NDFD or HRRR) with either ISD station observations (Step 5a) or ERA5-Land reanalysis (Step 5b) to compute forecast errors. Uses `gpd.sjoin_nearest` (projected to EPSG:3857) to match each observation location to its nearest forecast grid cell.
+
+**Timezone convention**: All output `valid_time` columns are **US/Central (tz-naive)**. Conversion from UTC happens at data-load time (`load_forecasts()` and `load_all_observations()`), so all timestamps are already in Central before errors are computed. July CDT = UTC−5; January CST = UTC−6. ⚠ Existing CSVs produced before this change stored UTC times and need to be regenerated.
+
+### Step 5a: Station-level errors (ISD observations as ground truth)
+
+~202 Texas weather stations. One CSV per station.
+
+```bash
+# HRRR
+uv run python -c "
+from process_data.calculate_forecast_errors import calculate_hrrr_errors_for_month
+calculate_hrrr_errors_for_month(2025, 7)
+"
+# NDFD
+uv run python -c "
+from process_data.calculate_forecast_errors import calculate_ndfd_errors_for_month
+calculate_ndfd_errors_for_month(2025, 7)
+"
+```
+
+**Output**: `{processed}/forecast_errors/{model}/{year}/{month:02d}/`
+- `{station_id}.csv` — per-station rows with columns: `station_id, valid_time [Central], lead_hours, forecast_temp, observed_temp, temp_error, temp_pct_error, forecast_wspd, observed_wspd, wspd_error, wspd_pct_error, forecast_wdir, observed_wdir, wdir_degree_error, lat, lon`
+- `error_summary.csv` — per-station, per-lead MAE and bias
+
+**Results for HRRR July 2025** (202 stations, lead times 1h + 18h):
 - Lead 1h: Temp MAE 1.04°C (bias +0.16), Wind MAE 1.19 m/s (bias +0.08)
-- Lead 25h: Temp MAE 1.12°C (bias +0.21), Wind MAE 1.24 m/s (bias +0.03)
+- Lead 18h: Temp MAE 1.12°C (bias +0.21), Wind MAE 1.24 m/s (bias +0.03)
+
+### Step 5b: ERA5 gridded errors (ERA5-Land as ground truth)
+
+~14,000 ERA5 cells. Dense spatial coverage; requires Step 1c data.
+
+```bash
+uv run python -c "
+from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
+calculate_era5_errors_for_month(2025, 7, model='hrrr')
+"
+```
+
+**Output**: `{processed}/forecast_errors_era5/{model}/{year}/{month:02d}/`
+- `era5_errors_{YYYYMM}.nc` — compressed NetCDF with dims `(valid_time [Central], lead_hours, latitude, longitude)` and variables: `temp_error`, `wspd_error`, `wdir_error`, `forecast_temp`, `era5_temp`, `forecast_wspd`, `era5_wspd`, `forecast_wdir`, `era5_wdir`
+- `error_summary.csv` — per-ERA5-cell, per-lead MAE and bias
+
+**Key implementation details**:
+- `build_era5_grid_gdf(era5_ds)` — ERA5's regular 1D lat/lon grid → GeoDataFrame (analogous to `build_forecast_grid_gdf` for 2D Lambert grids)
+- `load_era5_as_obs_dict(era5_nc_path)` — loads ERA5 arrays into the same `{cell_id: DataFrame}` format used by the station pipeline; converts K→°C; skips ocean-masked cells
+- `_compute_era5_gridded_errors()` — accumulates errors into pre-allocated NumPy arrays and saves as NetCDF (CSV would be ~20M rows for a single month)
 
 ---
 
@@ -329,9 +390,9 @@ ERCOT publishes 60-Day SCED Disclosure with individual unit output and HSL. Curt
 
 ```bash
 # Step 0: Already done
-uv sync
+uv sync  # installs all dependencies including cdsapi
 
-# Step 1: NDFD forecasts (~30-60 min per element)
+# Step 1a: NDFD forecasts (~30-60 min per element)
 uv run python -c "
 from download_data.pull_ndfd import download_and_extract_texas_month
 from helper_funcs import setup_directories
@@ -342,6 +403,12 @@ for element in ['temp', 'wspd', 'wdir']:
     download_and_extract_texas_month(element, year=2025, month=7, base_dir=base_dir)
 "
 
+# Step 1b: HRRR forecasts (~2-3 hours for a full month)
+uv run python -m download_data.pull_hrrr  # interactive prompts for year/month
+
+# Step 1c: ERA5-Land reanalysis (~10-30 min per month, requires ~/.cdsapirc)
+uv run python -m download_data.pull_era5 --year 2025 --month 7
+
 # Step 2: Weather stations (~1 min)
 uv run python -m download_data.pull_weatherstation
 
@@ -351,10 +418,19 @@ uv run python -m download_data.pull_ercot
 # Step 4: Node coordinate mapping (~1 min)
 uv run python -m download_data.pull_np4160
 uv run python -m download_data.pull_eia860
-uv run python -c "from process_ercot import build_node_coordinates; build_node_coordinates(force_rebuild=True)"
+uv run python -c "from process_data.process_ercot import build_node_coordinates; build_node_coordinates(force_rebuild=True)"
 
-# Step 5: Forecast errors (~2 min, requires Steps 1+2)
-uv run python -c "from calculate_forecast_errors import calculate_errors_for_month; calculate_errors_for_month(2025, 7)"
+# Step 5a: Station-level forecast errors (~2 min per model, requires Steps 1+2)
+uv run python -c "
+from process_data.calculate_forecast_errors import calculate_hrrr_errors_for_month
+calculate_hrrr_errors_for_month(2025, 7)
+"
+
+# Step 5b: ERA5 gridded forecast errors (~10-20 min per model, requires Steps 1+1c)
+uv run python -c "
+from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
+calculate_era5_errors_for_month(2025, 7, model='hrrr')
+"
 
 # Validate
 uv run python -m download_data.validate_data
@@ -367,14 +443,33 @@ uv run python create_plots.py
 
 ## Processing & Visualization Scripts
 
-### `calculate_forecast_errors.py`
-Functions for computing NDFD forecast errors at weather station locations:
-- `calculate_errors_for_month(year, month)` — main entry point: loads NDFD grids and ISD observations, computes per-station errors, saves CSVs
-- `load_stations_gdf(raw_dir)` — loads station metadata as a GeoDataFrame with Point geometry
-- `load_all_observations(stations_gdf, year, month, raw_dir)` — loads and resamples all stations' ISD data to hourly
-- `build_ndfd_grid_gdf(sample_nc_path)` — builds GeoDataFrame of NDFD grid points for spatial join
-- `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` to match each station to its nearest grid cell
-- `load_ndfd_forecasts(element_dir, variable_name, year, month)` — loads all NDFD NetCDF files for one element into memory
+### `process_data/calculate_forecast_errors.py`
+Computes forecast errors (NDFD or HRRR) against either ISD weather stations or ERA5-Land reanalysis. All output `valid_time` values are **US/Central (tz-naive)**.
+
+**Timezone utility**:
+- `_to_central(timestamps)` — converts UTC timestamps (tz-naive or tz-aware) to US/Central tz-naive; handles DST automatically
+
+**Station-level entry points** (ISD observations as ground truth):
+- `calculate_ndfd_errors_for_month(year, month)` — NDFD vs ISD stations; output: `{processed}/forecast_errors/ndfd/{year}/{month:02d}/`
+- `calculate_hrrr_errors_for_month(year, month)` — HRRR vs ISD stations; output: `{processed}/forecast_errors/hrrr/{year}/{month:02d}/`
+
+**ERA5 gridded entry point** (ERA5-Land reanalysis as ground truth):
+- `calculate_era5_errors_for_month(year, month, model='hrrr')` — NDFD or HRRR vs ERA5; output: `{processed}/forecast_errors_era5/{model}/{year}/{month:02d}/era5_errors_{YYYYMM}.nc`
+
+**Shared helpers**:
+- `load_stations_gdf(raw_dir)` — station metadata as GeoDataFrame
+- `load_all_observations(stations_gdf, year, month, raw_dir)` — ISD data resampled to hourly; times converted to US/Central
+- `build_forecast_grid_gdf(sample_nc_path)` — GeoDataFrame of any 2D lat/lon forecast grid (NDFD, HRRR)
+- `build_era5_grid_gdf(era5_ds)` — GeoDataFrame of ERA5's regular 1D lat/lon grid
+- `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` (EPSG:3857) to match any observation GDF to nearest forecast grid cell
+- `load_forecasts(element_dir, variable_name, year, month)` — loads NetCDF files; converts `valid_time` to US/Central
+- `load_era5_as_obs_dict(era5_nc_path)` — ERA5 NetCDF → `{cell_id: DataFrame}` format compatible with the station pipeline
+
+### `download_data/pull_era5.py`
+Downloads ERA5-Land hourly reanalysis from the Copernicus CDS API:
+- `download_era5_month(year, month, base_dir, force_rebuild=False)` — downloads one month, adds derived `wspd`/`wdir`, saves compressed NetCDF
+- `download_era5_months(months, base_dir, force_rebuild=False)` — loops over a list of `(year, month)` tuples
+- CLI: `uv run python -m download_data.pull_era5 --year 2025 --month 7`
 
 ### `process_data/process_ercot.py`
 Functions for reading and processing ERCOT market data:
@@ -416,3 +511,12 @@ The NCEI API can be slow (30+ seconds per request). The script uses 120s timeout
 
 ### NDFD: only ~248 files per element (not ~496)
 This is expected. Of ~496 Group B GRIB files downloaded, only ~half contain the target lead times (1h and 25h). The rest are skipped.
+
+### ERA5-Land: CDS API errors
+- **401 / invalid key**: Verify `~/.cdsapirc` uses the new-style URL (`url: https://cds.climate.copernicus.eu/api`) and a current API key from your CDS profile page.
+- **`data_format` key not accepted**: Requires `cdsapi>=0.7.0`. Run `uv sync` to ensure the right version is installed.
+- **Request queued for a long time**: ERA5-Land requests are queued server-side; a full month (~50-100 MB) typically takes 5–20 minutes depending on CDS load. The script will wait until the download completes.
+- **ERA5 errors NetCDF missing**: If `calculate_era5_errors_for_month()` raises `FileNotFoundError`, the ERA5 raw file is missing — run Step 1c first.
+
+### Stale UTC forecast error CSVs
+After the timezone change to US/Central, any existing per-station CSVs in `processed_data/forecast_errors/` contain UTC `valid_time` values and are stale. Delete the relevant subdirectory and re-run `calculate_hrrr_errors_for_month()` or `calculate_ndfd_errors_for_month()` to regenerate with correct Central times.

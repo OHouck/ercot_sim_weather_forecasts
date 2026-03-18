@@ -357,11 +357,12 @@ def validate_node_coordinate_matching():
     )
 
     method_styles = {
-        'html_contour': {'color': '#2196F3', 'marker': 'o', 'label': 'HTML contour', 'size': 46, 'alpha': 0.9},
-        'kml':          {'color': '#4CAF50', 'marker': 's', 'label': 'KML (2019)', 'size': 20, 'alpha': 0.8},
-        'prefix':       {'color': '#FF9800', 'marker': '^', 'label': 'EIA prefix', 'size': 20, 'alpha': 0.8},
-        'contains':     {'color': '#9C27B0', 'marker': 'D', 'label': 'EIA substring', 'size': 20, 'alpha': 0.8},
-        'fuzzy':        {'color': '#F44336', 'marker': 'v', 'label': 'EIA fuzzy', 'size': 20, 'alpha': 0.8},
+        'html_contour':  {'color': '#2196F3', 'marker': 'o', 'label': 'HTML contour',    'size': 46, 'alpha': 0.9},
+        'kml':           {'color': '#4CAF50', 'marker': 's', 'label': 'KML (2019)',       'size': 20, 'alpha': 0.8},
+        'eia_lmp_node':  {'color': '#00BCD4', 'marker': '*', 'label': 'EIA LMP node',     'size': 55, 'alpha': 0.9},
+        'prefix':        {'color': '#FF9800', 'marker': '^', 'label': 'EIA prefix',       'size': 20, 'alpha': 0.8},
+        'contains':      {'color': '#9C27B0', 'marker': 'D', 'label': 'EIA substring',    'size': 20, 'alpha': 0.8},
+        'fuzzy':         {'color': '#F44336', 'marker': 'v', 'label': 'EIA fuzzy',        'size': 20, 'alpha': 0.8},
     }
 
     for method, style in method_styles.items():
@@ -384,15 +385,36 @@ def validate_node_coordinate_matching():
     _draw_texas(ax, proj)
     _draw_ercot_gis_layers(ax, proj, os.path.join(dirs['root'], 'Texas_GIS_Data'))
 
-    # Show matched EIA plants as light background dots
-    eia_matched_names = set(matched['plant_name'].dropna())
-    eia_matched_pts = eia_all[eia_all['plant_name'].isin(eia_matched_names)]
-    if len(eia_matched_pts) > 0:
+    # Separate matched plants by whether they were matched exclusively via
+    # eia_lmp_node (those deserve their own colour to mirror panel 1) vs any
+    # other method (prefix / contains / fuzzy / html / kml).
+    lmp_matched_plants = set(
+        matched[matched['match_method'] == 'eia_lmp_node']['plant_name'].dropna()
+    )
+    other_matched_plants = set(
+        matched[matched['match_method'] != 'eia_lmp_node']['plant_name'].dropna()
+    )
+    lmp_only_plants = lmp_matched_plants - other_matched_plants
+
+    eia_name_matched = eia_all[eia_all['plant_name'].isin(other_matched_plants)]
+    eia_lmp_only = eia_all[eia_all['plant_name'].isin(lmp_only_plants)]
+
+    # Plants matched by name / contour methods (blue circles)
+    if len(eia_name_matched) > 0:
         ax.scatter(
-            eia_matched_pts['lon'], eia_matched_pts['lat'],
+            eia_name_matched['lon'], eia_name_matched['lat'],
             c='#2196F3', marker='o', s=15, alpha=1.0,
-            label=f'EIA matched ({len(eia_matched_pts)})',
+            label=f'EIA matched – other ({len(eia_name_matched)})',
             transform=proj, zorder=4)
+
+    # Plants matched exclusively via EIA LMP node designation (cyan stars,
+    # same colour/marker as panel 1 so the two panels tell the same story)
+    if len(eia_lmp_only) > 0:
+        ax.scatter(
+            eia_lmp_only['lon'], eia_lmp_only['lat'],
+            c='#00BCD4', marker='*', s=80, alpha=0.95,
+            label=f'EIA matched – LMP node only ({len(eia_lmp_only)})',
+            transform=proj, zorder=6)
 
     # Unmatched EIA plants
     ax.scatter(

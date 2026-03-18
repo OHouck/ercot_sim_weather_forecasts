@@ -1,5 +1,8 @@
 import os
+import sys
 import glob
+import re
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -10,6 +13,30 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn.neighbors import kneighbors_graph
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
+
+# Allow imports from the project root (helper_funcs lives there)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from helper_funcs import setup_directories
+
+# ── EIA generator broad-category mapping ─────────────────────────────────────
+# Fine-grained EIA technology → one of: gas, nuclear, coal, solar, wind, other
+_BROAD_CATEGORY_MAP = {
+    "Natural Gas Internal Combustion Engine": "gas",
+    "Natural Gas Fired Combined Cycle":       "gas",
+    "Natural Gas Fired Combustion Turbine":   "gas",
+    "Natural Gas Steam Turbine":              "gas",
+    "Nuclear":                                "nuclear",
+    "Conventional Steam Coal":                "coal",
+    "Solar Photovoltaic":                     "solar",
+    "Onshore Wind Turbine":                   "wind",
+    # everything else (petroleum, batteries, hydro, biomass, etc.) → other
+}
+_BROAD_CATEGORIES = ["gas", "nuclear", "coal", "solar", "wind", "other"]
+
+
+def _tech_slug(tech: str) -> str:
+    """Convert a technology name to a safe column-name slug."""
+    return re.sub(r"[^a-z0-9]+", "_", tech.lower()).strip("_")
 
 
 def compute_node_lmp_features(df):
@@ -344,6 +371,28 @@ def load_station_errors_wide(months, model, dirs):
     )
     errors_wide = errors_wide.rename(columns={'lat': 'station_lat', 'lon': 'station_lon'})
 
+    # ── Deduplicate observed columns ──
+    # observed_* values should be identical across lead times (same physical observation).
+    # Verify consistency where both are non-NA, then keep only the short-lead version
+    # renamed to observed_* (no suffix).
+    obs_base_cols = [c for c in error_cols if c.startswith('observed_')]
+    for base in obs_base_cols:
+        col_short = f'{base}_{lead_short}h'
+        col_long = f'{base}_{lead_long}h'
+        if col_short not in errors_wide.columns or col_long not in errors_wide.columns:
+            continue
+        both_present = errors_wide[col_short].notna() & errors_wide[col_long].notna()
+        mismatches = (errors_wide.loc[both_present, col_short] !=
+                      errors_wide.loc[both_present, col_long]).sum()
+        if mismatches > 0:
+            raise ValueError(
+                f"Observed column mismatch: {col_short} vs {col_long} differ "
+                f"in {mismatches} rows where both are non-NA."
+            )
+        errors_wide[col_short] = errors_wide[col_short].fillna(errors_wide[col_long])
+        errors_wide = errors_wide.drop(columns=[col_long])
+        errors_wide = errors_wide.rename(columns={col_short: base})
+
     print(f"Loaded {len(errors_wide):,} station-hour rows "
           f"({errors_wide['station_id'].nunique()} stations, model={model})")
     return errors_wide
@@ -363,6 +412,7 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
 
     For each (cluster, hour):
       - LMP: mean, std, max, min across nodes
+      - System LMP STD: system_lmp_std, (total std across all nodes in all clusters for that hour)
       - Forecast errors (per lead time): mean, std, max(|error|)
       - Observed wind speed and temperature: mean, std, max, min
 
@@ -392,14 +442,42 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
           f"{df_with_cluster['settlement_point'].nunique()} / "
           f"{df['settlement_point'].nunique()}")
 
+    # Build the aggregation dict dynamically so load_error column names are
+    # derived from the lead_short / lead_long parameters rather than hardcoded.
+    # This makes the function work for both HRRR (1h/18h) and NDFD (1h/25h).
+    le_short = f'load_error_{lead_short}h'
+    le_long  = f'load_error_{lead_long}h'
+    lmp_agg = {
+        'lmp_mean':       ('lmp',         'mean'),
+        'lmp_std':        ('lmp',         'std'),
+        'lmp_max':        ('lmp',         'max'),
+        'lmp_min':        ('lmp',         'min'),
+        'actual_load':    ('actual_load', 'mean'),
+        'n_nodes_in_hour':('lmp',         'count'),
+    }
+    for le_col in [le_short, le_long]:
+        if le_col in df_with_cluster.columns:
+            lmp_agg[le_col] = (le_col, 'mean')
+
     lmp_hourly = (
         df_with_cluster
-        .groupby(['cluster', 'hour'])['lmp']
-        .agg(lmp_mean='mean', lmp_std='std', lmp_max='max', lmp_min='min',
-             n_nodes_in_hour='count')
+        .groupby(['cluster', 'hour'])
+        .agg(**lmp_agg)
         .reset_index()
     )
     lmp_hourly['lmp_std'] = lmp_hourly['lmp_std'].fillna(0)
+
+    system_lmp_std = (
+        df_with_cluster
+        .groupby('hour')['lmp']
+        .std()
+        .rename('system_lmp_std')
+        .reset_index()
+    )
+
+    # merge m:1 back to lmp_hourly to get system_lmp_std in the same df for modeling
+    lmp_hourly = lmp_hourly.merge(system_lmp_std, on='hour', how='left')
+
 
     # ── Weather aggregation ──
     if use_polygons:
@@ -492,7 +570,8 @@ def _aggregate_weather_from_nodes(df_with_cluster, lead_short, lead_long):
     Deduplicate so each (station_id, cluster, hour) contributes once.
     """
     error_prefixes = ('temp_error', 'wspd_error', 'wdir_degree_error',
-                      'observed_temp', 'observed_wspd', 'forecast_temp', 'forecast_wspd')
+                      'observed_temp', 'observed_wspd', 'observed_wdir',
+                      'forecast_temp', 'forecast_wspd')
     weather_cols = [c for c in df_with_cluster.columns
                     if c.startswith(error_prefixes)]
     keep = ['station_id', 'cluster', 'hour'] + weather_cols
@@ -521,9 +600,9 @@ def _compute_weather_aggs(station_cluster, lead_short, lead_long):
             if err_col in station_cluster.columns:
                 agg_dict[err_col] = ['mean', 'std']
 
-        for obs_col in [f'observed_temp{suffix}', f'observed_wspd{suffix}']:
-            if obs_col in station_cluster.columns:
-                agg_dict[obs_col] = ['mean', 'std', 'max', 'min']
+    for obs_col in ['observed_temp', 'observed_wspd', 'observed_wdir']:
+        if obs_col in station_cluster.columns:
+            agg_dict[obs_col] = ['mean', 'std', 'max', 'min']
 
     if not agg_dict:
         return pd.DataFrame(columns=['cluster', 'hour'])
@@ -562,3 +641,364 @@ def _compute_weather_aggs(station_cluster, lead_short, lead_long):
             grouped = grouped.merge(max_abs, on=['cluster', 'hour'], how='left')
 
     return grouped
+
+
+# ── EIA generator mix by cluster ─────────────────────────────────────────────
+
+
+def compute_cluster_generation_mix(node_clusters, cluster_polygons, generators_path):
+    """
+    Compute the generation technology mix for each cluster from EIA Form 860
+    generator data.
+
+    Each generator is spatially assigned to the cluster whose convex-hull
+    polygon it falls inside.  Generators that fall outside every polygon are
+    assigned to the nearest cluster centroid as a fallback (covers plants near
+    polygon boundaries or in lightly-populated areas of Texas).
+
+    For every cluster the function returns two capacity measures per technology:
+
+    * **nameplate_mw** – sum of nameplate_capacity_mw
+    * **scaled_mw**    – sum of nameplate_capacity_mw × nameplate_power_factor
+                         (available / effective capacity)
+
+    Technology columns are produced at two levels of granularity:
+
+    * **Fine-grained** – one column per EIA technology string, slug-formatted
+      (e.g. ``nameplate_mw_natural_gas_fired_combined_cycle``).
+    * **Broad category** – gas, nuclear, coal, solar, wind, other
+      (e.g. ``nameplate_mw_gas``, ``scaled_mw_wind``).
+
+    Broad-category mapping:
+      gas    → Natural Gas * (all four NG technology types)
+      nuclear → Nuclear
+      coal   → Conventional Steam Coal
+      solar  → Solar Photovoltaic
+      wind   → Onshore Wind Turbine
+      other  → everything else (petroleum, batteries, hydro, biomass, …)
+
+    Args:
+        node_clusters:    DataFrame with columns [settlement_point, cluster,
+                          lat, lon] – output of cluster_nodes().
+        cluster_polygons: GeoDataFrame with columns [cluster, geometry] in
+                          EPSG:4326 – output of build_cluster_polygons().
+        generators_path:  Path to the EIA 860 Texas generators CSV.  Expected
+                          columns: technology, nameplate_capacity_mw,
+                          nameplate_power_factor, lat, lon.
+
+    Returns:
+        DataFrame with one row per cluster and columns:
+          cluster,
+          n_generators,
+          total_nameplate_mw,
+          total_scaled_mw,
+          nameplate_mw_<broad_cat>,   scaled_mw_<broad_cat>,   … (6 cats)
+          nameplate_mw_<tech_slug>,   scaled_mw_<tech_slug>,   … (per EIA tech)
+    """
+    # ── 1. Load generators and build GeoDataFrame ──────────────────────────
+    gen = pd.read_csv(generators_path)
+    gen["nameplate_capacity_mw"] = pd.to_numeric(gen["nameplate_capacity_mw"],
+                                                  errors="coerce")
+    gen["nameplate_power_factor"] = pd.to_numeric(gen["nameplate_power_factor"],
+                                                   errors="coerce")
+    gen = gen.dropna(subset=["lat", "lon", "nameplate_capacity_mw",
+                              "nameplate_power_factor", "technology"])
+    gen["scaled_mw"] = gen["nameplate_capacity_mw"] * gen["nameplate_power_factor"]
+
+    gen_gdf = gpd.GeoDataFrame(
+        gen,
+        geometry=gpd.points_from_xy(gen["lon"], gen["lat"]),
+        crs="EPSG:4326",
+    )
+
+    # ── 2. Spatial join: generators → cluster polygons (within) ───────────
+    polys = cluster_polygons[["cluster", "geometry"]].reset_index(drop=True)
+
+    joined = gpd.sjoin(
+        gen_gdf[["technology", "nameplate_capacity_mw", "scaled_mw", "geometry"]],
+        polys,
+        how="left",
+        predicate="within",
+    )
+    # Normalise the cluster column name (geopandas may suffix it)
+    if "cluster" not in joined.columns and "cluster_right" in joined.columns:
+        joined = joined.rename(columns={"cluster_right": "cluster"})
+
+    # ── 3. Fallback: assign unmatched generators to nearest cluster centroid
+    unmatched_mask = joined["cluster"].isna()
+    n_unmatched = unmatched_mask.sum()
+    if n_unmatched > 0:
+        centroids = (
+            node_clusters.groupby("cluster")[["lat", "lon"]].mean().reset_index()
+        )
+        centroids_gdf = gpd.GeoDataFrame(
+            centroids,
+            geometry=gpd.points_from_xy(centroids["lon"], centroids["lat"]),
+            crs="EPSG:4326",
+        ).to_crs("EPSG:3857")
+
+        unmatched_pts = gen_gdf.loc[unmatched_mask].to_crs("EPSG:3857")
+        nearest = gpd.sjoin_nearest(
+            unmatched_pts[["technology", "nameplate_capacity_mw",
+                           "scaled_mw", "geometry"]],
+            centroids_gdf[["cluster", "geometry"]],
+            how="left",
+        )
+        if "cluster_right" in nearest.columns:
+            nearest = nearest.rename(columns={"cluster_right": "cluster"})
+
+        joined.loc[unmatched_mask, "cluster"] = nearest["cluster"].values
+        print(f"  Generation mix: {n_unmatched} generators assigned via "
+              f"nearest-centroid fallback")
+
+    joined["cluster"] = joined["cluster"].astype(int)
+
+    # ── 4. Broad-category column ───────────────────────────────────────────
+    joined["broad_cat"] = joined["technology"].map(_BROAD_CATEGORY_MAP).fillna("other")
+
+    # ── 5. Aggregate ───────────────────────────────────────────────────────
+    cluster_ids = sorted(joined["cluster"].unique())
+
+    # 5a. Fine-grained technology pivot
+    # Fine-grained columns are prefixed with "tech_" to avoid collisions with
+    # the broad-category columns (e.g. EIA "Nuclear" → slug "nuclear" would
+    # otherwise clash with broad-cat column "nameplate_mw_nuclear").
+    fine_nameplate = (
+        joined.groupby(["cluster", "technology"])["nameplate_capacity_mw"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+    fine_nameplate.columns = [
+        f"nameplate_mw_tech_{_tech_slug(c)}" for c in fine_nameplate.columns
+    ]
+
+    fine_scaled = (
+        joined.groupby(["cluster", "technology"])["scaled_mw"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+    fine_scaled.columns = [
+        f"scaled_mw_tech_{_tech_slug(c)}" for c in fine_scaled.columns
+    ]
+
+    # 5b. Broad-category pivot
+    broad_nameplate = (
+        joined.groupby(["cluster", "broad_cat"])["nameplate_capacity_mw"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+    # Ensure all broad categories are present even if zero
+    for cat in _BROAD_CATEGORIES:
+        if cat not in broad_nameplate.columns:
+            broad_nameplate[cat] = 0.0
+    broad_nameplate = broad_nameplate[_BROAD_CATEGORIES]
+    broad_nameplate.columns = [f"nameplate_mw_{c}" for c in broad_nameplate.columns]
+
+    broad_scaled = (
+        joined.groupby(["cluster", "broad_cat"])["scaled_mw"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+    for cat in _BROAD_CATEGORIES:
+        if cat not in broad_scaled.columns:
+            broad_scaled[cat] = 0.0
+    broad_scaled = broad_scaled[_BROAD_CATEGORIES]
+    broad_scaled.columns = [f"scaled_mw_{c}" for c in broad_scaled.columns]
+
+    # 5c. Totals and generator count
+    totals = (
+        joined.groupby("cluster")
+        .agg(
+            n_generators=("nameplate_capacity_mw", "count"),
+            total_nameplate_mw=("nameplate_capacity_mw", "sum"),
+            total_scaled_mw=("scaled_mw", "sum"),
+        )
+    )
+
+    # ── 6. Combine and fill any clusters with zero generators ─────────────
+    all_clusters = pd.DataFrame({"cluster": cluster_ids}).set_index("cluster")
+    result = (
+        all_clusters
+        .join(totals, how="left")
+        .join(broad_nameplate, how="left")
+        .join(broad_scaled, how="left")
+        .join(fine_nameplate, how="left")
+        .join(fine_scaled, how="left")
+        .fillna(0)
+        .reset_index()
+    )
+    result["n_generators"] = result["n_generators"].astype(int)
+
+    # ── 7. Summary print ──────────────────────────────────────────────────
+    print(f"Generation mix computed for {len(result)} clusters "
+          f"({int(result['n_generators'].sum())} generators, "
+          f"{result['total_nameplate_mw'].sum():.0f} MW total nameplate)")
+    for cat in _BROAD_CATEGORIES:
+        mw = result[f"nameplate_mw_{cat}"].sum()
+        if mw > 0:
+            print(f"  {cat:8s}: {mw:8,.0f} MW nameplate")
+
+    return result
+
+
+# ── Canonical cluster-hour dataset builder ────────────────────────────────────
+
+
+def build_cluster_hourly_data(
+    months, model, n_clusters, geo_weight, n_neighbors,
+    generators_path, force_rebuild=False,
+    error_source='station',
+):
+    """
+    Build (or load from cache) the canonical cluster × hour analysis dataset.
+
+    Runs the full pipeline end-to-end:
+      prepare_node_level_data → compute_node_lmp_features → cluster_nodes →
+      build_cluster_polygons → aggregate_to_cluster_hour →
+      compute_cluster_generation_mix
+
+    The generation mix is merged into the cluster-hour DataFrame so every
+    hourly row carries its cluster's capacity totals, broad-category MW,
+    scaled MW, and percentage-share columns (``pct_{cat}``).
+
+    Three artefacts are cached in ``dirs["processed"]`` and reloaded on
+    subsequent calls (set ``force_rebuild=True`` to bypass):
+
+    * ``cluster_hourly_{model}_k{n_clusters}_{months_tag}.csv``
+    * ``node_clusters_{model}_k{n_clusters}_{months_tag}.csv``
+    * ``cluster_polygons_{model}_k{n_clusters}_{months_tag}.gpkg``
+
+    Args:
+        months:          List of (year, month) tuples, e.g. [(2025, 1), …].
+        model:           Forecast model — ``'hrrr'`` or ``'ndfd'``.
+        n_clusters:      Number of clusters to form.
+        geo_weight:      Geographic weight for agglomerative clustering.
+        n_neighbors:     k-NN connectivity graph size for clustering.
+        generators_path: Path to EIA 860 Texas generators CSV.
+        force_rebuild:   If True, ignore existing cache files and rebuild.
+        error_source:    ``'station'`` (default) or ``'era5'``. Passed through
+                         to ``prepare_node_level_data()``.
+
+    Returns:
+        Tuple ``(cluster_hourly, node_clusters, cluster_polygons, sil_score)``.
+
+        * ``cluster_hourly``  — DataFrame, one row per (cluster, hour),
+          with all LMP, weather, load, time, and generation-mix columns.
+        * ``node_clusters``   — DataFrame, one row per settlement_point,
+          with lat/lon and cluster assignment.
+        * ``cluster_polygons``— GeoDataFrame, one row per cluster, with
+          convex-hull polygon geometry (EPSG:4326).
+        * ``sil_score``       — Silhouette score (float) from clustering,
+          or None when loaded from cache.
+    """
+    from process_data.prepare_node_level_data import prepare_node_level_data
+
+    dirs = setup_directories()
+
+    # ── Cache key ─────────────────────────────────────────────────────────
+    months = sorted(months)
+    if len(months) == 1:
+        months_tag = f"{months[0][0]}_{months[0][1]:02d}"
+    else:
+        first_y, first_m = months[0]
+        last_y,  last_m  = months[-1]
+        months_tag = f"{first_y}{first_m:02d}_{last_y}{last_m:02d}"
+
+    source_tag = '' if error_source == 'station' else f'_{error_source}'
+    key = f"{model}_k{n_clusters}{source_tag}_{months_tag}"
+    ch_path  = os.path.join(dirs["processed"], f"cluster_hourly_{key}.csv")
+    nc_path  = os.path.join(dirs["processed"], f"node_clusters_{key}.csv")
+    gpkg_path = os.path.join(dirs["processed"], f"cluster_polygons_{key}.gpkg")
+
+    cache_files = [ch_path, nc_path, gpkg_path]
+    cache_exists = all(os.path.exists(p) for p in cache_files)
+
+    if cache_exists and not force_rebuild:
+        print(f"Loading cached cluster-hour data ({key})…")
+        cluster_hourly  = pd.read_csv(ch_path,  parse_dates=["hour"])
+        node_clusters   = pd.read_csv(nc_path)
+        cluster_polygons = gpd.read_file(gpkg_path)
+        return cluster_hourly, node_clusters, cluster_polygons, None
+
+    print(f"Building cluster-hour dataset ({key}, force_rebuild={force_rebuild})…")
+
+    # ── 1. Node-level data ────────────────────────────────────────────────
+    df = prepare_node_level_data(months=months, model=model, force_rebuild=False,
+                                error_source=error_source)
+
+    # ── 2. Clustering ─────────────────────────────────────────────────────
+    MODEL_LEAD_TIMES = {"ndfd": (1, 25), "hrrr": (1, 18)}
+    lead_short, lead_long = MODEL_LEAD_TIMES[model]
+
+    node_features = compute_node_lmp_features(df)
+    node_clusters, sil_score = cluster_nodes(
+        node_features,
+        n_clusters=n_clusters,
+        geo_weight=geo_weight,
+        n_neighbors=n_neighbors,
+    )
+    cluster_polygons = build_cluster_polygons(node_clusters)
+
+    # ── 3. Cluster × hour aggregation ─────────────────────────────────────
+    if error_source == 'era5':
+        # ERA5 errors are already attached to nodes at grid-cell resolution.
+        # Skip station CSV loading; aggregate directly from node-attached errors.
+        cluster_hourly = aggregate_to_cluster_hour(
+            df, node_clusters, lead_short, lead_long,
+        )
+    else:
+        # Try polygon-based station aggregation; fall back to node-attached errors
+        # if individual station CSV files time out (common with OneDrive sync).
+        station_errors = None
+        try:
+            station_errors = load_station_errors_wide(months, model, dirs)
+        except (TimeoutError, OSError) as exc:
+            print(f"  Station error loading failed ({exc}); using node-attached fallback.")
+
+        if station_errors is not None:
+            cluster_hourly = aggregate_to_cluster_hour(
+                df, node_clusters, lead_short, lead_long,
+                station_errors=station_errors,
+                cluster_polygons=cluster_polygons,
+            )
+        else:
+            cluster_hourly = aggregate_to_cluster_hour(
+                df, node_clusters, lead_short, lead_long,
+            )
+
+    # ── 4. Generation mix ─────────────────────────────────────────────────
+    cluster_gen_mix = compute_cluster_generation_mix(
+        node_clusters, cluster_polygons, generators_path
+    )
+
+    # Percentage shares (nameplate MW basis)
+    for cat in _BROAD_CATEGORIES:
+        cluster_gen_mix[f"pct_{cat}"] = (
+            cluster_gen_mix[f"nameplate_mw_{cat}"]
+            / cluster_gen_mix["total_nameplate_mw"] * 100
+        ).fillna(0)
+
+    # Merge all generation columns into cluster_hourly (1:m on cluster)
+    gen_cols = (
+        ["cluster", "n_generators", "total_nameplate_mw", "total_scaled_mw"]
+        + [f"nameplate_mw_{c}" for c in _BROAD_CATEGORIES]
+        + [f"scaled_mw_{c}"    for c in _BROAD_CATEGORIES]
+        + [f"pct_{c}"          for c in _BROAD_CATEGORIES]
+        + [c for c in cluster_gen_mix.columns if c.startswith("nameplate_mw_tech_")]
+        + [c for c in cluster_gen_mix.columns if c.startswith("scaled_mw_tech_")]
+    )
+    cluster_hourly = cluster_hourly.merge(
+        cluster_gen_mix[gen_cols], on="cluster", how="left"
+    )
+
+    # ── 5. Save cache ─────────────────────────────────────────────────────
+    cluster_hourly.to_csv(ch_path, index=False)
+    node_clusters.to_csv(nc_path, index=False)
+    cluster_polygons.to_file(gpkg_path, driver="GPKG")
+
+    print(f"  Saved cluster_hourly  → {ch_path}")
+    print(f"  Saved node_clusters   → {nc_path}")
+    print(f"  Saved cluster_polygons→ {gpkg_path}")
+    print(f"  cluster_hourly shape: {cluster_hourly.shape}")
+
+    return cluster_hourly, node_clusters, cluster_polygons, sil_score

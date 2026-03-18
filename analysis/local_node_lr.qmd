@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 import pyfixest as pf
 
 # Add parent directory to path for imports
-sys.path.insert(0, str(Path.cwd().parent))
+sys.path.insert(0, str(Path.cwd().parent)
 from helper_funcs import setup_directories
 from process_data.process_ercot import load_rt_spp_month
 from process_data.prepare_node_level_data import prepare_node_level_data
@@ -64,7 +64,7 @@ LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
 # ── Months to include ──
 MONTHS = [(2025, m) for m in range(1, 9)] # For now jan to aug 
 
-df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
+df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=True)
 
 print(f"\n{'='*60}")
 print(f"Dataset Summary ({MODEL.upper()})")
@@ -90,14 +90,6 @@ def prepare_data(df, depvar, treatments, controls, fe):
     df_clean = df.dropna(subset=existing_cols).copy()
     print(f"Analysis sample: {len(df_clean):,} observations "
           f"(dropped {len(df) - len(df_clean):,} with missing values)")
-    observation_cols = ["observed_temp", "observed_wspd", "observed_wdir"]
-    for col in observation_cols:
-        col_short = f"{col}_{LEAD_SHORT}h"
-        col_long = f"{col}_{LEAD_LONG}h"
-        df_clean = df_clean.dropna(subset=[col_short, col_long]) # these aren't captured in the main dropna above since the code is sloppy
-        assert (df_clean[col_short] == df_clean[col_long]).all(), f"Observed {col} should be same for short and long lead columns"
-        # drop the long lead version and rename the short lead version to just observed_temp, observed_wspd, etc.
-        df_clean = df_clean.drop(columns=[col_long]).rename(columns={col_short: col})
     return df_clean
 
 
@@ -233,7 +225,8 @@ def plot_coefs(model, data, depvar, treatments, coefs=None, save_path=None, save
 
 # Note: positive errors mean forecast was warmer/faster than observed, negative means cooler/slower
 
-leadtime = LEAD_SHORT
+# leadtime = LEAD_SHORT
+leadtime = LEAD_LONG
 
 # options are lmp_mean, lmp_max, lmp_std
 DEPVAR = "lmp"
@@ -244,18 +237,21 @@ TREATMENTS = [
     f"temp_error_{leadtime}h",
     f"wspd_error_{leadtime}h",
     f"wdir_degree_error_{leadtime}h",
+    f"load_error_{leadtime}h",
 ]
 
 CONTROLS = [
     f"observed_temp",
     f"observed_wspd",
     f"observed_wdir",
+    f"actual_load",
     'weekday',
 ]
 INTERACTIONS = [
     (f"temp_error_{leadtime}h", f'observed_temp'),
     (f"wspd_error_{leadtime}h", f'observed_wspd'),
     (f"wdir_degree_error_{leadtime}h", f'observed_wdir'),
+    (f"load_error_{leadtime}h", f'actual_load'),
 ]
 
 
