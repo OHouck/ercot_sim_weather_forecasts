@@ -1,10 +1,10 @@
-# CLAUDE.md — MVP Data Build Guide
+# CLAUDE.md — Data Build Guide
 
 ## Research Question
 How do joint errors in 24hr wind and temperature forecasts impact locational marginal prices (LMP) and renewable curtailment in ERCOT?
 
-## MVP Scope
-**July 2025 only.** Build and validate the full pipeline for one month before scaling.
+## Scope
+**Full year 2025.** Pipeline is built and validated for all 12 months.
 
 ## Directory Structure
 All raw data is stored on OneDrive via `helper_funcs.setup_directories()`:
@@ -17,9 +17,9 @@ Layout:
 {root}/
 ├── raw_data/
 │   ├── ndfd_data/              # Step 1a: NDFD weather forecasts
-│   │   ├── temp/2025/07/       # ~248 NetCDF files
-│   │   ├── wspd/2025/07/       # ~248 NetCDF files
-│   │   └── wdir/2025/07/       # ~248 NetCDF files
+│   │   ├── temp/2025/07/       # ~248 NetCDF files per month
+│   │   ├── wspd/2025/07/
+│   │   └── wdir/2025/07/
 │   ├── hrrr_data/              # Step 1b: HRRR weather forecasts
 │   │   ├── temp/2025/07/       # NetCDF files (one per cycle × lead time)
 │   │   ├── wspd/2025/07/
@@ -35,16 +35,23 @@ Layout:
 │   │   └── np4_160/            # Step 4a: Settlement point mapping (5 CSVs)
 │   └── eia860/                 # Step 4b: EIA Form 860 plant data
 │       └── texas_plants.csv    # 1,369 TX plants with lat/lon
+├── data/                       # Static GIS / reference data
+│   ├── {rtmLmp,rtmSpp,damSpp2,damSpp7}_html_source.txt  # Step 4c: ERCOT HTML contour maps
+│   ├── rtmLmpPoints.kml        # Step 4c: 2019 ERCOT KML snapshot
+│   ├── Line_Output.shp (+ .dbf/.prj/.shx)  # Step 5c: Transmission line GIS
+│   └── Bus_Output.shp (+ .dbf/.prj/.shx)   # Step 5c: ERCOT bus GIS
 ├── processed_data/
 │   ├── node_coordinates.csv    # Step 4c: 544 matched nodes with lat/lon
-│   ├── unmatched_ercot_settlement_points.csv  # Unmatched ERCOT nodes for review
-│   ├── unmatched_eia860_plants.csv            # Unmatched EIA plants for review
+│   ├── unmatched_ercot_settlement_points.csv
+│   ├── unmatched_eia860_plants.csv
 │   ├── forecast_errors/{model}/2025/07/       # Step 5a: Per-station error CSVs + summary
-│   └── forecast_errors_era5/{model}/2025/07/  # Step 5b: ERA5 gridded errors (NetCDF + summary)
-└── plots/                      # Generated visualizations
-    ├── max_temp_july_2025.png
-    ├── max_wind_speed_july_2025.png
-    └── combined_map_july_2025.png
+│   ├── forecast_errors_era5/{model}/2025/07/  # Step 5b: ERA5 gridded errors (NetCDF + summary)
+│   ├── gridded_generation_map.nc              # Step 5c: Static generation/infra map
+│   ├── combined_hourly_gridded_data/          # Step 5d: Pixel × hour analysis dataset
+│   │   └── pixel_hourly_{model}_{year}_{month:02d}.parquet
+│   ├── node_hourly_{model}[_{error_source}]_{tag}.csv  # Step 5e: Node × hour dataset
+│   └── cluster_hourly_{model}_{tag}.csv       # Step 6: Cluster × hour dataset
+└── figures/                    # Generated visualizations
 ```
 
 ## Data Sources Summary
@@ -61,6 +68,8 @@ Layout:
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
 | Node coords HTML | ERCOT contour map HTML (4 pages) | No | `data/*_html_source.txt` |
 | Node coords KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
+| Transmission GIS | `data/Line_Output.shp` | No | `process_data/gridded_generation_mapping.py` |
+| Bus GIS | `data/Bus_Output.shp` | No | `process_data/gridded_generation_mapping.py` |
 | Station forecast errors | NDFD/HRRR + ISD (Steps 1+2) | No | `process_data/calculate_forecast_errors.py` |
 | ERA5 gridded errors | NDFD/HRRR + ERA5 (Steps 1+1c) | No | `process_data/calculate_forecast_errors.py` |
 | Validation | All above | — | `download_data/validate_data.py` |
@@ -77,8 +86,8 @@ Layout:
 ## Step 0: Project Setup (DONE)
 
 Changes made:
-- `helper_funcs.py`: Added `raw` and `processed` keys to `setup_directories()`
-- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4`, `geopandas`, `cartopy`, `openpyxl`, `cdsapi` dependencies
+- `helper_funcs.py`: Added `raw`, `processed`, and `figures` keys to `setup_directories()`
+- `pyproject.toml`: Added `xarray`, `cfgrib`, `netcdf4`, `geopandas`, `cartopy`, `openpyxl`, `cdsapi`, `pyfixest`, `great-tables` dependencies
 - Run `uv sync` to install
 
 Prerequisites: `brew install awscli eccodes`
@@ -107,6 +116,50 @@ for element in ['temp', 'wspd', 'wdir']:
 - temp: 248 files, wspd: 248 files, wdir: 248 files
 - ~496 GRIB files downloaded per element, ~half have matching lead times
 - Each NetCDF file has 2 steps (1h, 25h lead time), ~490×516 grid points
+
+---
+
+## Step 1b: HRRR Weather Forecasts (DONE)
+
+**Script**: `download_data/pull_hrrr.py`
+
+Lead times: 1h and 18h. Run with interactive prompts for year/month.
+
+```bash
+uv run python -m download_data.pull_hrrr
+```
+
+---
+
+## Step 1c: ERA5-Land Reanalysis (DONE)
+
+**Script**: `download_data/pull_era5.py`
+
+Downloads ERA5-Land hourly reanalysis for the Texas bounding box (lat 25.8–36.5, lon -106.6 to -93.5) from the Copernicus CDS API. ERA5-Land provides gap-free gridded observations at ~9 km (0.1°) resolution and serves as a dense ground truth alternative to the ~202 ISD weather stations.
+
+### Run
+```bash
+uv run python -m download_data.pull_era5 --year 2025 --month 7
+```
+
+### Key implementation details
+
+**CDS API request** (`download_era5_month()`):
+- Dataset: `reanalysis-era5-land`
+- Variables requested: `2m_temperature`, `10m_u_component_of_wind`, `10m_v_component_of_wind`
+- Area: `[north, west, south, east]` = `[36.5, -106.6, 25.8, -93.5]`
+- `data_format: netcdf`, `download_format: unarchived` (new CDS API ≥ 0.7 syntax)
+- Requires `~/.cdsapirc` with the new-style URL (`https://cds.climate.copernicus.eu/api`)
+
+**Derived variables** added before saving:
+- `wspd = sqrt(u10² + v10²)` — wind speed [m/s]
+- `wdir = atan2(-u10, -v10) * 180/π (mod 360)` — meteorological wind direction [degrees], matching NDFD/HRRR `wdir10` convention
+
+**Output NetCDF variables**: `t2m` [K], `u10`, `v10`, `wspd`, `wdir` [m/s / degrees]; times stored in UTC; saved with zlib compression (complevel=5).
+
+### Output
+- `{raw}/era5_land/{year}/{month:02d}/era5_land_{YYYYMM}.nc`
+- ~109 lat × ~132 lon = ~14,388 grid cells covering Texas; 744 hourly steps per month
 
 ---
 
@@ -169,7 +222,7 @@ def parse_wnd(wnd_str):
 
 **Script**: `download_data/pull_ercot.py`
 
-Downloads day-ahead hourly LMP and real-time settlement point prices.
+Downloads day-ahead hourly LMP, real-time settlement point prices, actual load, and demand forecasts.
 
 ### Run
 ```bash
@@ -280,48 +333,6 @@ types are used in the analysis because only RN names appear in NP4-160 and thus 
 | PUN | ~5% | Point of Use Node (demand/load points, different physical locations) | No |
 | LZ/HU/SH/AH | ~3% | Load zones, hubs, sub-hubs (aggregates, not point-level) | No |
 
-PCCRN/LCCRN could theoretically be mapped via NP4-160's `Settlement_Points` file (which has
-a SUBSTATION column), but this is not implemented. PUN nodes would require coordinates from
-the CRR Network Model or similar source.
-
-### Possible improvements
-- **CRR Network Model KML**: Requires free IMRE registration at `https://www.ercot.com/services/rq/imre`. Contains bus polygon geometries for all network buses. Parser exists at `github.com/patrickbrown4/pvvm_pvtos`. Would cover ~100% of nodes.
-- Cross-reference EIA Form 860 generator-level data (`3_1_Generator*.xlsx`) for unit-level matching instead of plant-level
-- Re-save the 4 HTML source files periodically to capture new nodes added to the ERCOT contour maps
-- Map PCCRN/LCCRN names to coordinates via NP4-160 `Settlement_Points` → SUBSTATION → EIA plants
-
----
-
-## Step 1c: ERA5-Land Reanalysis (DONE)
-
-**Script**: `download_data/pull_era5.py`
-
-Downloads ERA5-Land hourly reanalysis for the Texas bounding box (lat 25.8–36.5, lon -106.6 to -93.5) from the Copernicus CDS API. ERA5-Land provides gap-free gridded observations at ~9 km (0.1°) resolution and serves as a dense ground truth alternative to the ~202 ISD weather stations.
-
-### Run
-```bash
-uv run python -m download_data.pull_era5 --year 2025 --month 7
-```
-
-### Key implementation details
-
-**CDS API request** (`download_era5_month()`):
-- Dataset: `reanalysis-era5-land`
-- Variables requested: `2m_temperature`, `10m_u_component_of_wind`, `10m_v_component_of_wind`
-- Area: `[north, west, south, east]` = `[36.5, -106.6, 25.8, -93.5]`
-- `data_format: netcdf`, `download_format: unarchived` (new CDS API ≥ 0.7 syntax)
-- Requires `~/.cdsapirc` with the new-style URL (`https://cds.climate.copernicus.eu/api`)
-
-**Derived variables** added before saving:
-- `wspd = sqrt(u10² + v10²)` — wind speed [m/s]
-- `wdir = atan2(-u10, -v10) * 180/π (mod 360)` — meteorological wind direction [degrees], matching NDFD/HRRR `wdir10` convention
-
-**Output NetCDF variables**: `t2m` [K], `u10`, `v10`, `wspd`, `wdir` [m/s / degrees]; times stored in UTC; saved with zlib compression (complevel=5).
-
-### Output
-- `{raw}/era5_land/{year}/{month:02d}/era5_land_{YYYYMM}.nc`
-- ~109 lat × ~132 lon = ~14,388 grid cells covering Texas; 744 hourly steps per month
-
 ---
 
 ## Step 5: Forecast Error Calculation (DONE)
@@ -330,7 +341,7 @@ uv run python -m download_data.pull_era5 --year 2025 --month 7
 
 Merges gridded weather forecasts (NDFD or HRRR) with either ISD station observations (Step 5a) or ERA5-Land reanalysis (Step 5b) to compute forecast errors. Uses `gpd.sjoin_nearest` (projected to EPSG:3857) to match each observation location to its nearest forecast grid cell.
 
-**Timezone convention**: All output `valid_time` columns are **US/Central (tz-naive)**. Conversion from UTC happens at data-load time (`load_forecasts()` and `load_all_observations()`), so all timestamps are already in Central before errors are computed. July CDT = UTC−5; January CST = UTC−6. ⚠ Existing CSVs produced before this change stored UTC times and need to be regenerated.
+**Timezone convention**: All output `valid_time` columns are **US/Central (tz-naive)**. Conversion from UTC happens at data-load time (`load_forecasts()` and `load_all_observations()`), so all timestamps are already in Central before errors are computed. July CDT = UTC−5; January CST = UTC−6.
 
 ### Step 5a: Station-level errors (ISD observations as ground truth)
 
@@ -372,14 +383,151 @@ calculate_era5_errors_for_month(2025, 7, model='hrrr')
 - `era5_errors_{YYYYMM}.nc` — compressed NetCDF with dims `(valid_time [Central], lead_hours, latitude, longitude)` and variables: `temp_error`, `wspd_error`, `wdir_error`, `forecast_temp`, `era5_temp`, `forecast_wspd`, `era5_wspd`, `forecast_wdir`, `era5_wdir`
 - `error_summary.csv` — per-ERA5-cell, per-lead MAE and bias
 
-**Key implementation details**:
-- `build_era5_grid_gdf(era5_ds)` — ERA5's regular 1D lat/lon grid → GeoDataFrame (analogous to `build_forecast_grid_gdf` for 2D Lambert grids)
-- `load_era5_as_obs_dict(era5_nc_path)` — loads ERA5 arrays into the same `{cell_id: DataFrame}` format used by the station pipeline; converts K→°C; skips ocean-masked cells
-- `_compute_era5_gridded_errors()` — accumulates errors into pre-allocated NumPy arrays and saves as NetCDF (CSV would be ~20M rows for a single month)
+---
+
+## Step 5c: Gridded Generation & Infrastructure Mapping (DONE)
+
+**Script**: `process_data/gridded_generation_mapping.py`
+
+Maps EIA Form 860 generation capacity, ERCOT transmission lines, and ERCOT load buses onto the ERA5-Land regular grid, creating a static spatial reference for infrastructure. Required before Step 5d.
+
+### Run
+```bash
+uv run python -c "
+from process_data.gridded_generation_mapping import build_gridded_generation_map
+build_gridded_generation_map()
+"
+```
+
+### Key implementation details
+
+**Grid template**: reads any ERA5-Land NetCDF to extract the 0.1° lat/lon grid (109 lats × 132 lons).
+
+**Generation binning** (`_bin_generators()`):
+- Reads `{raw}/eia860/texas_plants.csv`
+- Bins each generator into its nearest ERA5 grid cell using `np.digitize`
+- Aggregates per cell: `total_capacity_mw`, `n_generators`, and `nameplate_mw_tech_{slug}` for each EIA technology (slug = lowercased name with spaces/special chars replaced by `_`)
+
+**Transmission marking** (`_mark_transmission()`):
+- Reads `data/Line_Output.shp`; builds 0.1° grid cell polygons
+- Sets `has_transmission_line = 1` for any cell intersecting a transmission line
+
+**Load center marking** (`_mark_load_centers()`):
+- Reads `data/Bus_Output.shp`; marks cells containing a bus with `Gen_bus__N == 0` as `load_center = 1`
+
+### Output
+- `{processed}/gridded_generation_map.nc` — static NetCDF, dims `(latitude, longitude)`
+- Variables: `total_capacity_mw`, `n_generators`, `nameplate_mw_tech_{slug}` (~16 technologies), `has_transmission_line`, `load_center`
 
 ---
 
-## Step 6: Renewable Curtailment Data (TODO)
+## Step 5d: Pixel × Hour Analysis Dataset (DONE)
+
+**Script**: `process_data/combine_forecast_generation_node.py`
+
+Builds the main analysis-ready dataset by merging ERA5 gridded forecast errors (Step 5b), the gridded generation map (Step 5c), and system-level hourly LMP statistics (Step 3). The result has one row per (pixel, hour) for all pixels with any infrastructure.
+
+### Run (per month)
+```bash
+uv run python -c "
+from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+build_pixel_hourly_dataset(2025, 7, model='hrrr')
+"
+```
+
+### Key functions
+- `flatten_era5_errors(year, month, model)` — load ERA5 error NetCDF, extract land pixels, pivot lead times to wide format (columns: `temp_error_{lead}h`, `wspd_error_{lead}h`, etc.)
+- `flatten_generation_map()` — load gridded generation map, keep only pixels with infrastructure
+- `compute_system_lmp_hourly(year, month)` — aggregate RT SPP (RN nodes only) to system-wide hourly `system_lmp_mean`, `system_lmp_max`, `system_lmp_std`
+- `build_pixel_hourly_dataset(year, month, model)` — main entry point; runs all three and merges
+
+### Output
+- `{processed}/combined_hourly_gridded_data/pixel_hourly_{model}_{year}_{month:02d}.parquet`
+- ~5,000 infrastructure pixels × 744 hours/month ≈ 3.7M rows per file
+- Columns: `pixel_id, latitude, longitude, valid_time` [Central], `temp_error_{lead}h`, `wspd_error_{lead}h`, `wdir_error_{lead}h`, `forecast_temp_{lead}h`, `forecast_wspd_{lead}h`, `era5_temp`, `era5_wspd`, `era5_wdir`, `total_capacity_mw`, `n_generators`, `nameplate_mw_tech_*`, `has_transmission_line`, `load_center`, `system_lmp_mean`, `system_lmp_max`, `system_lmp_std`, `hour_of_day`, `day_of_month`, `weekday`, `month`
+
+**pixel_id format**: `"{lat:.1f}_{lon:.1f}"` (rounded to 0.1°, matching ERA5 grid)
+
+---
+
+## Step 5e: Node × Hour Dataset (DONE)
+
+**Script**: `process_data/prepare_node_level_data.py`
+
+Builds a node × hour dataset linking each ERCOT resource node's LMP to weather forecast errors. Supports two error sources and multi-month analysis.
+
+### Run
+```bash
+uv run python -c "
+from process_data.prepare_node_level_data import prepare_node_level_data
+prepare_node_level_data(
+    months=[(2025, m) for m in range(1, 13)],
+    model='hrrr',
+    error_source='era5'   # or 'station'
+)
+"
+```
+
+### Key implementation details
+
+**Error sources** (`error_source` parameter):
+- `'station'` (default): each node → nearest ISD station via `gpd.sjoin_nearest`; uses per-station error CSVs from Step 5a
+- `'era5'`: each node → nearest ERA5 cell via `xr.sel(method='nearest')`; uses gridded error NetCDF from Step 5b
+
+**Lead times**: HRRR = 1h + 18h; NDFD = 1h + 25h
+
+**Weather zone integration**: nodes are spatially joined to ERCOT weather-zone polygons for load forecast merging
+
+**Multi-month caching**: one cache file per (month range, model, error_source) combination; skips rebuild if cache exists
+
+### Output
+- `{processed}/node_hourly_{model}[_{error_source}]_{tag}.csv`
+- Columns: `settlement_point, valid_time` [Central], `lmp, temp_error_{lead}h, wspd_error_{lead}h, era5_temp, era5_wspd, forecast_load_{lead}h, load_error_{lead}h, weather_zone, lat, lon`, time features
+
+---
+
+## Step 6: Cluster × Hour Dataset (DONE)
+
+**Script**: `process_data/prepare_cluster_level_data.py`
+
+Clusters ERCOT nodes geographically and by LMP patterns, then aggregates weather and LMP data to a cluster × hour level. This is the primary dataset for the cluster-level regression analyses.
+
+### Run
+```bash
+uv run python -c "
+from process_data.prepare_cluster_level_data import build_cluster_hourly_data
+cluster_hourly, node_clusters, cluster_polygons, sil = build_cluster_hourly_data(
+    months=[(2025, m) for m in range(1, 13)],
+    model='hrrr',
+    n_clusters=9,
+    geo_weight=10.0,
+    n_neighbors=8,
+)
+"
+```
+
+### Clustering approach (`cluster_nodes()`)
+- Features: standardized `[lat, lon]` (weighted by `geo_weight`) + LMP summary stats (`mean_lmp`, `std_lmp`, `peak_offpeak_spread`) + per-month means/stds
+- Algorithm: `AgglomerativeClustering` with k-NN connectivity constraint — only adjacent nodes merge, ensuring geographic contiguity
+- Post-processing: small clusters (< `min_cluster_size`) are reassigned to nearest valid cluster
+- Returns: labeled DataFrame + silhouette score
+
+Use `sweep_n_clusters()` to plot silhouette scores vs k and choose the best number of clusters.
+
+### Weather aggregation to cluster level (`aggregate_to_cluster_hour()`)
+- **'polygon' mode** (default): all ISD stations within each cluster's convex-hull polygon are pooled; generation capacity used as weights for wind/solar/gas pixels; unweighted mean for transmission/load
+- **'node' mode**: uses node-to-station mapping (one station per node)
+
+### Broad technology categories
+`_BROAD_CATEGORY_MAP` in `prepare_cluster_level_data.py` maps EIA technologies to 6 categories: `gas`, `nuclear`, `coal`, `solar`, `wind`, `other`.
+
+### Output
+- `{processed}/cluster_hourly_{model}_{tag}.csv` — one row per (cluster, hour)
+- Columns: `cluster, valid_time` [Central], `lmp, temp_error_{lead}h, wspd_error_{lead}h, era5_temp, era5_wspd, actual_load, load_error_{lead}h, nameplate_mw_{broad_cat}`, `total_nameplate_mw`, `n_generators`, `n_nodes`, time features
+
+---
+
+## Step 7: Renewable Curtailment Data (TODO)
 
 ERCOT publishes 60-Day SCED Disclosure with individual unit output and HSL. Curtailment = HSL - actual output for renewables.
 - Source: https://www.ercot.com/mp/data-products/data-product-details?id=NP3-966-ER
@@ -389,10 +537,10 @@ ERCOT publishes 60-Day SCED Disclosure with individual unit output and HSL. Curt
 ## Execution Order
 
 ```bash
-# Step 0: Already done
-uv sync  # installs all dependencies including cdsapi
+# Step 0: Setup
+uv sync
 
-# Step 1a: NDFD forecasts (~30-60 min per element)
+# Step 1a: NDFD forecasts (~30-60 min per element per month)
 uv run python -c "
 from download_data.pull_ndfd import download_and_extract_texas_month
 from helper_funcs import setup_directories
@@ -403,7 +551,7 @@ for element in ['temp', 'wspd', 'wdir']:
     download_and_extract_texas_month(element, year=2025, month=7, base_dir=base_dir)
 "
 
-# Step 1b: HRRR forecasts (~2-3 hours for a full month)
+# Step 1b: HRRR forecasts (~2-3 hours per month)
 uv run python -m download_data.pull_hrrr  # interactive prompts for year/month
 
 # Step 1c: ERA5-Land reanalysis (~10-30 min per month, requires ~/.cdsapirc)
@@ -420,23 +568,59 @@ uv run python -m download_data.pull_np4160
 uv run python -m download_data.pull_eia860
 uv run python -c "from process_data.process_ercot import build_node_coordinates; build_node_coordinates(force_rebuild=True)"
 
-# Step 5a: Station-level forecast errors (~2 min per model, requires Steps 1+2)
+# Step 5a: Station-level forecast errors (~2 min per model per month)
 uv run python -c "
 from process_data.calculate_forecast_errors import calculate_hrrr_errors_for_month
 calculate_hrrr_errors_for_month(2025, 7)
 "
 
-# Step 5b: ERA5 gridded forecast errors (~10-20 min per model, requires Steps 1+1c)
+# Step 5b: ERA5 gridded forecast errors (~10-20 min per model per month)
 uv run python -c "
 from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
 calculate_era5_errors_for_month(2025, 7, model='hrrr')
 "
 
+# Step 5c: Gridded generation/infrastructure map (one-time, ~1 min)
+uv run python -c "
+from process_data.gridded_generation_mapping import build_gridded_generation_map
+build_gridded_generation_map()
+"
+
+# Step 5d: Pixel × hour dataset (per month, ~5 min)
+uv run python -c "
+from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+for month in range(1, 13):
+    build_pixel_hourly_dataset(2025, month, model='hrrr')
+"
+
+# Step 5e: Node × hour dataset
+uv run python -c "
+from process_data.prepare_node_level_data import prepare_node_level_data
+prepare_node_level_data(
+    months=[(2025, m) for m in range(1, 13)],
+    model='hrrr',
+    error_source='era5',
+)
+"
+
+# Step 6: Cluster × hour dataset
+uv run python -c "
+from process_data.prepare_cluster_level_data import build_cluster_hourly_data
+build_cluster_hourly_data(
+    months=[(2025, m) for m in range(1, 13)],
+    model='hrrr',
+    n_clusters=9,
+    geo_weight=10.0,
+    n_neighbors=8,
+)
+"
+
 # Validate
 uv run python -m download_data.validate_data
 
-# Generate plots
-uv run python create_plots.py
+# Analysis notebooks (run after Steps 5d and 6)
+quarto render analysis/gridded_lr.qmd
+quarto render analysis/cluster_node_lr.qmd
 ```
 
 ---
@@ -446,55 +630,114 @@ uv run python create_plots.py
 ### `process_data/calculate_forecast_errors.py`
 Computes forecast errors (NDFD or HRRR) against either ISD weather stations or ERA5-Land reanalysis. All output `valid_time` values are **US/Central (tz-naive)**.
 
-**Timezone utility**:
-- `_to_central(timestamps)` — converts UTC timestamps (tz-naive or tz-aware) to US/Central tz-naive; handles DST automatically
-
-**Station-level entry points** (ISD observations as ground truth):
-- `calculate_ndfd_errors_for_month(year, month)` — NDFD vs ISD stations; output: `{processed}/forecast_errors/ndfd/{year}/{month:02d}/`
-- `calculate_hrrr_errors_for_month(year, month)` — HRRR vs ISD stations; output: `{processed}/forecast_errors/hrrr/{year}/{month:02d}/`
-
-**ERA5 gridded entry point** (ERA5-Land reanalysis as ground truth):
-- `calculate_era5_errors_for_month(year, month, model='hrrr')` — NDFD or HRRR vs ERA5; output: `{processed}/forecast_errors_era5/{model}/{year}/{month:02d}/era5_errors_{YYYYMM}.nc`
-
-**Shared helpers**:
-- `load_stations_gdf(raw_dir)` — station metadata as GeoDataFrame
-- `load_all_observations(stations_gdf, year, month, raw_dir)` — ISD data resampled to hourly; times converted to US/Central
-- `build_forecast_grid_gdf(sample_nc_path)` — GeoDataFrame of any 2D lat/lon forecast grid (NDFD, HRRR)
+- `_to_central(timestamps)` — converts UTC timestamps to US/Central tz-naive; handles DST
+- `calculate_ndfd_errors_for_month(year, month)` — NDFD vs ISD stations
+- `calculate_hrrr_errors_for_month(year, month)` — HRRR vs ISD stations
+- `calculate_era5_errors_for_month(year, month, model='hrrr')` — NDFD or HRRR vs ERA5
+- `build_forecast_grid_gdf(sample_nc_path)` — GeoDataFrame of any 2D lat/lon forecast grid
 - `build_era5_grid_gdf(era5_ds)` — GeoDataFrame of ERA5's regular 1D lat/lon grid
-- `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` (EPSG:3857) to match any observation GDF to nearest forecast grid cell
+- `spatial_join_stations_to_grid(stations_gdf, grid_gdf)` — `sjoin_nearest` (EPSG:3857)
 - `load_forecasts(element_dir, variable_name, year, month)` — loads NetCDF files; converts `valid_time` to US/Central
-- `load_era5_as_obs_dict(era5_nc_path)` — ERA5 NetCDF → `{cell_id: DataFrame}` format compatible with the station pipeline
+- `load_era5_as_obs_dict(era5_nc_path)` — ERA5 NetCDF → `{cell_id: DataFrame}` format
 
-### `download_data/pull_era5.py`
-Downloads ERA5-Land hourly reanalysis from the Copernicus CDS API:
-- `download_era5_month(year, month, base_dir, force_rebuild=False)` — downloads one month, adds derived `wspd`/`wdir`, saves compressed NetCDF
-- `download_era5_months(months, base_dir, force_rebuild=False)` — loops over a list of `(year, month)` tuples
-- CLI: `uv run python -m download_data.pull_era5 --year 2025 --month 7`
+### `process_data/gridded_generation_mapping.py`
+Maps generation/infrastructure onto the ERA5 grid.
+
+- `build_gridded_generation_map(force_rebuild=False)` — main entry point; caches to `{processed}/gridded_generation_map.nc`
+- `build_era5_template_dataset()` — load ERA5 NetCDF to get lat/lon grid template
+- `_bin_generators(generators_path, lats, lons)` — bin EIA generators into ERA5 cells
+- `_mark_transmission(lats, lons, shp_path)` — mark cells intersecting transmission lines
+- `_mark_load_centers(lats, lons, shp_path)` — mark cells containing ERCOT load buses
+- `_tech_slug(tech)` — convert EIA technology name to safe column slug (imported from `prepare_cluster_level_data`)
+
+### `process_data/combine_forecast_generation_node.py`
+Builds the pixel × hour analysis dataset (Step 5d).
+
+- `build_pixel_hourly_dataset(year, month, model='hrrr', force_rebuild=False)` — main entry point
+- `flatten_era5_errors(year, month, model)` — ERA5 errors → wide DataFrame (one row per pixel × hour)
+- `flatten_generation_map()` — generation map NetCDF → DataFrame (one row per infrastructure pixel)
+- `compute_system_lmp_hourly(year, month)` — RT SPP → system-level hourly `system_lmp_mean/max/std`
+
+### `process_data/prepare_node_level_data.py`
+Builds the node × hour dataset (Step 5e).
+
+- `prepare_node_level_data(months, model='hrrr', error_source='era5', force_rebuild=False)` — main entry point; `months` is a list of `(year, month)` tuples
+- `_load_era5_errors_for_nodes(nodes_gdf, year, month, model)` — extract ERA5 errors at node coordinates via `xr.sel(method='nearest')`
+- `_map_nodes_to_weather_zones(nodes_gdf, zones_shp_path)` — spatial join with fallback to nearest
+- `_load_weather_zone_load_data(year, month)` — actual load + 1h/18h forecasts by weather zone
+
+### `process_data/prepare_cluster_level_data.py`
+Clusters nodes and builds the cluster × hour dataset (Step 6).
+
+- `compute_node_lmp_features(months, model)` — per-node LMP summary stats for clustering
+- `cluster_nodes(node_features_gdf, n_clusters, geo_weight, n_neighbors, min_cluster_size)` — agglomerative clustering with geographic connectivity
+- `sweep_n_clusters(node_features_gdf, k_range, ...)` — plot silhouette scores to choose k
+- `build_cluster_polygons(node_clusters_gdf)` — convex-hull polygon per cluster
+- `aggregate_to_cluster_hour(cluster_hourly, mode='polygon')` — aggregate weather/LMP to cluster level
+- `compute_cluster_generation_mix(nodes_gdf, cluster_labels)` — capacity by broad tech category per cluster
+- `build_cluster_hourly_data(months, model, n_clusters, ...)` — main entry point; orchestrates all steps; returns `(cluster_hourly, node_clusters, cluster_polygons, silhouette_score)`
+- `_tech_slug(tech)` — technology name → safe column slug (also imported by `gridded_generation_mapping.py`)
 
 ### `process_data/process_ercot.py`
 Functions for reading and processing ERCOT market data:
+
 - `load_dam_spp_month(year, month)` — loads all daily DAM SPP CSVs into one DataFrame
 - `load_rt_spp_month(year, month)` — loads all daily RT SPP CSVs into one DataFrame
-- `compute_max_lmp_by_node(year, month, point_types='RN')` — max LMP per settlement point; accepts a string, list of strings, or None (all types)
-- `build_node_coordinates(force_rebuild=False)` — builds the name-matching pipeline (Step 4c), caches to `{processed}/node_coordinates.csv`
+- `compute_max_lmp_by_node(year, month, point_types='RN')` — max LMP per settlement point
+- `build_node_coordinates(force_rebuild=False)` — name-matching pipeline (Step 4c)
+- `load_actual_load_month(year, month)` — actual hourly load by ERCOT weather zone
+- `load_demand_forecasts_month(year, month)` — demand forecasts (1h and 18h ahead) by weather zone
+- `extract_demand_forecast_lead_times(year, month, lead_hours)` — pull specific lead-time demand forecasts
+
+### `download_data/pull_era5.py`
+- `download_era5_month(year, month, base_dir, force_rebuild=False)` — downloads one month
+- `download_era5_months(months, base_dir, force_rebuild=False)` — loops over `(year, month)` tuples
+- CLI: `uv run python -m download_data.pull_era5 --year 2025 --month 7`
 
 ### `download_data/validate_data.py`
-Functions for validating downloaded data:
 - `validate_data(year, month)` — checks file completeness for NDFD, HRRR, weather stations, DAM SPP, RT SPP
-- `validate_settlement_point_coverage(year, month)` — reports settlement point type distribution in RT SPP, RN coordinate coverage, and match method breakdown
+- `validate_settlement_point_coverage(year, month)` — settlement point type distribution, RN coverage, match methods
 - `validate_node_coordinate_matching()` — detailed matching pipeline validation with map visualization
 
-### `create_plots.py`
-Visualization functions using cartopy for Texas maps:
-- `plot_max_temperature_map()` — weather stations colored by max temperature
-- `plot_max_wind_speed_map()` — weather stations colored by max wind speed
-- `plot_combined_map()` — 3-panel figure: max temp, max wind speed, max LMP
+### `analysis/create_plots.py`
+Visualization functions using cartopy for Texas maps (moved from project root to `analysis/`):
+- `plot_max_temperature_map()`, `plot_max_wind_speed_map()`, `plot_combined_map()` — standard map outputs
 - `map_station_values()` — reusable scatter-map plotter
-- `compute_station_stat()` — generic per-station statistic from ISD data (supports any column/parser/stat_func)
+- `compute_station_stat()` — generic per-station statistic from ISD data
 
-Parsers in `create_plots.py`:
-- `parse_tmp(tmp_str)` — ISD TMP field → °C
-- `parse_wnd_speed(wnd_str)` — ISD WND field → m/s
+---
+
+## Analysis Scripts & Notebooks
+
+### `analysis/gridded_lr.qmd`
+Regression analysis at the pixel × hour level using the dataset from Step 5d. Since system LMP is constant across pixels within an hour, forecast errors are aggregated by infrastructure type per hour (capacity-weighted for generation pixels, unweighted for transmission/load), producing an hour-level dataset (~8,760 obs for all of 2025). Regressions test how spatially-disaggregated errors affect system LMP mean, max, and spread.
+
+**Infrastructure categories for aggregation**: wind (weighted by wind turbine capacity), solar (solar capacity), gas (sum of gas tech capacity), transmission (unweighted), load center (unweighted).
+
+**Models included**:
+1. Baseline: all error types → `system_lmp_{mean,max,std}` | `hour_of_day + month` FE, SEs clustered by day
+2. Long lead (18h) version of baseline
+3. Cross-category interactions (e.g., `temp_error_load_center × wspd_error_wind`)
+4. Spatial map: per-pixel `corr(wspd_error_1h, system_lmp_std)` over Texas
+5. Seasonal subsample: summer vs winter vs shoulder
+
+**Prerequisite**: `build_pixel_hourly_dataset()` must have been run for all months.
+
+### `analysis/cluster_node_lr.qmd`
+Cluster-level regression analysis using the dataset from Step 6. Clusters ERCOT nodes geographically and by LMP patterns, then regresses cluster-level LMP on capacity-weighted forecast errors.
+
+**Helper functions** (reused in `gridded_lr.qmd`):
+- `prepare_data(df, depvar, treatments, controls, fe)` — drop NaN rows
+- `build_formula(depvar, treatments, controls, fe, interactions)` — build pyfixest formula string
+- `plot_coefs(model, data, depvar, treatments, coefs, save_path, save_dir)` — horizontal CI coefficient plot
+
+### `analysis/cluster_heterogeneity_lr.py`
+Runs cluster-level regressions separately for each cluster to estimate heterogeneous treatment effects. Produces a PDF with: labeled cluster map, across-cluster coefficient plots, and per-cluster error-distribution histograms scaled by estimated coefficients.
+
+### `analysis/analysis_forecast_error_eda.py`
+Forecast error exploratory analysis. For each cluster, identifies "treatment" hours (large forecast errors) and matches them to similar control hours. Produces side-by-side LMP maps for treatment vs control for each cluster.
+
+**Key function**: `find_treatment_control(cluster_data, weather_var, lead_time, window_days, error_tolerance)` — finds the max-error hour and a control hour with similar time-of-day and baseline conditions.
 
 ---
 
@@ -517,6 +760,12 @@ This is expected. Of ~496 Group B GRIB files downloaded, only ~half contain the 
 - **`data_format` key not accepted**: Requires `cdsapi>=0.7.0`. Run `uv sync` to ensure the right version is installed.
 - **Request queued for a long time**: ERA5-Land requests are queued server-side; a full month (~50-100 MB) typically takes 5–20 minutes depending on CDS load. The script will wait until the download completes.
 - **ERA5 errors NetCDF missing**: If `calculate_era5_errors_for_month()` raises `FileNotFoundError`, the ERA5 raw file is missing — run Step 1c first.
+
+### pixel_hourly parquet missing
+If `build_pixel_hourly_dataset()` raises `FileNotFoundError`, check:
+1. ERA5 gridded errors exist for the month (Step 5b)
+2. `gridded_generation_map.nc` exists (Step 5c)
+3. RT SPP CSVs exist for the month (Step 3)
 
 ### Stale UTC forecast error CSVs
 After the timezone change to US/Central, any existing per-station CSVs in `processed_data/forecast_errors/` contain UTC `valid_time` values and are stale. Delete the relevant subdirectory and re-run `calculate_hrrr_errors_for_month()` or `calculate_ndfd_errors_for_month()` to regenerate with correct Central times.

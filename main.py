@@ -108,13 +108,13 @@ dirs = setup_directories()
 # compares to ISD hourly observations, and saves per-station error CSVs.
 # Requires Steps 1 and 2. ~2 min per month per model.
 # =============================================================================
-# from process_data.calculate_forecast_errors import (
-#     calculate_ndfd_errors_for_month,
-#     calculate_hrrr_errors_for_month,
-# )
-# for year, month in MONTHS:
+from process_data.calculate_forecast_errors import (
+    calculate_ndfd_errors_for_month,
+    calculate_hrrr_errors_for_month,
+)
+for year, month in MONTHS:
     # calculate_ndfd_errors_for_month(year, month) # not using atm
-    # calculate_hrrr_errors_for_month(year, month)
+    calculate_hrrr_errors_for_month(year, month)
 
 # =============================================================================
 # STEP 5b: Calculate ERA5-based gridded forecast errors
@@ -145,9 +145,9 @@ dirs = setup_directories()
 # montly parquet files
 # Output: pixel_hourly_{model}_{YYYYMM}.parquet
 # =============================================================================
-from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset 
-for year, month in MONTHS:
-    build_pixel_hourly_dataset(
-        year, month, model='hrrr', force_rebuild=False
-    )
+# from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset 
+# for year, month in MONTHS:
+#     build_pixel_hourly_dataset(
+#         year, month, model='hrrr', force_rebuild=False
+#     )
 
