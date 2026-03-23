@@ -56,22 +56,20 @@ print("Setup complete")
 
 dirs = setup_directories()
 
-# ── Choose forecast model: 'ndfd' or 'hrrr' ──
-MODEL = 'hrrr'
-LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
-LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
+# ── Combined HRRR (1h short-range) + GFS (day-ahead, lead=0) ──
+LEAD_SHORT, LEAD_DAH = 1, 0  # HRRR 1h short-range, GFS day-ahead
 
 # ── Months to include ──
 MONTHS = [(2025, m) for m in range(1, 9)] # For now jan to aug 
 
-df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=True)
+df = prepare_node_level_data(months=MONTHS, force_rebuild=True)
 
 print(f"\n{'='*60}")
 print(f"Dataset Summary ({MODEL.upper()})")
 print(f"{'='*60}")
 print(f"Observations: {len(df):,}")
 print(f"Nodes: {df['settlement_point'].nunique()}")
-print(f"Lead times: {LEAD_SHORT}h (short) / {LEAD_LONG}h (long)")
+print(f"Lead times: {LEAD_SHORT}h (HRRR short-range) / {LEAD_DAH}h (GFS day-ahead)")
 print(f"Date range: {df['hour_dt'].min()} to {df['hour_dt'].max()}")
 print(f"\nColumns: {', '.join(df.columns)}")
 ```
@@ -226,7 +224,7 @@ def plot_coefs(model, data, depvar, treatments, coefs=None, save_path=None, save
 # Note: positive errors mean forecast was warmer/faster than observed, negative means cooler/slower
 
 # leadtime = LEAD_SHORT
-leadtime = LEAD_LONG
+leadtime = LEAD_DAH
 
 # options are lmp_mean, lmp_max, lmp_std
 DEPVAR = "lmp"

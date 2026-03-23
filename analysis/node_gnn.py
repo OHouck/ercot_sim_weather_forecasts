@@ -27,8 +27,11 @@ Usage:
     uv run python -m analysis.node_gnn
 """
 
+import glob
 import os
+import re
 import sys
+import warnings
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -54,15 +57,15 @@ from helper_funcs import setup_directories
 from process_data.prepare_node_level_data import prepare_node_level_data
 
 # ── Configuration ────────────────────────────────────────────────
-MODEL = "hrrr"
+# Uses combined HRRR (1h short-range) + GFS (day-ahead, lead=0) by default
 ERROR_SOURCE = "era5"
 MONTHS = [(2025, m) for m in range(1, 13)]
 
 FALLBACK_K = 3            # k-NN for isolated nodes
 HIDDEN_DIM = 128
 N_HEADS = 4
-N_GAT_LAYERS = 3
-DROPOUT = 0.2
+N_GAT_LAYERS = 2          # 2 layers suffice (virtual node = diameter-2)
+DROPOUT = 0.3             # v4: increased from 0.2 to reduce overfitting
 MLP_HIDDEN = 64
 
 TRAIN_DAYS = (1, 15)
@@ -73,12 +76,12 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 MAX_EPOCHS = 200
-PATIENCE = 20
+PATIENCE = 40             # v4: increased from 20 (val curve is noisy)
+WARMUP_EPOCHS = 5
+NODE_EMBED_DIM = 8        # v5: learnable per-node embedding dimension
 
-_GIS_ROOT = (
-    '/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/'
-    'ercot_sim_weather_forecasts/Texas_GIS_Data'
-)
+dirs = setup_directories()
+_GIS_ROOT = os.path.join(dirs["root"], "Texas_GIS_Data")
 LINE_SHP = os.path.join(_GIS_ROOT, 'Line', 'Line_Output.shp')
 BUS_SHP = os.path.join(_GIS_ROOT, 'Bus', 'Bus_Output.shp')
 
@@ -107,27 +110,24 @@ WEATHER_ZONES = [
 BASE_NUMERIC_COLS = [
     "observed_temp",       # 0
     "observed_wspd",       # 1
-    "temp_error_1h",       # 2
-    "wspd_error_1h",       # 3
-    "temp_error_18h",      # 4
-    "wspd_error_18h",      # 5
+    "temp_error_1h",       # 2  HRRR short-range
+    "wspd_error_1h",       # 3  HRRR short-range
+    "temp_error_0h",       # 4  GFS day-ahead
+    "wspd_error_0h",       # 5  GFS day-ahead
     "forecast_temp_1h",    # 6
     "forecast_wspd_1h",    # 7
-    "forecast_temp_18h",   # 8
-    "forecast_wspd_18h",   # 9
-    "actual_load",         # 10
-    "forecast_load_1h",    # 11
-    "forecast_load_18h",   # 12
-    "load_error_1h",       # 13
-    "load_error_18h",      # 14
-    "lat",                 # 15
-    "lon",                 # 16
+    "actual_load",         # 8
+    "forecast_load_1h",    # 9
+    "load_error_1h",       # 10
+    "lat",                 # 11
+    "lon",                 # 12
 ]
 TARGET_COL = "lmp"
 
 ERROR_FEATURE_INDICES = [2, 3, 4, 5]
 ERROR_FEATURE_NAMES = [
-    "temp_error_1h", "wspd_error_1h", "temp_error_18h", "wspd_error_18h",
+    "temp_error_1h", "wspd_error_1h",   # HRRR short-range
+    "temp_error_0h", "wspd_error_0h",   # GFS day-ahead
 ]
 
 LMP_CLIP_LO = 1
@@ -138,13 +138,47 @@ EDGE_TRANSMISSION = 0
 EDGE_FALLBACK_KNN = 1
 EDGE_VIRTUAL = 2
 
+# Technology types for node classification
+TECH_TYPES = ["wind", "solar", "gas", "storage", "other"]
+
+_WIND_RE = re.compile(r"WIND|WND|_W\d|TURBINE|TURBN", re.I)
+_SOLAR_RE = re.compile(r"SLR|SOLAR|_PV|SOLR", re.I)
+_BESS_RE = re.compile(r"ESR\d?|ESS\d?|BESS|BATTERY", re.I)
+_GAS_RE = re.compile(r"_GT\d|_CT\d|_CC\d|_ST\d|CCGT|GAS|STEAM|_STG", re.I)
+
+
+def _classify_node_tech(node_order):
+    """Classify settlement-point nodes by technology from NP4-160 unit names."""
+    rn_files = glob.glob(
+        os.path.join(dirs["raw"], "ercot", "np4_160", "Resource_Node_to_Unit_*.csv")
+    )
+    unit_map = {}
+    if rn_files:
+        rn = pd.read_csv(rn_files[0])
+        unit_map = rn.groupby("RESOURCE_NODE")["UNIT_NAME"].apply(" ".join).to_dict()
+
+    tech = {}
+    for sp in node_order:
+        combined = sp + " " + unit_map.get(sp, "")
+        if _WIND_RE.search(combined):
+            tech[sp] = "wind"
+        elif _SOLAR_RE.search(combined):
+            tech[sp] = "solar"
+        elif _BESS_RE.search(combined):
+            tech[sp] = "storage"
+        elif _GAS_RE.search(combined):
+            tech[sp] = "gas"
+        else:
+            tech[sp] = "other"
+    return tech
+
 
 # ── Data Loading ─────────────────────────────────────────────────
 
 def load_data():
     dirs = setup_directories()
     df = prepare_node_level_data(
-        months=MONTHS, model=MODEL, error_source=ERROR_SOURCE,
+        months=MONTHS, error_source=ERROR_SOURCE,
     )
     df["hour"] = pd.to_datetime(df["hour"])
     node_coords = pd.read_csv(
@@ -157,25 +191,29 @@ def load_data():
 # ── Graph Construction ───────────────────────────────────────────
 
 def build_transmission_graph(node_coords):
-    """Build a graph guided by the ERCOT 345 kV transmission topology.
+    """Build a settlement-node graph via simulation-bus contraction.
 
     Algorithm:
-      1. Load 123 simulation buses and 255 transmission lines.
-      2. Map each settlement-point node to its nearest simulation bus.
-      3. For each transmission line (FBus→TBus), connect all nodes mapped
-         to FBus with all nodes mapped to TBus (bipartite edges).
-      4. Connect all nodes mapped to the *same* bus to each other.
-      5. Fix any isolated nodes: connect each to its 3 nearest already-
-         connected nodes.  Repeat until the graph is fully connected.
-      6. Add a virtual super node (index = N) connected to all N real
-         nodes.
+      1. Map each settlement-point node to its nearest simulation bus.
+      2. Build the full simulation transmission graph (all buses + lines).
+      3. Iteratively remove simulation buses that have no mapped nodes,
+         rewiring their edges directly between their neighbours (i.e. path
+         contraction).  One pass through the initially-empty buses suffices
+         because contractions are processed in-place — each bus's neighbour
+         list already reflects earlier removals in the same pass.
+      4. The result is a backbone graph where every bus has ≥ 1 mapped node.
+      5. Connect settlement-point nodes whose backbone buses share an edge,
+         plus all nodes that share the same backbone bus (intra-bus edges).
+      6. Add a virtual super node connected to every real node.
 
     Returns:
-        edge_index: (2, E) LongTensor  — includes virtual-node edges
-        edge_attr:  (E, 2) FloatTensor — [normalised distance, edge type]
-        node_order: list of settlement_point names (length N, real only)
-        positions:  (N, 2) ndarray of (lat, lon) for real nodes
+        edge_index:       (2, E) LongTensor  — includes virtual-node edges
+        edge_attr:        (E, 2) FloatTensor — [normalised distance, edge type]
+        node_order:       list of settlement_point names (length N)
+        positions:        (N, 2) ndarray of (lat, lon) for real nodes
         virtual_node_idx: int — index of the virtual super node (= N)
+        backbone_bus_pos: (M, 2) ndarray of (lat, lon) for backbone buses
+        backbone_edges:   list of (lat1, lon1, lat2, lon2) for backbone edges
     """
     # ── Load shapefiles ──
     lines = gpd.read_file(LINE_SHP)
@@ -195,37 +233,70 @@ def build_transmission_graph(node_coords):
     num_nodes = len(node_order)
 
     _, nearest_bus_idx = bus_tree.query(positions)
-    node_to_bus = bus_numbers[nearest_bus_idx]   # bus number per node
+    node_to_bus = bus_numbers[nearest_bus_idx]
 
-    # Invert: bus_number → list of node indices
     bus_to_nodes = {}
     for i, bus_num in enumerate(node_to_bus):
         bus_to_nodes.setdefault(int(bus_num), []).append(i)
 
-    # ── Build edges from transmission lines ──
-    edge_set = {}   # (src, dst) → geographic distance
-
+    # ── Build full simulation adjacency (bus_num → set of neighbour bus_nums) ──
+    all_bus_nums = set(int(b) for b in bus_numbers)
+    adj = {b: set() for b in all_bus_nums}
     for _, line in lines.iterrows():
-        fbus = int(line["FBus_Num"])
-        tbus = int(line["TBus_Num"])
-        fnodes = bus_to_nodes.get(fbus, [])
-        tnodes = bus_to_nodes.get(tbus, [])
+        fbus, tbus = int(line["FBus_Num"]), int(line["TBus_Num"])
+        if fbus != tbus and fbus in adj and tbus in adj:
+            adj[fbus].add(tbus)
+            adj[tbus].add(fbus)
 
-        # Cross-bus edges
-        for fi in fnodes:
-            for ti in tnodes:
-                if fi == ti:
-                    continue
-                dist = np.sqrt(
-                    (positions[fi, 0] - positions[ti, 0]) ** 2
-                    + (positions[fi, 1] - positions[ti, 1]) ** 2
-                )
-                for s, d in [(fi, ti), (ti, fi)]:
-                    if (s, d) not in edge_set:
-                        edge_set[(s, d)] = (dist, EDGE_TRANSMISSION)
+    print(f"  Simulation graph: {len(adj)} buses, "
+          f"{sum(len(v) for v in adj.values()) // 2} lines")
 
-    # Intra-bus edges (nodes mapped to the same bus)
-    for bus_num, node_list in bus_to_nodes.items():
+    # ── Contract empty buses (single pass is sufficient) ──
+    # Process every bus that has no mapped settlement node.  For each one,
+    # add direct edges between all its neighbours (so paths through it are
+    # preserved), then remove it.  Processing order doesn't matter because
+    # adj is modified in place — a later bus sees the already-updated graph.
+    empty_buses = [b for b in list(adj) if b not in bus_to_nodes]
+    for bus in empty_buses:
+        if bus not in adj:
+            continue   # already removed as a neighbour in an earlier step
+        neighbours = list(adj[bus])
+        for nb in neighbours:
+            adj[nb].discard(bus)
+            adj[nb].update(n for n in neighbours if n != nb)
+        del adj[bus]
+
+    backbone_buses = set(adj)
+    print(f"  Backbone graph:   {len(backbone_buses)} buses, "
+          f"{sum(len(v) for v in adj.values()) // 2} edges "
+          f"(contracted {len(all_bus_nums) - len(backbone_buses)} empty buses)")
+
+    # ── Build edge set for GNN graph ──
+    edge_set = {}
+
+    # Cross-bus edges: nodes whose backbone buses are adjacent
+    for bus, neighbours in adj.items():
+        fnodes = bus_to_nodes.get(bus, [])
+        for nb in neighbours:
+            if nb <= bus:
+                continue   # process each undirected pair once
+            tnodes = bus_to_nodes.get(nb, [])
+            for fi in fnodes:
+                for ti in tnodes:
+                    if fi == ti:
+                        continue
+                    dist = np.sqrt(
+                        (positions[fi, 0] - positions[ti, 0]) ** 2
+                        + (positions[fi, 1] - positions[ti, 1]) ** 2
+                    )
+                    for s, d in [(fi, ti), (ti, fi)]:
+                        if (s, d) not in edge_set:
+                            edge_set[(s, d)] = (dist, EDGE_TRANSMISSION)
+
+    # Intra-bus edges: nodes sharing the same backbone bus
+    for bus, node_list in bus_to_nodes.items():
+        if bus not in backbone_buses:
+            continue
         for i in range(len(node_list)):
             for j in range(i + 1, len(node_list)):
                 ni, nj = node_list[i], node_list[j]
@@ -237,42 +308,8 @@ def build_transmission_graph(node_coords):
                     if (s, d) not in edge_set:
                         edge_set[(s, d)] = (dist, EDGE_TRANSMISSION)
 
-    # ── Fix isolated nodes ──
-    n_transmission = len(edge_set) // 2
-    connected = set()
-    for s, d in edge_set:
-        connected.add(s)
-        connected.add(d)
-    isolated = [i for i in range(num_nodes) if i not in connected]
-
-    node_tree = KDTree(positions)
-    iteration = 0
-    while isolated:
-        iteration += 1
-        new_isolated = []
-        for iso_node in isolated:
-            dists, idxs = node_tree.query(positions[iso_node], k=FALLBACK_K + 1)
-            added = False
-            for k_idx in range(1, FALLBACK_K + 1):
-                neighbor = idxs[k_idx]
-                dist = dists[k_idx]
-                for s, d in [(iso_node, neighbor), (neighbor, iso_node)]:
-                    if (s, d) not in edge_set:
-                        edge_set[(s, d)] = (dist, EDGE_FALLBACK_KNN)
-                connected.add(iso_node)
-                added = True
-            if not added:
-                new_isolated.append(iso_node)
-        isolated = new_isolated
-        if iteration > 20:
-            break
-
-    n_fallback = (len(edge_set) // 2) - n_transmission
-
-    # ── Add virtual super node ──
-    virtual_idx = num_nodes  # index N
-
-    # Use mean position as a sentinel (won't be plotted)
+    # ── Virtual super node ──
+    virtual_idx = num_nodes
     for i in range(num_nodes):
         edge_set[(virtual_idx, i)] = (0.0, EDGE_VIRTUAL)
         edge_set[(i, virtual_idx)] = (0.0, EDGE_VIRTUAL)
@@ -297,12 +334,23 @@ def build_transmission_graph(node_coords):
         np.stack([dist_norm, type_arr], axis=1), dtype=torch.float32,
     )
 
-    print(f"  Transmission edges: {n_transmission}")
-    print(f"  Fallback k-NN edges: {n_fallback}")
     print(f"  Virtual-node edges: {num_nodes} (bidirectional)")
     print(f"  Total edges: {edge_index.shape[1]}")
 
-    return edge_index, edge_attr, node_order, positions, virtual_idx
+    # ── Backbone visualisation data ──
+    bus_latlon = {int(row["Bus_Number"]): (row["lat"], row["lon"])
+                  for _, row in bus_positions.iterrows()}
+    backbone_bus_pos = np.array(
+        [bus_latlon[b] for b in sorted(backbone_buses) if b in bus_latlon]
+    )
+    backbone_edges = [
+        (bus_latlon[a][0], bus_latlon[a][1], bus_latlon[b][0], bus_latlon[b][1])
+        for a, nbs in adj.items() for b in nbs if a < b
+        if a in bus_latlon and b in bus_latlon
+    ]
+
+    return (edge_index, edge_attr, node_order, positions, virtual_idx,
+            backbone_bus_pos, backbone_edges)
 
 
 # ── Feature Engineering ──────────────────────────────────────────
@@ -326,10 +374,41 @@ def prepare_features(df, node_order, virtual_node_idx):
     df_f = df[df["settlement_point"].isin(node_to_idx)].copy()
     df_f["node_idx"] = df_f["settlement_point"].map(node_to_idx)
 
+    # Weather zone one-hot
     for zone in WEATHER_ZONES:
         df_f[f"wz_{zone}"] = (df_f["weather_zone"] == zone).astype(np.float32)
     wz_cols = [f"wz_{z}" for z in WEATHER_ZONES]
 
+    # Technology type one-hot (v4)
+    tech_map = _classify_node_tech(node_order)
+    tech_counts = pd.Series(tech_map).value_counts()
+    print(f"  Node tech: {tech_counts.to_dict()}")
+    for tt in TECH_TYPES:
+        df_f[f"tech_{tt}"] = (
+            df_f["settlement_point"].map(tech_map) == tt
+        ).astype(np.float32)
+    tech_cols = [f"tech_{tt}" for tt in TECH_TYPES]
+
+    # Interaction features: forecast error × technology (v4)
+    df_f["wspd_err_1h_x_wind"] = df_f["wspd_error_1h"] * df_f["tech_wind"]
+    df_f["temp_err_1h_x_solar"] = df_f["temp_error_1h"] * df_f["tech_solar"]
+    interaction_cols = [
+        "wspd_err_1h_x_wind", 
+        "temp_err_1h_x_solar", 
+    ]
+
+    # System-wide hourly aggregates (v5) — same value for all nodes in an
+    # hour, giving the model context about the overall system state.
+    sys_agg = df_f.groupby("hour").agg(
+        sys_mean_temp_err_1h=("temp_error_1h", "mean"),
+        sys_mean_wspd_err_1h=("wspd_error_1h", "mean"),
+        sys_mean_load=("actual_load", "mean"),
+    ).reset_index()
+    df_f = df_f.merge(sys_agg, on="hour", how="left")
+    sys_cols = list(sys_agg.columns.drop("hour"))
+    print(f"  System-wide features: {sys_cols}")
+
+    # Cyclical time features
     df_f["hod_sin"], df_f["hod_cos"] = _encode_cyclical(df_f["hour_of_day"], 24)
     df_f["wday_sin"], df_f["wday_cos"] = _encode_cyclical(df_f["weekday"], 7)
     df_f["mon_sin"], df_f["mon_cos"] = _encode_cyclical(df_f["month"], 12)
@@ -337,7 +416,8 @@ def prepare_features(df, node_order, virtual_node_idx):
         "hod_sin", "hod_cos", "wday_sin", "wday_cos", "mon_sin", "mon_cos",
     ]
 
-    feature_cols = BASE_NUMERIC_COLS + wz_cols + cyclical_cols
+    feature_cols = (BASE_NUMERIC_COLS + wz_cols + tech_cols
+                    + interaction_cols + sys_cols + cyclical_cols)
     num_features = len(feature_cols)
 
     hours = sorted(df_f["hour"].unique())
@@ -357,7 +437,10 @@ def prepare_features(df, node_order, virtual_node_idx):
         # Virtual node: system-wide mean of all valid real-node features
         valid = mask[:num_real]
         if valid.any():
-            X[virtual_node_idx] = np.nanmean(X[:num_real][valid], axis=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                vn_feats = np.nanmean(X[:num_real][valid], axis=0)
+            X[virtual_node_idx] = np.nan_to_num(vn_feats, nan=0.0)
         else:
             X[virtual_node_idx] = 0.0
         # Virtual node never has an LMP target
@@ -382,49 +465,90 @@ def build_pyg_datasets(hours, hour_to_features, edge_index, edge_attr):
     print(f"  Train hours: {len(train_hours)}, Val: {len(val_hours)}, "
           f"Test: {len(test_hours)}")
 
-    train_y_all = np.concatenate([
-        hour_to_features[h][1][hour_to_features[h][2]] for h in train_hours
+    # ── Per-node mean LMP from training data (for target demeaning) ──
+    num_total = hour_to_features[hours[0]][0].shape[0]
+    node_lmp_sum = np.zeros(num_total, dtype=np.float64)
+    node_lmp_cnt = np.zeros(num_total, dtype=np.int64)
+    for h in train_hours:
+        _, y, mask = hour_to_features[h]
+        valid = mask & np.isfinite(y)
+        node_lmp_sum[valid] += y[valid]
+        node_lmp_cnt[valid] += 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        node_lmp_mean = np.where(
+            node_lmp_cnt > 0, node_lmp_sum / node_lmp_cnt, 0.0,
+        ).astype(np.float32)
+    n_real = num_total - 1
+    print(f"  Node LMP mean range: [{node_lmp_mean[:n_real].min():.1f}, "
+          f"{node_lmp_mean[:n_real].max():.1f}] $/MWh")
+
+    # ── Clip bounds on demeaned LMP ──
+    train_y_demeaned = np.concatenate([
+        (hour_to_features[h][1] - node_lmp_mean)[hour_to_features[h][2]]
+        for h in train_hours
     ])
-    train_y_finite = train_y_all[np.isfinite(train_y_all)]
+    train_y_finite = train_y_demeaned[np.isfinite(train_y_demeaned)]
     lmp_lo = np.percentile(train_y_finite, LMP_CLIP_LO)
     lmp_hi = np.percentile(train_y_finite, LMP_CLIP_HI)
-    print(f"  LMP clipping: [{lmp_lo:.1f}, {lmp_hi:.1f}] $/MWh")
+    print(f"  Demeaned LMP clipping: [{lmp_lo:.1f}, {lmp_hi:.1f}] $/MWh")
 
+    # ── Feature scaler (fit on training X) ──
     train_X_all = np.vstack([hour_to_features[h][0] for h in train_hours])
     scaler = StandardScaler()
     scaler.fit(np.nan_to_num(train_X_all, nan=0.0))
+
+    node_lmp_mean_t = torch.tensor(node_lmp_mean)
 
     def hours_to_data(hour_list):
         out = []
         for h in hour_list:
             X, y, mask = hour_to_features[h]
             X_s = scaler.transform(np.nan_to_num(X, nan=0.0)).astype(np.float32)
-            y_c = np.clip(y, lmp_lo, lmp_hi)
+            y_dm = np.clip(y - node_lmp_mean, lmp_lo, lmp_hi)
             out.append(Data(
-                x=torch.tensor(X_s), y=torch.tensor(y_c),
+                x=torch.tensor(X_s), y=torch.tensor(y_dm),
                 edge_index=edge_index, edge_attr=edge_attr,
                 mask=torch.tensor(mask),
+                node_lmp_mean=node_lmp_mean_t,
             ))
         return out
 
     return (
         hours_to_data(train_hours), hours_to_data(val_hours),
         hours_to_data(test_hours), scaler, lmp_lo, lmp_hi,
+        node_lmp_mean,
     )
 
 
 # ── Model ────────────────────────────────────────────────────────
 
 class ERCOTGraphNet(nn.Module):
-    """Residual GAT with edge features for node-level LMP prediction.
+    """2-layer residual GAT with learnable node embeddings.
+
+    v5 additions:
+      - Learnable node embeddings (nn.Parameter): each node (including the
+        virtual super node) gets a trainable vector that captures its unique
+        identity — congestion patterns, local generation mix, typical price
+        regime, etc.  Concatenated with input features before the input
+        projection, so the GAT layers see both time-varying features and
+        static node identity.  Dropout is applied to embeddings during
+        training to prevent memorisation of node-specific biases.
+      - System-wide hourly features are now part of the input feature vector.
 
     edge_dim=2: [normalised geographic distance, edge-type indicator]
     """
 
-    def __init__(self, in_channels, hidden=HIDDEN_DIM, heads=N_HEADS,
-                 dropout=DROPOUT, mlp_hidden=MLP_HIDDEN, edge_dim=2):
+    def __init__(self, in_channels, num_nodes, embed_dim=NODE_EMBED_DIM,
+                 hidden=HIDDEN_DIM, heads=N_HEADS, dropout=DROPOUT,
+                 mlp_hidden=MLP_HIDDEN, edge_dim=2):
         super().__init__()
-        self.input_proj = nn.Linear(in_channels, hidden)
+        # Learnable per-node embedding (includes virtual node)
+        self.node_embed = nn.Parameter(
+            torch.randn(num_nodes, embed_dim) * 0.02
+        )
+        self.embed_drop = nn.Dropout(dropout)
+        self.input_proj = nn.Linear(in_channels + embed_dim, hidden)
 
         self.gat1 = GATConv(hidden, hidden, heads=heads, dropout=dropout,
                             concat=True, edge_dim=edge_dim)
@@ -432,13 +556,8 @@ class ERCOTGraphNet(nn.Module):
         self.proj1 = nn.Linear(hidden * heads, hidden)
 
         self.gat2 = GATConv(hidden, hidden, heads=heads, dropout=dropout,
-                            concat=True, edge_dim=edge_dim)
-        self.bn2 = nn.BatchNorm1d(hidden * heads)
-        self.proj2 = nn.Linear(hidden * heads, hidden)
-
-        self.gat3 = GATConv(hidden, hidden, heads=heads, dropout=dropout,
                             concat=False, edge_dim=edge_dim)
-        self.bn3 = nn.BatchNorm1d(hidden)
+        self.bn2 = nn.BatchNorm1d(hidden)
 
         self.mlp = nn.Sequential(
             nn.Linear(hidden, mlp_hidden),
@@ -450,11 +569,17 @@ class ERCOTGraphNet(nn.Module):
             nn.Linear(mlp_hidden // 2, 1),
         )
         self.dropout = dropout
-        self._attn_weights = [None, None, None]
+        self._attn_weights = [None, None]
 
     def forward(self, data, return_attention=False):
         x, edge_index = data.x, data.edge_index
         edge_attr = data.edge_attr if hasattr(data, "edge_attr") else None
+
+        # Concatenate learnable node embeddings with input features
+        n = self.node_embed.shape[0]
+        B = x.shape[0] // n
+        embeds = self.embed_drop(self.node_embed.repeat(B, 1))
+        x = torch.cat([x, embeds], dim=1)
 
         x = F.elu(self.input_proj(x))
         residual = x
@@ -472,15 +597,6 @@ class ERCOTGraphNet(nn.Module):
                             return_attention_weights=True)
         self._attn_weights[1] = a2
         out = self.bn2(out)
-        out = F.elu(self.proj2(out))
-        out = F.dropout(out, p=self.dropout, training=self.training)
-        x = out + residual
-        residual = x
-
-        out, a3 = self.gat3(x, edge_index, edge_attr=edge_attr,
-                            return_attention_weights=True)
-        self._attn_weights[2] = a3
-        out = self.bn3(out)
         out = F.elu(out)
         out = F.dropout(out, p=self.dropout, training=self.training)
         x = out + residual
@@ -494,8 +610,9 @@ def train_model(model, train_loader, val_loader):
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=MAX_EPOCHS, eta_min=1e-6,
+    # v4: ReduceLROnPlateau with warmup — more adaptive than cosine
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6,
     )
     huber = nn.SmoothL1Loss(beta=5.0)
 
@@ -505,6 +622,12 @@ def train_model(model, train_loader, val_loader):
     history = {"train_mae": [], "val_mae": []}
 
     for epoch in range(MAX_EPOCHS):
+        # Warmup: linearly ramp LR for first few epochs
+        if epoch < WARMUP_EPOCHS:
+            warmup_lr = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
         model.train()
         mae_sum, count = 0.0, 0
         for batch in train_loader:
@@ -522,7 +645,6 @@ def train_model(model, train_loader, val_loader):
             with torch.no_grad():
                 mae_sum += F.l1_loss(pm, ym, reduction="sum").item()
                 count += mask.sum().item()
-        scheduler.step()
 
         model.eval()
         v_sum, v_cnt = 0.0, 0
@@ -539,6 +661,10 @@ def train_model(model, train_loader, val_loader):
         history["train_mae"].append(t_mae)
         history["val_mae"].append(v_mae)
 
+        # Step scheduler after warmup
+        if epoch >= WARMUP_EPOCHS:
+            scheduler.step(v_mae)
+
         improved = v_mae < best_val_mae
         if improved:
             best_val_mae = v_mae
@@ -549,7 +675,7 @@ def train_model(model, train_loader, val_loader):
             patience_counter += 1
 
         if epoch % 10 == 0 or improved:
-            lr = scheduler.get_last_lr()[0]
+            lr = optimizer.param_groups[0]["lr"]
             print(f"  Epoch {epoch:3d}: train={t_mae:.2f}  val={v_mae:.2f}"
                   f"  lr={lr:.2e}{'  *' if improved else ''}")
 
@@ -566,7 +692,11 @@ def train_model(model, train_loader, val_loader):
 # ── Evaluation ───────────────────────────────────────────────────
 
 def evaluate_model(model, test_loader, node_order):
-    """Metrics for real nodes only (virtual node excluded by mask)."""
+    """Metrics for real nodes only (virtual node excluded by mask).
+
+    v4: un-demeans predictions and targets to report metrics in original
+    $/MWh scale.
+    """
     model.eval()
     predictions = []
     n = len(node_order)
@@ -575,9 +705,13 @@ def evaluate_model(model, test_loader, node_order):
     with torch.no_grad():
         for batch in test_loader:
             batch = batch.to(DEVICE)
-            pred = model(batch).cpu().numpy()
-            y = batch.y.cpu().numpy()
+            pred_dm = model(batch).cpu().numpy()
+            y_dm = batch.y.cpu().numpy()
             mask = batch.mask.cpu().numpy()
+            nm = batch.node_lmp_mean.cpu().numpy()
+            # Un-demean to original scale
+            pred = pred_dm + nm
+            y = y_dm + nm
             predictions.append((pred, y, mask))
             for i in range(n):
                 if mask[i]:
@@ -703,23 +837,80 @@ def _draw_texas(ax, proj):
 
 
 def plot_graph_topology(edge_index, edge_attr, positions, node_order,
-                        virtual_idx, save_path):
+                        virtual_idx, save_path,
+                        backbone_bus_pos=None, backbone_edges=None):
     """Draw the transmission-guided graph on a Texas map.
 
-    Colors: orange = transmission, green = fallback k-NN.  Virtual-node
-    edges are omitted (they connect to every node).
+    Layer order (back → front):
+      1. Light gray  — full simulation lines + buses (all shapefiles)
+      2. Steel blue  — backbone buses and edges after empty-bus contraction
+      3. Orange      — GNN graph edges (settlement nodes connected via backbone)
+      4. Red dots    — settlement-point nodes
+    Virtual-node edges are omitted.
     """
     proj = ccrs.PlateCarree()
     fig, ax = plt.subplots(figsize=(14, 11), subplot_kw={"projection": proj})
     _draw_texas(ax, proj)
 
+    # ── Simulation buses and lines (background layer) ──
+    sim_lines = gpd.read_file(LINE_SHP)
+    sim_buses = gpd.read_file(BUS_SHP)
+
+    # Reproject to WGS84 using the .prj sidecar so PlateCarree renders correctly
+    if sim_lines.crs is not None:
+        sim_lines = sim_lines.to_crs(epsg=4326)
+
+    sim_line_handle = None
+    for geom in sim_lines.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        parts = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
+        for part in parts:
+            lons, lats = part.xy
+            h, = ax.plot(
+                list(lons), list(lats),
+                color="#666666", linewidth=1.0, alpha=0.6,
+                transform=proj, zorder=2,
+            )
+            if sim_line_handle is None:
+                sim_line_handle = h
+
+    # Buses use the explicit lat/lon attribute columns (always WGS84 degrees)
+    bus_lats = pd.to_numeric(sim_buses["Bus_latitu"], errors="coerce").values
+    bus_lons = pd.to_numeric(sim_buses["Bus_longit"], errors="coerce").values
+    valid = np.isfinite(bus_lats) & np.isfinite(bus_lons)
+    sim_bus_scatter = ax.scatter(
+        bus_lons[valid], bus_lats[valid],
+        c="#333333", s=30, marker="D", edgecolors="none",
+        alpha=0.9, transform=proj, zorder=3,
+    )
+
+    # ── Backbone buses and edges (mid layer) ──
+    bb_line_handle = None
+    bb_bus_scatter = None
+    if backbone_edges is not None:
+        for lat1, lon1, lat2, lon2 in backbone_edges:
+            h, = ax.plot(
+                [lon1, lon2], [lat1, lat2],
+                color="steelblue", linewidth=1.4, alpha=0.75,
+                transform=proj, zorder=4,
+            )
+            if bb_line_handle is None:
+                bb_line_handle = h
+    if backbone_bus_pos is not None and len(backbone_bus_pos):
+        bb_bus_scatter = ax.scatter(
+            backbone_bus_pos[:, 1], backbone_bus_pos[:, 0],
+            c="steelblue", s=50, marker="D", edgecolors="white",
+            linewidths=0.5, alpha=1.0, transform=proj, zorder=5,
+        )
+
+    # ── Graph edges (foreground layer) ──
     src = edge_index[0].numpy()
     dst = edge_index[1].numpy()
     etypes = edge_attr[:, 1].numpy()
 
-    color_map = {EDGE_TRANSMISSION: "#e67e22", EDGE_FALLBACK_KNN: "#27ae60"}
-    label_map = {EDGE_TRANSMISSION: "Transmission line",
-                 EDGE_FALLBACK_KNN: "Fallback k-NN"}
+    color_map = {EDGE_TRANSMISSION: "#e67e22"}
+    label_map = {EDGE_TRANSMISSION: "Graph edge (transmission)"}
     drawn = set()
     handles = {}
 
@@ -740,27 +931,46 @@ def plot_graph_topology(edge_index, edge_attr, positions, node_order,
         line, = ax.plot(
             [positions[s, 1], positions[d, 1]],
             [positions[s, 0], positions[d, 0]],
-            color=c, linewidth=lw, alpha=0.5, transform=proj, zorder=3,
+            color=c, linewidth=lw, alpha=0.5, transform=proj, zorder=6,
         )
         if et not in handles:
             handles[et] = line
 
-    ax.scatter(
+    node_scatter = ax.scatter(
         positions[:, 1], positions[:, 0],
         c="red", s=18, edgecolors="k", linewidths=0.3,
-        alpha=0.8, transform=proj, zorder=5,
+        alpha=0.8, transform=proj, zorder=7,
     )
 
-    legend_handles = [handles[k] for k in sorted(handles)]
-    legend_labels = [label_map[k] for k in sorted(handles)]
+    # ── Legend ──
+    legend_handles = []
+    legend_labels = []
+    if sim_line_handle is not None:
+        legend_handles.append(sim_line_handle)
+        legend_labels.append("Simulation line (345 kV)")
+    legend_handles.append(sim_bus_scatter)
+    legend_labels.append("Simulation bus")
+    if bb_line_handle is not None:
+        legend_handles.append(bb_line_handle)
+        legend_labels.append("Backbone edge (after contraction)")
+    if bb_bus_scatter is not None:
+        legend_handles.append(bb_bus_scatter)
+        legend_labels.append("Backbone bus (has ≥1 node)")
+    for k in sorted(handles):
+        legend_handles.append(handles[k])
+        legend_labels.append(label_map[k])
+    legend_handles.append(node_scatter)
+    legend_labels.append("Settlement-point node")
     ax.legend(legend_handles, legend_labels, loc="lower left", fontsize=9)
 
     n_tx = sum(1 for e in etypes if e == EDGE_TRANSMISSION) // 2
-    n_fb = sum(1 for e in etypes if e == EDGE_FALLBACK_KNN) // 2
+    n_bb_buses = len(backbone_bus_pos) if backbone_bus_pos is not None else "?"
+    n_bb_edges = len(backbone_edges) if backbone_edges is not None else "?"
     ax.set_title(
-        f"Transmission-Guided Graph — {len(node_order)} nodes, "
-        f"{n_tx} transmission + {n_fb} fallback edges + virtual super node",
-        fontsize=12,
+        f"Transmission-Guided Graph — {len(node_order)} nodes, {n_tx} graph edges\n"
+        f"Sim: {len(sim_buses)} buses, {len(sim_lines)} lines  |  "
+        f"Backbone: {n_bb_buses} buses, {n_bb_edges} edges",
+        fontsize=11,
     )
     ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
     plt.tight_layout()
@@ -775,7 +985,7 @@ def plot_training_curves(history, save_path):
     ax.plot(history["val_mae"], label="Val MAE", color="darkorange")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MAE ($/MWh)")
-    ax.set_title("Training Curves — Transmission GAT (v3)")
+    ax.set_title("Training Curves — Transmission GAT")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -875,12 +1085,14 @@ def main():
         node_coords["settlement_point"].isin(nodes_with_data)
     ].reset_index(drop=True)
 
-    edge_index, edge_attr, node_order, positions, virtual_idx = \
-        build_transmission_graph(coords_with_data)
+    (edge_index, edge_attr, node_order, positions, virtual_idx,
+     backbone_bus_pos, backbone_edges) = build_transmission_graph(coords_with_data)
 
     plot_graph_topology(
         edge_index, edge_attr, positions, node_order, virtual_idx,
         os.path.join(out_dir, "graph_topology.png"),
+        backbone_bus_pos=backbone_bus_pos,
+        backbone_edges=backbone_edges,
     )
 
     # ── Prepare features ──
@@ -892,8 +1104,9 @@ def main():
     print(f"  Real nodes: {len(node_order)}, Virtual node idx: {virtual_idx}")
 
     # ── Build PyG datasets ──
-    print("\nBuilding PyG datasets (intra-month split)...")
-    train_data, val_data, test_data, scaler, lmp_lo, lmp_hi = \
+    print("\nBuilding PyG datasets (intra-month split, demeaned targets)...")
+    (train_data, val_data, test_data, scaler, lmp_lo, lmp_hi,
+     node_lmp_mean) = \
         build_pyg_datasets(hours, hour_to_features, edge_index, edge_attr)
 
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
@@ -904,11 +1117,15 @@ def main():
     print(f"\nDevice: {DEVICE}")
     if DEVICE.type == "mps":
         print("  Apple Silicon GPU (MPS) — sparse ops fall back to CPU")
-    model = ERCOTGraphNet(in_channels=num_features).to(DEVICE)
+    num_nodes = virtual_idx + 1  # includes virtual super node
+    model = ERCOTGraphNet(
+        in_channels=num_features, num_nodes=num_nodes,
+    ).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params:,} parameters")
     print(f"  {N_GAT_LAYERS}-layer residual GAT ({N_HEADS} heads, "
-          f"hidden={HIDDEN_DIM}), edge_dim=2")
+          f"hidden={HIDDEN_DIM}), edge_dim=2, "
+          f"node_embed={NODE_EMBED_DIM}")
 
     # ── Train ──
     print("\nTraining...")
@@ -969,12 +1186,14 @@ def main():
         "scaler_mean": scaler.mean_,
         "scaler_scale": scaler.scale_,
         "node_order": node_order,
+        "node_lmp_mean": node_lmp_mean,
         "metrics": metrics,
         "lmp_clip": (lmp_lo, lmp_hi),
         "virtual_node_idx": virtual_idx,
         "config": {
             "HIDDEN_DIM": HIDDEN_DIM, "N_HEADS": N_HEADS,
             "N_GAT_LAYERS": N_GAT_LAYERS, "DROPOUT": DROPOUT,
+            "NODE_EMBED_DIM": NODE_EMBED_DIM,
         },
     }, os.path.join(results_dir, "model_checkpoint.pt"))
 

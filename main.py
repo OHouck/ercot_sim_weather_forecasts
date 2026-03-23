@@ -44,6 +44,14 @@ dirs = setup_directories()
 #     download_hrrr_month(year, month, hrrr_base)
 
 # =============================================================================
+# STEP 1b: Download GFS weather forecasts from NOAA S3
+# =============================================================================
+# from download_data.pull_gfs import download_gfs_month
+# gfs_base = os.path.join(dirs['raw'], 'gfs_data')
+# for year, month in MONTHS:
+#     download_gfs_month(year, month, gfs_base)
+
+# =============================================================================
 # STEP 1c: Download ERA5-Land hourly reanalysis for Texas
 # Downloads 2m_temperature and 10m_u/v_wind from the Copernicus CDS API.
 # Derives wind speed and direction and saves as compressed NetCDF.
@@ -108,13 +116,14 @@ dirs = setup_directories()
 # compares to ISD hourly observations, and saves per-station error CSVs.
 # Requires Steps 1 and 2. ~2 min per month per model.
 # =============================================================================
-from process_data.calculate_forecast_errors import (
-    calculate_ndfd_errors_for_month,
-    calculate_hrrr_errors_for_month,
-)
-for year, month in MONTHS:
-    # calculate_ndfd_errors_for_month(year, month) # not using atm
-    calculate_hrrr_errors_for_month(year, month)
+# from process_data.calculate_forecast_errors import calculate_station_errors_for_month
+
+# for year, month in MONTHS:
+#     if month >= 9 and year == 2025:
+#         print(f"\n=== Skipping station data for {year}-{month:02d} (not available yet) ===")
+#         continue
+#     # calculate_station_errors_for_month(year, month, model='hrrr')
+#     calculate_station_errors_for_month(year, month, model='gfs')
 
 # =============================================================================
 # STEP 5b: Calculate ERA5-based gridded forecast errors
@@ -124,13 +133,13 @@ for year, month in MONTHS:
 #   {processed}/forecast_errors_era5/{model}/{year}/{month:02d}/era5_errors_{YYYYMM}.nc
 #   plus a human-readable error_summary.csv per month.
 # All valid_time values are US/Central (tz-naive).
-# Requires Step 1 (HRRR or NDFD data) AND Step 1c (ERA5-Land data).
+# Requires Step 1 (HRRR or GFS data) AND Step 1c (ERA5-Land data).
 # ~10-20 min per month per model.
 # =============================================================================
 # from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
 # for year, month in MONTHS:
-#     calculate_era5_errors_for_month(year, month, model='hrrr')
-#     # calculate_era5_errors_for_month(year, month, model='ndfd')
+#     # calculate_era5_errors_for_month(year, month, model='hrrr')
+#     calculate_era5_errors_for_month(year, month, model='gfs')
 
 # =============================================================================
 # Map generation data to a grid and save as NetCDF
@@ -143,11 +152,11 @@ for year, month in MONTHS:
 # =============================================================================
 # Combine gridded generation data with forecast errrors and lmp data into single
 # montly parquet files
-# Output: pixel_hourly_{model}_{YYYYMM}.parquet
+# Output: pixel_hourly_{models_key}_{YYYYMM}.parquet
 # =============================================================================
-# from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset 
-# for year, month in MONTHS:
-#     build_pixel_hourly_dataset(
-#         year, month, model='hrrr', force_rebuild=False
-#     )
+from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+for year, month in MONTHS:
+    build_pixel_hourly_dataset(
+        year, month, force_rebuild=False  # defaults to HRRR 1h + GFS day-ahead
+    )
 

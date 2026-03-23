@@ -1,22 +1,40 @@
 """calculate_forecast_errors.py — Compute forecast errors at weather station locations
 or against ERA5-Land gridded reanalysis.
 
-Merges gridded weather forecasts (NDFD or HRRR) with either ISD weather station
+Merges gridded weather forecasts (HRRR or GFS) with either ISD weather station
 observations or ERA5-Land reanalysis. For each forecast file, loads the gridded
 xarray dataset and uses a spatial join to extract forecast values at observation
 coordinates. Computes forecast error = forecast - observed.
 
 Supports two forecast models:
-  - NDFD (2.5km): calculate_ndfd_errors_for_month()
-  - HRRR (3km):   calculate_hrrr_errors_for_month()
+  - HRRR (3km):   calculate_station_errors_for_month(model='hrrr')
+                   Default: 1h lead only. Override with lead_hours=[1, 18].
+  - GFS  (0.25°): calculate_station_errors_for_month(model='gfs')
+                   Day-ahead: all GFS leads (f018-f041 from 12z cycle) are
+                   collapsed to lead_hours=0. Each file predicts a unique hour
+                   of the following day; "day-ahead" is the conceptual label.
 
 And two ground-truth sources:
-  - ISD weather stations: calculate_ndfd_errors_for_month() / calculate_hrrr_errors_for_month()
-  - ERA5-Land reanalysis: calculate_era5_errors_for_month(model='hrrr' or 'ndfd')
+  - ISD weather stations: calculate_station_errors_for_month()
+  - ERA5-Land reanalysis: calculate_era5_errors_for_month()
+
+Lead time convention:
+  - lead_hours=0 means "day-ahead" — forecast issued at 12z the previous day.
+    The actual model lead varies (18–41h depending on hour-of-day) but is
+    collapsed to a single pseudo-lead for clean, dense output.
+  - lead_hours=1 means HRRR 1-hour-ahead (short-range forecast).
+
+Regridding methods for the ERA5 path:
+  - Bin-center averaging (HRRR): forecast resolution is finer than ERA5
+    (~3 km vs ~11 km), so ~12 forecast cell centers fall within each ERA5 bin
+    and are averaged.
+  - Bilinear interpolation (GFS): forecast resolution is coarser than ERA5
+    (~28 km vs ~11 km), so bin-averaging would leave ~60 % of ERA5 cells empty.
+    xarray .interp(method='linear') smoothly fills the finer grid instead.
 
 Timezone convention:
   All output valid_time columns are stored in **US/Central (tz-naive)**.
-  Raw NetCDF files (NDFD, HRRR, ERA5) remain in UTC; conversion happens at load
+  Raw NetCDF files (HRRR, GFS, ERA5) remain in UTC; conversion happens at load
   time in load_forecasts() and load_all_observations(). July 2025 CDT = UTC-5,
   so 2025-07-01 12:00 UTC → 2025-07-01 07:00 (stored without tz suffix).
   ⚠ Existing CSVs written before this change stored UTC times and are stale;
@@ -50,6 +68,26 @@ from helper_funcs import setup_directories
 from analysis.create_plots import parse_tmp, parse_wnd_speed
 
 
+# ── Model configuration ──────────────────────────────────────────────────────
+
+_MODEL_CONFIG = {
+    'hrrr': {
+        'data_dir': 'hrrr_data',
+        'display_name': 'HRRR',
+        'regrid_method': 'bin',
+        'default_lead_hours': [1],    # only 1h lead by default
+        'collapse_leads': False,
+    },
+    'gfs': {
+        'data_dir': 'gfs_data',
+        'display_name': 'GFS',
+        'regrid_method': 'interp',
+        'default_lead_hours': None,   # keep all available leads
+        'collapse_leads': True,       # remap all lead_hours → 0 ("day-ahead")
+    },
+}
+
+
 # ── Timezone utilities ────────────────────────────────────────────────────────
 
 _CENTRAL = 'US/Central'
@@ -73,6 +111,26 @@ def _to_central(timestamps):
         s = s.dt.tz_localize('UTC')
     result = s.dt.tz_convert(_CENTRAL).dt.tz_localize(None)
     return result.iloc[0] if scalar else result.reset_index(drop=True)
+
+
+# ── Forecast lead-time filtering ──────────────────────────────────────────────
+
+def _filter_forecasts(forecasts, lead_hours=None, collapse_leads=False):
+    """Filter forecast records by lead time and optionally collapse to day-ahead.
+
+    Args:
+        forecasts: List of forecast dicts from load_forecasts().
+        lead_hours: If not None, keep only records with lead_hours in this list.
+        collapse_leads: If True, remap all lead_hours to 0 (day-ahead labeling).
+    Returns:
+        Filtered (and possibly remapped) list of forecast dicts.
+    """
+    if lead_hours is not None:
+        forecasts = [r for r in forecasts if r['lead_hours'] in lead_hours]
+    if collapse_leads:
+        for r in forecasts:
+            r['lead_hours'] = 0
+    return forecasts
 
 
 # ── Field parsers ─────────────────────────────────────────────────────────────
@@ -162,9 +220,9 @@ def load_all_observations(stations_gdf, year, month, raw_dir):
 def build_forecast_grid_gdf(sample_nc_path):
     """Build a GeoDataFrame of forecast grid points from a sample NetCDF file.
 
-    Works for any 2D lat/lon grid (NDFD, HRRR, etc.).
-    Each row is one grid cell with its (y, x) index and lat/lon as a Point geometry.
-    Used for spatial join against station points.
+    Works for any forecast grid: 1D regular lat/lon (GFS) or 2D projected
+    lat/lon (HRRR). Each row is one grid cell with its (y, x) index
+    and lat/lon as a Point geometry. Used for spatial join against station points.
 
     Returns GeoDataFrame with columns: y_idx, x_idx, grid_lat, grid_lon, geometry
     """
@@ -172,6 +230,10 @@ def build_forecast_grid_gdf(sample_nc_path):
     lat = ds.latitude.values
     lon = ds.longitude.values
     ds.close()
+
+    # Handle both 1D regular grids (GFS) and 2D projected grids (HRRR)
+    if lat.ndim == 1:
+        lon, lat = np.meshgrid(lon, lat)  # (n_lat, n_lon)
 
     ny, nx = lat.shape
     y_indices, x_indices = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
@@ -190,7 +252,7 @@ def build_forecast_grid_gdf(sample_nc_path):
 def spatial_join_stations_to_grid(stations_gdf, grid_gdf):
     """Spatially join each station to its nearest forecast grid point.
 
-    Works for any forecast grid (NDFD, HRRR, ERA5, etc.).
+    Works for any forecast grid (HRRR, GFS, ERA5, etc.).
     Projects to EPSG:3857 (meters) for accurate nearest-neighbor distance,
     then returns results in the original CRS.
 
@@ -385,12 +447,86 @@ def _regrid_wind_to_era5(wspd_2d, wdir_2d, bin_lat_idx, bin_lon_idx,
     return regridded_wspd, regridded_wdir
 
 
+# ── Bilinear interpolation regridding (GFS regular grid → ERA5) ──────────────
+
+def _regrid_regular_field_to_era5(field_2d, fc_lats_1d, fc_lons_1d,
+                                   era5_lats, era5_lons):
+    """Bilinear interpolation from a regular forecast grid to the ERA5 grid.
+
+    Appropriate when the forecast grid is coarser than ERA5 (e.g. GFS 0.25°
+    → ERA5 0.1°). Bin-center averaging would leave most ERA5 cells empty in
+    this regime; bilinear interpolation smoothly fills the finer target grid.
+
+    Uses xarray's built-in .interp() which delegates to scipy's
+    RegularGridInterpolator.
+
+    Args:
+        field_2d: 2D numpy array, shape (n_fc_lat, n_fc_lon).
+        fc_lats_1d: 1D array of forecast latitudes (may be ascending or descending).
+        fc_lons_1d: 1D array of forecast longitudes (ascending).
+        era5_lats: 1D array of ERA5 latitude centers.
+        era5_lons: 1D array of ERA5 longitude centers.
+
+    Returns:
+        2D numpy float32 array, shape (n_era5_lat, n_era5_lon).
+        Cells outside the forecast domain are NaN.
+    """
+    da = xr.DataArray(
+        field_2d,
+        dims=['latitude', 'longitude'],
+        coords={'latitude': fc_lats_1d, 'longitude': fc_lons_1d},
+    )
+    interpolated = da.interp(
+        latitude=era5_lats,
+        longitude=era5_lons,
+        method='linear',
+    )
+    return interpolated.values.astype(np.float32)
+
+
+def _regrid_regular_wind_to_era5(wspd_2d, wdir_2d, fc_lats_1d, fc_lons_1d,
+                                  era5_lats, era5_lons):
+    """Bilinear interpolation for wind from a regular forecast grid to ERA5.
+
+    Wind direction is circular and cannot be interpolated directly. Decomposes
+    to u/v components, interpolates each independently, then recomputes speed
+    and direction. Uses the same meteorological convention as the bin-averaging
+    counterpart (_regrid_wind_to_era5).
+
+    Args:
+        wspd_2d: 2D forecast wind speed array (m/s), shape (n_fc_lat, n_fc_lon).
+        wdir_2d: 2D forecast wind direction array (degrees, 0-360), same shape.
+        fc_lats_1d: 1D array of forecast latitudes.
+        fc_lons_1d: 1D array of forecast longitudes.
+        era5_lats: 1D array of ERA5 latitude centers.
+        era5_lons: 1D array of ERA5 longitude centers.
+
+    Returns:
+        Tuple (regridded_wspd, regridded_wdir), both shape (n_era5_lat, n_era5_lon).
+    """
+    wdir_rad = np.radians(wdir_2d)
+    u_wind = -wspd_2d * np.sin(wdir_rad)
+    v_wind = -wspd_2d * np.cos(wdir_rad)
+
+    u_regridded = _regrid_regular_field_to_era5(
+        u_wind, fc_lats_1d, fc_lons_1d, era5_lats, era5_lons
+    )
+    v_regridded = _regrid_regular_field_to_era5(
+        v_wind, fc_lats_1d, fc_lons_1d, era5_lats, era5_lons
+    )
+
+    regridded_wspd = np.sqrt(u_regridded**2 + v_regridded**2).astype(np.float32)
+    regridded_wdir = (np.degrees(np.arctan2(-u_regridded, -v_regridded)) % 360).astype(np.float32)
+
+    return regridded_wspd, regridded_wdir
+
+
 # ── Forecast data loading ─────────────────────────────────────────────────────
 
 def load_forecasts(element_dir, variable_name, year, month):
     """Load all forecast NetCDF files for one element and extract metadata.
 
-    Works for both NDFD (multiple steps per file) and HRRR (single step per file).
+    Works for both multi-step files (HRRR) and single-step files (GFS).
     Handles step as either a dimension or a scalar coordinate.
 
     valid_time values are converted to US/Central (tz-naive) so they align with
@@ -455,8 +591,8 @@ def _compute_and_save_errors(
 ):
     """Compute forecast errors at station locations and save CSVs.
 
-    This is the shared core logic used by both calculate_ndfd_errors_for_month()
-    and calculate_hrrr_errors_for_month(). It receives already-loaded forecast
+    This is the shared core logic used by calculate_station_errors_for_month().
+    It receives already-loaded forecast
     records and the station-to-grid mapping, then:
       1. Indexes forecasts by (valid_time [Central], lead_hours)
       2. For each station, matches forecast grid values to observations
@@ -473,7 +609,7 @@ def _compute_and_save_errors(
         obs_dict: Dict mapping station_id -> observation DataFrame (Central times).
         stations_gdf: GeoDataFrame of station metadata.
         out_dir: Output directory for CSV files.
-        model_name: String label for log messages (e.g. 'NDFD', 'HRRR').
+        model_name: String label for log messages (e.g. 'HRRR', 'GFS').
 
     Returns:
         Summary DataFrame with per-station, per-lead-time error statistics.
@@ -591,37 +727,59 @@ def _compute_and_save_errors(
 
 # ── Station-level entry points ─────────────────────────────────────────────────
 
-def calculate_ndfd_errors_for_month(year, month):
-    """Calculate NDFD forecast errors at all weather stations for a given month.
+def calculate_station_errors_for_month(year, month, model='hrrr', lead_hours=None):
+    """Calculate forecast errors at all weather stations for a given month.
+
+    Unified station-level error function for all forecast models (HRRR, GFS).
 
     1. Load station locations as a GeoDataFrame
-    2. Build a GeoDataFrame of the NDFD grid and spatially join stations to
-       their nearest grid cell
-    3. Load all NDFD forecasts and ISD observations
-    4. Compute errors and save per-station CSVs and summary
+    2. Build a GeoDataFrame of the forecast grid and spatially join stations
+       to their nearest grid cell
+    3. Load all forecasts and ISD observations
+    4. Filter by lead time (and optionally collapse leads for day-ahead models)
+    5. Compute errors and save per-station CSVs and summary
 
     All valid_time values in output are US/Central (tz-naive).
-    Output: {processed}/forecast_errors/ndfd/{year}/{month:02d}/
+    Output: {processed}/forecast_errors/{model}/{year}/{month:02d}/
 
-    Returns summary DataFrame with per-station error statistics.
+    Args:
+        year: Four-digit year.
+        month: Month 1–12.
+        model: 'hrrr' or 'gfs'.
+        lead_hours: List of lead hours to keep. None uses the model's
+                    default_lead_hours from _MODEL_CONFIG. Pass an explicit
+                    list to override (e.g. [1, 18] to get both HRRR leads).
+
+    Returns:
+        Summary DataFrame with per-station error statistics.
     """
+    model_lower = model.lower()
+    if model_lower not in _MODEL_CONFIG:
+        raise ValueError(
+            f"model must be one of {list(_MODEL_CONFIG)}, got '{model}'"
+        )
+    cfg = _MODEL_CONFIG[model_lower]
+
     dirs = setup_directories()
     raw_dir = dirs['raw']
     processed_dir = dirs['processed']
-    ndfd_base = os.path.join(raw_dir, 'ndfd_data')
+    fc_base = os.path.join(raw_dir, cfg['data_dir'])
 
     # Output directory
-    out_dir = os.path.join(processed_dir, 'forecast_errors', 'ndfd', str(year), f"{month:02d}")
+    out_dir = os.path.join(
+        processed_dir, 'forecast_errors', model_lower,
+        str(year), f"{month:02d}"
+    )
     os.makedirs(out_dir, exist_ok=True)
 
     # Load station metadata as GeoDataFrame
     stations_gdf = load_stations_gdf(raw_dir)
     print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
 
-    # Build NDFD grid GeoDataFrame and spatially join stations to nearest grid cell
-    temp_dir = os.path.join(ndfd_base, 'temp', str(year), f"{month:02d}")
+    # Build forecast grid GeoDataFrame and spatially join stations
+    temp_dir = os.path.join(fc_base, 'temp', str(year), f"{month:02d}")
     sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
-    print("Building NDFD grid GeoDataFrame and joining stations...")
+    print(f"Building {cfg['display_name']} grid GeoDataFrame and joining stations...")
     grid_gdf = build_forecast_grid_gdf(str(sample_nc))
     station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
     print(f"  Joined {len(station_grid_map)} stations to grid (mean dist: "
@@ -632,97 +790,60 @@ def calculate_ndfd_errors_for_month(year, month):
     obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
     print(f"  Loaded observations for {len(obs_dict)} stations")
 
-    # Load NDFD forecasts (valid_time converted to Central inside load_forecasts)
-    print(f"Loading NDFD forecasts for {year}-{month:02d}...")
+    # Load forecasts (valid_time converted to Central inside load_forecasts)
+    print(f"Loading {cfg['display_name']} forecasts for {year}-{month:02d}...")
     temp_forecasts = load_forecasts(
-        os.path.join(ndfd_base, 'temp'), 't2m', year, month)
+        os.path.join(fc_base, 'temp'), 't2m', year, month)
     wspd_forecasts = load_forecasts(
-        os.path.join(ndfd_base, 'wspd'), 'si10', year, month)
+        os.path.join(fc_base, 'wspd'), 'si10', year, month)
     wdir_forecasts = load_forecasts(
-        os.path.join(ndfd_base, 'wdir'), 'wdir10', year, month)
+        os.path.join(fc_base, 'wdir'), 'wdir10', year, month)
     print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
           f"{len(wdir_forecasts)} wdir forecast fields")
+
+    # Apply lead-time filtering and optional collapse
+    effective_leads = lead_hours if lead_hours is not None else cfg.get('default_lead_hours')
+    collapse = cfg.get('collapse_leads', False)
+
+    temp_forecasts = _filter_forecasts(temp_forecasts, effective_leads, collapse)
+    wspd_forecasts = _filter_forecasts(wspd_forecasts, effective_leads, collapse)
+    wdir_forecasts = _filter_forecasts(wdir_forecasts, effective_leads, collapse)
+
+    if effective_leads is not None or collapse:
+        print(f"  After filtering: {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
+              f"{len(wdir_forecasts)} wdir fields (leads={effective_leads}, collapse={collapse})")
 
     return _compute_and_save_errors(
         temp_forecasts, wspd_forecasts, wdir_forecasts,
         station_grid_map, obs_dict, stations_gdf,
-        out_dir, 'NDFD',
+        out_dir, cfg['display_name'],
     )
 
 
 def calculate_hrrr_errors_for_month(year, month):
-    """Calculate HRRR forecast errors at all weather stations for a given month.
+    """Calculate HRRR forecast errors at weather stations.
 
-    1. Load station locations as a GeoDataFrame
-    2. Build a GeoDataFrame of the HRRR grid and spatially join stations to
-       their nearest grid cell (HRRR uses a 3km Lambert Conformal grid,
-       different from NDFD's 2.5km grid)
-    3. Load all HRRR forecasts and ISD observations
-    4. Compute errors and save per-station CSVs and summary
-
-    All valid_time values in output are US/Central (tz-naive).
-    Output: {processed}/forecast_errors/hrrr/{year}/{month:02d}/
-
-    Returns summary DataFrame with per-station error statistics.
+    Backward-compatible wrapper — delegates to calculate_station_errors_for_month().
     """
-    dirs = setup_directories()
-    raw_dir = dirs['raw']
-    processed_dir = dirs['processed']
-    hrrr_base = os.path.join(raw_dir, 'hrrr_data')
-
-    # Output directory
-    out_dir = os.path.join(processed_dir, 'forecast_errors', 'hrrr', str(year), f"{month:02d}")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Load station metadata as GeoDataFrame
-    stations_gdf = load_stations_gdf(raw_dir)
-    print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
-
-    # Build HRRR grid GeoDataFrame and spatially join stations to nearest grid cell
-    temp_dir = os.path.join(hrrr_base, 'temp', str(year), f"{month:02d}")
-    sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
-    print("Building HRRR grid GeoDataFrame and joining stations...")
-    grid_gdf = build_forecast_grid_gdf(str(sample_nc))
-    station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
-    print(f"  Joined {len(station_grid_map)} stations to grid (mean dist: "
-          f"{station_grid_map['dist_m'].mean():.0f} m)")
-
-    # Load all observations (returns Central-time valid_time)
-    print("Loading station observations...")
-    obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
-    print(f"  Loaded observations for {len(obs_dict)} stations")
-
-    # Load HRRR forecasts (valid_time converted to Central inside load_forecasts)
-    print(f"Loading HRRR forecasts for {year}-{month:02d}...")
-    temp_forecasts = load_forecasts(
-        os.path.join(hrrr_base, 'temp'), 't2m', year, month)
-    wspd_forecasts = load_forecasts(
-        os.path.join(hrrr_base, 'wspd'), 'si10', year, month)
-    wdir_forecasts = load_forecasts(
-        os.path.join(hrrr_base, 'wdir'), 'wdir10', year, month)
-    print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
-          f"{len(wdir_forecasts)} wdir forecast fields")
-
-    return _compute_and_save_errors(
-        temp_forecasts, wspd_forecasts, wdir_forecasts,
-        station_grid_map, obs_dict, stations_gdf,
-        out_dir, 'HRRR',
-    )
+    return calculate_station_errors_for_month(year, month, model='hrrr')
 
 
 def _compute_era5_gridded_errors(
     temp_forecasts, wspd_forecasts, wdir_forecasts,
     era5_ds, out_dir, year, month, model_name,
-    fc_lat2d, fc_lon2d,
+    fc_lats, fc_lons,
+    regrid_method='bin',
     bin_map_cache_path=None, force_rebuild_bin_map=False,
 ):
-    """Compute forecast errors vs ERA5 using bin-averaged regridding and xarray merge.
+    """Compute forecast errors vs ERA5 using regridding and xarray merge.
 
-    Regrids forecast fields from the native forecast grid (e.g. HRRR 3km Lambert)
-    to the ERA5 0.1° regular grid via bin-center averaging: each ERA5 cell gets the
-    mean of all forecast cells whose centers fall within it (~12 forecast cells per
-    ERA5 cell at 3km vs 11km resolution). Wind direction is regridded by decomposing
-    to u/v components, averaging those, then recomputing speed and direction.
+    Supports two regridding methods:
+      - 'bin' (default): Bin-center averaging — appropriate when the forecast grid
+        is finer than ERA5 (HRRR 3km → ERA5 0.1°). Each ERA5 cell gets
+        the mean of all forecast cell centers that fall within it.
+      - 'interp': Bilinear interpolation — appropriate when the forecast grid is
+        coarser than ERA5 (GFS 0.25° → ERA5 0.1°). xarray .interp(method='linear')
+        smoothly fills the finer target grid.
 
     After regridding, forecast and ERA5 datasets are merged using xr.merge() on
     shared coordinates, and errors are computed via xarray subtraction.
@@ -734,13 +855,15 @@ def _compute_era5_gridded_errors(
         era5_ds: xarray Dataset opened from ERA5-Land NetCDF (t2m in K, wspd, wdir).
         out_dir: Output directory.
         year, month: For output filename.
-        model_name: 'NDFD' or 'HRRR' (for log messages).
-        fc_lat2d: 2D array of forecast latitudes, shape (ny, nx).
-        fc_lon2d: 2D array of forecast longitudes, shape (ny, nx).
-        bin_map_cache_path: Passed through to _build_hrrr_to_era5_bin_map. See that
-                            function's docstring for details. None disables caching.
-        force_rebuild_bin_map: Passed through to _build_hrrr_to_era5_bin_map. If True,
-                               recompute and overwrite any existing cache file.
+        model_name: Display name for log messages (e.g. 'HRRR', 'GFS').
+        fc_lats: Forecast latitudes — 2D array (ny, nx) for bin method, 1D for interp.
+        fc_lons: Forecast longitudes — 2D array (ny, nx) for bin method, 1D for interp.
+        regrid_method: 'bin' for bin-center averaging (HRRR) or 'interp' for
+                       bilinear interpolation (GFS). Defaults to 'bin'.
+        bin_map_cache_path: Passed through to _build_hrrr_to_era5_bin_map (only used
+                            when regrid_method='bin'). None disables caching.
+        force_rebuild_bin_map: Passed through to _build_hrrr_to_era5_bin_map (only used
+                               when regrid_method='bin'). Defaults to False.
 
     Returns:
         Summary DataFrame with per-cell, per-lead-time error statistics.
@@ -757,20 +880,29 @@ def _compute_era5_gridded_errors(
     print(f"  {len(all_keys)} forecast entries: {len(valid_times)} times × {len(lead_hours_list)} leads")
     print(f"  Lead hours: {lead_hours_list}")
 
-    # ── Step 2: Pre-compute bin assignments (ONCE) ───────────────────────
+    # ── Step 2: Set up regridding ────────────────────────────────────────
     era5_lats = era5_ds.latitude.values   # 1D
     era5_lons = era5_ds.longitude.values  # 1D
     n_lat = len(era5_lats)
     n_lon = len(era5_lons)
 
-    print(f"  Building {model_name} → ERA5 bin map for regridding...")
-    bin_lat_idx, bin_lon_idx, valid_mask = _build_hrrr_to_era5_bin_map(
-        fc_lat2d, fc_lon2d, era5_lats, era5_lons,
-        cache_path=bin_map_cache_path,
-        force_rebuild=force_rebuild_bin_map,
-    )
-    n_valid = valid_mask.sum()
-    print(f"  {n_valid}/{fc_lat2d.size} forecast cells fall within ERA5 domain")
+    use_interp = (regrid_method == 'interp')
+
+    if use_interp:
+        # Bilinear interpolation: GFS coarse regular grid → ERA5
+        print(f"  Using bilinear interpolation for {model_name} → ERA5 regridding")
+        print(f"  Forecast grid: {len(fc_lats)} lat × {len(fc_lons)} lon "
+              f"→ ERA5: {n_lat} × {n_lon}")
+    else:
+        # Bin-center averaging: HRRR high-res 2D grid → ERA5
+        print(f"  Building {model_name} → ERA5 bin map for regridding...")
+        bin_lat_idx, bin_lon_idx, valid_mask = _build_hrrr_to_era5_bin_map(
+            fc_lats, fc_lons, era5_lats, era5_lons,
+            cache_path=bin_map_cache_path,
+            force_rebuild=force_rebuild_bin_map,
+        )
+        n_valid = valid_mask.sum()
+        print(f"  {n_valid}/{fc_lats.size} forecast cells fall within ERA5 domain")
 
     # ── Step 3: Regrid all forecast fields ───────────────────────────────
     n_times = len(valid_times)
@@ -788,17 +920,25 @@ def _compute_era5_gridded_errors(
         ti = time_to_idx[vt]
         li = lead_to_idx[lh]
 
-        # Regrid temperature
-        fc_temp_arr[ti, li] = _regrid_field_to_era5(
-            temp_index[(vt, lh)], bin_lat_idx, bin_lon_idx,
-            valid_mask, n_lat, n_lon,
-        )
-
-        # Regrid wind via u/v decomposition
-        fc_wspd_arr[ti, li], fc_wdir_arr[ti, li] = _regrid_wind_to_era5(
-            wspd_index[(vt, lh)], wdir_index[(vt, lh)],
-            bin_lat_idx, bin_lon_idx, valid_mask, n_lat, n_lon,
-        )
+        if use_interp:
+            # Bilinear interpolation (GFS)
+            fc_temp_arr[ti, li] = _regrid_regular_field_to_era5(
+                temp_index[(vt, lh)], fc_lats, fc_lons, era5_lats, era5_lons,
+            )
+            fc_wspd_arr[ti, li], fc_wdir_arr[ti, li] = _regrid_regular_wind_to_era5(
+                wspd_index[(vt, lh)], wdir_index[(vt, lh)],
+                fc_lats, fc_lons, era5_lats, era5_lons,
+            )
+        else:
+            # Bin-center averaging (HRRR)
+            fc_temp_arr[ti, li] = _regrid_field_to_era5(
+                temp_index[(vt, lh)], bin_lat_idx, bin_lon_idx,
+                valid_mask, n_lat, n_lon,
+            )
+            fc_wspd_arr[ti, li], fc_wdir_arr[ti, li] = _regrid_wind_to_era5(
+                wspd_index[(vt, lh)], wdir_index[(vt, lh)],
+                bin_lat_idx, bin_lon_idx, valid_mask, n_lat, n_lon,
+            )
 
         n_regridded += 1
         if n_regridded % 200 == 0:
@@ -916,14 +1056,22 @@ def _compute_era5_gridded_errors(
     for v in ['wdir_error', 'forecast_wdir', 'era5_wdir']:
         ds_out[v].attrs['units'] = 'degrees (0-360)'
     ds_out.attrs['forecast_model'] = model_name
-    ds_out.attrs['description'] = (
-        f'{model_name} forecast errors vs ERA5-Land reanalysis. '
-        f'Forecast regridded to ERA5 grid via bin-center averaging '
-        f'(~12 forecast cells per ERA5 cell). '
-        f'Wind direction regridded via u/v decomposition. '
-        f'Error = forecast - ERA5. valid_time in US/Central (tz-naive).'
-    )
-    ds_out.attrs['regridding_method'] = 'bin_center_averaging'
+    if use_interp:
+        ds_out.attrs['description'] = (
+            f'{model_name} forecast errors vs ERA5-Land reanalysis. '
+            f'Forecast regridded to ERA5 grid via bilinear interpolation. '
+            f'Wind direction regridded via u/v decomposition. '
+            f'Error = forecast - ERA5. valid_time in US/Central (tz-naive).'
+        )
+        ds_out.attrs['regridding_method'] = 'bilinear_interpolation'
+    else:
+        ds_out.attrs['description'] = (
+            f'{model_name} forecast errors vs ERA5-Land reanalysis. '
+            f'Forecast regridded to ERA5 grid via bin-center averaging. '
+            f'Wind direction regridded via u/v decomposition. '
+            f'Error = forecast - ERA5. valid_time in US/Central (tz-naive).'
+        )
+        ds_out.attrs['regridding_method'] = 'bin_center_averaging'
 
     compress = {'zlib': True, 'complevel': 5}
     encoding = {v: compress for v in ds_out.data_vars}
@@ -988,19 +1136,22 @@ def _compute_era5_gridded_errors(
     return summary_df
 
 
-def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin_map=False):
+def calculate_era5_errors_for_month(year, month, model='hrrr',
+                                     lead_hours=None, force_rebuild_bin_map=False):
     """Calculate forecast errors vs ERA5-Land at every ERA5 grid cell for a month.
 
     Uses ERA5-Land reanalysis as the ground truth (instead of ISD weather stations),
-    providing dense spatial coverage of forecast errors over Texas. Forecast fields
-    are regridded from the native forecast grid (e.g. HRRR 3km Lambert) to the ERA5
-    0.1° regular grid via bin-center averaging, then merged with ERA5 observations
-    using xarray for error computation.
+    providing dense spatial coverage of forecast errors over Texas.
 
-    The forecast-to-ERA5 bin map is cached to
-    {processed}/{model}_to_era5_bin_map.npz and reused across months, since the
-    forecast and ERA5 grids are fixed. Pass force_rebuild_bin_map=True to force
-    recomputation (e.g. after updating the forecast grid).
+    For HRRR (finer than ERA5), forecast fields are regridded via bin-center
+    averaging (~12 forecast cells per ERA5 cell). The bin map is cached to
+    {processed}/{model}_to_era5_bin_map.npz and reused across months.
+
+    For GFS (coarser than ERA5), bilinear interpolation is used instead, since
+    bin-averaging would leave most ERA5 cells empty at 0.25° → 0.1° resolution.
+    GFS leads are collapsed to lead_hours=0 ("day-ahead") by default: each GFS
+    file (f018–f041 from the 12z cycle) predicts a unique hour of the next day,
+    so collapsing produces a dense output rather than a 96%-NaN sparse array.
 
     Output (US/Central times throughout):
       {processed}/forecast_errors_era5/{model}/{year}/{month:02d}/
@@ -1010,9 +1161,13 @@ def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin
     Args:
         year: Four-digit year.
         month: Month 1–12.
-        model: 'hrrr' or 'ndfd'.
+        model: 'hrrr' or 'gfs'.
+        lead_hours: List of lead hours to keep. None uses the model's
+                    default_lead_hours from _MODEL_CONFIG. Pass an explicit
+                    list to override (e.g. [1, 18] for both HRRR leads).
         force_rebuild_bin_map: If True, recompute the forecast-to-ERA5 bin map even
-                               if a cached copy already exists. Defaults to False.
+                               if a cached copy already exists. Only relevant for
+                               bin-averaging models (HRRR). Defaults to False.
 
     Returns:
         Summary DataFrame with per-cell, per-lead-time statistics.
@@ -1022,14 +1177,13 @@ def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin
     processed_dir = dirs['processed']
 
     model_lower = model.lower()
-    if model_lower == 'hrrr':
-        fc_base = os.path.join(raw_dir, 'hrrr_data')
-        model_name = 'HRRR'
-    elif model_lower == 'ndfd':
-        fc_base = os.path.join(raw_dir, 'ndfd_data')
-        model_name = 'NDFD'
-    else:
-        raise ValueError(f"model must be 'hrrr' or 'ndfd', got '{model}'")
+    if model_lower not in _MODEL_CONFIG:
+        raise ValueError(
+            f"model must be one of {list(_MODEL_CONFIG)}, got '{model}'"
+        )
+    cfg = _MODEL_CONFIG[model_lower]
+    fc_base = os.path.join(raw_dir, cfg['data_dir'])
+    model_name = cfg['display_name']
 
     # Output directory
     out_dir = os.path.join(
@@ -1056,11 +1210,16 @@ def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin
         raise FileNotFoundError(f"No {model_name} NetCDF files found in {temp_dir}")
 
     sample_ds = xr.open_dataset(str(nc_files[0]))
-    fc_lat2d = sample_ds.latitude.values   # shape (ny, nx)
-    fc_lon2d = sample_ds.longitude.values  # shape (ny, nx)
+    fc_lats = sample_ds.latitude.values
+    fc_lons = sample_ds.longitude.values
     sample_ds.close()
-    print(f"  {model_name} grid: {fc_lat2d.shape[0]}×{fc_lat2d.shape[1]} "
-          f"→ ERA5 grid: {len(era5_ds.latitude)}×{len(era5_ds.longitude)}")
+
+    if fc_lats.ndim == 1:
+        print(f"  {model_name} grid: {len(fc_lats)}×{len(fc_lons)} (1D regular) "
+              f"→ ERA5 grid: {len(era5_ds.latitude)}×{len(era5_ds.longitude)}")
+    else:
+        print(f"  {model_name} grid: {fc_lats.shape[0]}×{fc_lats.shape[1]} (2D projected) "
+              f"→ ERA5 grid: {len(era5_ds.latitude)}×{len(era5_ds.longitude)}")
 
     # ── Load forecasts (valid_time → Central inside load_forecasts) ─────────
     print(f"Loading {model_name} forecasts for {year}-{month:02d}...")
@@ -1070,18 +1229,34 @@ def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin
     print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
           f"{len(wdir_forecasts)} wdir forecast fields")
 
+    # Apply lead-time filtering and optional collapse
+    effective_leads = lead_hours if lead_hours is not None else cfg.get('default_lead_hours')
+    collapse = cfg.get('collapse_leads', False)
+
+    temp_forecasts = _filter_forecasts(temp_forecasts, effective_leads, collapse)
+    wspd_forecasts = _filter_forecasts(wspd_forecasts, effective_leads, collapse)
+    wdir_forecasts = _filter_forecasts(wdir_forecasts, effective_leads, collapse)
+
+    if effective_leads is not None or collapse:
+        print(f"  After filtering: {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
+              f"{len(wdir_forecasts)} wdir fields (leads={effective_leads}, collapse={collapse})")
+
     # ── Regrid forecasts, merge with ERA5, compute errors ──────────────────
-    # The bin map depends only on grid geometry (not month/year), so cache it
-    # in processed_data/ and reuse it across all months.
-    bin_map_cache_path = os.path.join(
-        processed_dir, f'{model_lower}_to_era5_bin_map.npz'
-    )
+    regrid_method = cfg['regrid_method']
+
+    # Bin map caching is only relevant for the 'bin' regridding method
+    bin_map_cache_path = None
+    if regrid_method == 'bin':
+        bin_map_cache_path = os.path.join(
+            processed_dir, f'{model_lower}_to_era5_bin_map.npz'
+        )
 
     print(f"Computing ERA5-vs-{model_name} errors for {year}-{month:02d}...")
     summary = _compute_era5_gridded_errors(
         temp_forecasts, wspd_forecasts, wdir_forecasts,
         era5_ds, out_dir, year, month, model_name,
-        fc_lat2d, fc_lon2d,
+        fc_lats, fc_lons,
+        regrid_method=regrid_method,
         bin_map_cache_path=bin_map_cache_path,
         force_rebuild_bin_map=force_rebuild_bin_map,
     )
@@ -1090,5 +1265,5 @@ def calculate_era5_errors_for_month(year, month, model='hrrr', force_rebuild_bin
 
 
 if __name__ == '__main__':
-    calculate_ndfd_errors_for_month(2025, 7)
-    calculate_hrrr_errors_for_month(2025, 7)
+    calculate_station_errors_for_month(2025, 7, model='hrrr')
+    # calculate_station_errors_for_month(2025, 7, model='gfs')

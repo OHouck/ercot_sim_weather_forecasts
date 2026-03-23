@@ -214,7 +214,7 @@ def _map_nodes_to_weather_zones(node_station, weather_zone_shapefile):
     return node_zone
 
 
-def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
+def _load_era5_errors_for_nodes(months, model, dirs, node_coords, leads):
     """Load ERA5 gridded forecast errors and extract values at node coordinates.
 
     Uses xr.sel(method='nearest') to find the nearest ERA5 grid cell for each
@@ -222,17 +222,15 @@ def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
 
     Args:
         months: List of (year, month) tuples.
-        model: 'hrrr' or 'ndfd'.
+        model: 'hrrr' or 'gfs'.
         dirs: dict from setup_directories().
         node_coords: DataFrame with settlement_point, lat, lon.
+        leads: Tuple of lead hours to process (e.g. (1,) or (0,)).
 
     Returns:
         DataFrame in wide format with one row per (settlement_point, hour),
         columns matching the station-based pivot format.
     """
-    MODEL_LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
-    lead_short, lead_long = MODEL_LEAD_TIMES[model]
-
     # Load and concat ERA5 error NetCDFs for all months
     parts = []
     for year, month in sorted(months):
@@ -273,6 +271,8 @@ def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
     dfs_by_lead = {}
     for li, lead in enumerate(lead_hours_vals):
         lead_int = int(lead)
+        if lead_int not in leads:
+            continue  # skip leads not in our target set
         sub = node_errors.isel(lead_hours=li)
 
         # Each variable is shape (n_times, n_nodes) — flatten to (n_times * n_nodes,)
@@ -293,8 +293,8 @@ def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
             f'forecast_wspd_{lead_int}h': sub['forecast_wspd'].values.ravel(),
         })
 
-        # Add observed columns only from the short lead (identical for both)
-        if lead_int == lead_short:
+        # Add observed columns only from the first lead (identical across leads)
+        if lead_int == leads[0]:
             df['observed_temp'] = sub['era5_temp'].values.ravel()
             df['observed_wspd'] = sub['era5_wspd'].values.ravel()
             df['observed_wdir'] = sub['era5_wdir'].values.ravel()
@@ -302,11 +302,14 @@ def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
         dfs_by_lead[lead_int] = df
 
     # Merge leads on (settlement_point, hour)
-    errors_wide = dfs_by_lead[lead_short].merge(
-        dfs_by_lead[lead_long].drop(columns=['lat', 'lon']),
-        on=['settlement_point', 'hour'],
-        how='outer',
-    )
+    lead_list = [l for l in leads if l in dfs_by_lead]
+    errors_wide = dfs_by_lead[lead_list[0]]
+    for lead_int in lead_list[1:]:
+        errors_wide = errors_wide.merge(
+            dfs_by_lead[lead_int].drop(columns=['lat', 'lon']),
+            on=['settlement_point', 'hour'],
+            how='outer',
+        )
 
     # Close datasets
     for ds in parts:
@@ -320,10 +323,11 @@ def _load_era5_errors_for_nodes(months, model, dirs, node_coords):
 
 def prepare_node_level_data(
     months,
-    model='ndfd',
+    models=None,
     force_rebuild=False,
     weather_zone_shapefile=DEFAULT_WEATHER_ZONE_SHP,
     error_source='station',
+    model=None,  # backward compat: single model name (str) → converted to models dict
 ):
     """
     Build a node × hour dataset linking ERCOT LMP to weather forecast errors.
@@ -334,17 +338,17 @@ def prepare_node_level_data(
       - 'era5': Each node is matched to its nearest ERA5 grid cell via
         xr.sel(method='nearest'). No GeoDataFrame construction needed.
 
-    Supports forecast models with different lead times:
-      - ndfd: 1h (short) and 25h (long). forecasts available every 3 hours
-      - hrrr: 1h (short) and 18h (long)
-
-    Output columns use the actual lead hour as suffix (e.g. temp_error_1h,
-    temp_error_25h for NDFD; temp_error_1h, temp_error_18h for HRRR).
+    Supports loading forecast errors from multiple models simultaneously
+    (e.g. HRRR 1h + GFS day-ahead).  Each model contributes columns with
+    its own lead-hour suffix (``temp_error_1h`` from HRRR, ``temp_error_0h``
+    from GFS), so columns never collide.
 
     Args:
         months: List of (year, month) tuples to include, e.g. [(2025, 1), (2025, 7)].
                 Can also be a single tuple (year, month) for backwards compatibility.
-        model: Forecast model — 'ndfd' or 'hrrr' (default 'ndfd')
+        models: Dict mapping model name → tuple of lead hours, e.g.
+                ``{'hrrr': (1,), 'gfs': (0,)}``.  Defaults to combined
+                HRRR 1h + GFS day-ahead when ``None``.
         force_rebuild: If True, rebuild even if cached file exists
         weather_zone_shapefile: Path to ERCOT weather-zone shapefile
         error_source: 'station' (default) or 'era5'. Determines how forecast
@@ -352,22 +356,27 @@ def prepare_node_level_data(
 
     Returns:
         DataFrame with one row per (settlement_point, hour) and columns for
-        LMP, short/long-lead forecast errors, observed weather, and station
-        distance.
+        LMP, forecast errors, observed weather, and station distance.
     """
     # Accept a single (year, month) tuple for convenience
     if isinstance(months, tuple) and len(months) == 2 and isinstance(months[0], int):
         months = [months]
 
     # Model-specific lead times
-    MODEL_LEAD_TIMES = {
-        'ndfd': (1, 25),
-        'hrrr': (1, 18),
-    }
-    if model not in MODEL_LEAD_TIMES:
-        raise ValueError(f"Unknown model '{model}'. Choose from: {list(MODEL_LEAD_TIMES)}")
+    MODEL_LEAD_TIMES = {'hrrr': (1,), 'gfs': (0,)}
 
-    lead_short, lead_long = MODEL_LEAD_TIMES[model]
+    # Backward compat: accept model='hrrr' → models={'hrrr': (1,)}
+    if model is not None and models is None:
+        models = {model: MODEL_LEAD_TIMES[model]}
+    elif models is None:
+        models = dict(MODEL_LEAD_TIMES)
+    for m in models:
+        if m not in MODEL_LEAD_TIMES:
+            raise ValueError(f"Unknown model '{m}'. Choose from: {list(MODEL_LEAD_TIMES)}")
+
+    # Combined leads across all models (e.g. (1, 0) for HRRR+GFS)
+    all_leads = tuple(lead for model_leads in models.values() for lead in model_leads)
+    models_key = '+'.join(sorted(models.keys()))
 
     dirs = setup_directories()
 
@@ -384,7 +393,7 @@ def prepare_node_level_data(
     source_tag = '' if error_source == 'station' else f'_{error_source}'
     cache_file = os.path.join(
         dirs['processed'],
-        f'node_hourly_{model}{source_tag}_{cache_tag}.csv'
+        f'node_hourly_{models_key}{source_tag}_{cache_tag}.csv'
     )
 
     if os.path.exists(cache_file) and not force_rebuild:
@@ -392,7 +401,7 @@ def prepare_node_level_data(
         return pd.read_csv(cache_file, parse_dates=['hour'])
 
     period_str = ", ".join(f"{y}-{m:02d}" for y, m in months)
-    print(f"Building node-level dataset from scratch (model={model}, months={period_str})...")
+    print(f"Building node-level dataset from scratch (models={models_key}, months={period_str})...")
 
     # ── Load node coordinates ──
     print("Loading node coordinates...")
@@ -403,7 +412,26 @@ def prepare_node_level_data(
     if error_source == 'era5':
         # ── ERA5 path: load gridded errors directly, no station indirection ──
         print("Loading ERA5 gridded forecast errors...")
-        errors_wide = _load_era5_errors_for_nodes(months, model, dirs, node_coords)
+        errors_wide = None
+        for model_name in sorted(models.keys()):
+            model_leads = models[model_name]
+            print(f"  Loading {model_name.upper()} errors (leads={model_leads})...")
+            model_errors = _load_era5_errors_for_nodes(
+                months, model_name, dirs, node_coords, model_leads,
+            )
+            if errors_wide is None:
+                errors_wide = model_errors
+            else:
+                # Drop columns already present in the base (observed_*, lat, lon)
+                dup_cols = [c for c in model_errors.columns
+                            if c in errors_wide.columns
+                            and c not in ('settlement_point', 'hour')]
+                model_errors = model_errors.drop(columns=dup_cols)
+                errors_wide = errors_wide.merge(
+                    model_errors,
+                    on=['settlement_point', 'hour'],
+                    how='outer',
+                )
 
         # Weather zone assignment (uses node lat/lon, same for both paths)
         node_meta = node_coords[['settlement_point', 'lat', 'lon']].copy()
@@ -467,69 +495,83 @@ def prepare_node_level_data(
     else:
         # ── Station path: original approach with station CSVs + sjoin ──
         print("Loading forecast errors from station CSVs...")
-        all_error_files = []
-        for year, month in months:
-            forecast_error_dir = os.path.join(
-                dirs['processed'], 'forecast_errors', model, str(year), f"{month:02d}"
-            )
-            month_files = glob.glob(os.path.join(forecast_error_dir, '*.csv'))
-            month_files = [f for f in month_files if not f.endswith('error_summary.csv')]
-            all_error_files.extend(month_files)
-            print(f"  {year}-{month:02d}: {len(month_files)} station files")
-
-        error_dfs = [pd.read_csv(f) for f in all_error_files]
-        all_errors = pd.concat(error_dfs, ignore_index=True)
-        all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'])
-        all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
-
-        print(f"  Total: {len(all_errors):,} station-hour-lead observations "
-              f"({model.upper()}, {len(months)} months)")
-
-        # Pivot lead_hours into separate columns
-        error_cols = [c for c in all_errors.columns
-                      if c not in ('station_id', 'valid_time', 'lead_hours',
-                                   'hour', 'lat', 'lon')]
-
-        suffix_short = f'_{lead_short}h'
-        suffix_long = f'_{lead_long}h'
-
-        lead_short_df = all_errors[all_errors['lead_hours'] == lead_short].copy()
-        lead_long_df = all_errors[all_errors['lead_hours'] == lead_long].copy()
-
-        rename_short = {c: f'{c}{suffix_short}' for c in error_cols}
-        rename_long = {c: f'{c}{suffix_long}' for c in error_cols}
-
-        lead_short_df = lead_short_df.rename(columns=rename_short)
-        lead_long_df = lead_long_df.rename(columns=rename_long)
-
-        keep_short = ['station_id', 'hour', 'lat', 'lon'] + list(rename_short.values())
-        keep_long = ['station_id', 'hour'] + list(rename_long.values())
-
-        errors_wide = lead_short_df[keep_short].merge(
-            lead_long_df[keep_long],
-            on=['station_id', 'hour'],
-            how='outer'
-        )
-        print(f"  After pivot: {len(errors_wide):,} station-hour rows")
-
-        # Deduplicate observed columns
-        obs_base_cols = [c for c in error_cols if c.startswith('observed_')]
-        for base in obs_base_cols:
-            col_short = f'{base}{suffix_short}'
-            col_long = f'{base}{suffix_long}'
-            if col_short not in errors_wide.columns or col_long not in errors_wide.columns:
-                continue
-            both_present = errors_wide[col_short].notna() & errors_wide[col_long].notna()
-            mismatches = (errors_wide.loc[both_present, col_short] !=
-                          errors_wide.loc[both_present, col_long]).sum()
-            if mismatches > 0:
-                raise ValueError(
-                    f"Observed column mismatch: {col_short} vs {col_long} differ "
-                    f"in {mismatches} rows where both are non-NA."
+        errors_wide = None
+        for model_name in sorted(models.keys()):
+            model_leads = models[model_name]
+            all_error_files = []
+            for year, month in months:
+                forecast_error_dir = os.path.join(
+                    dirs['processed'], 'forecast_errors', model_name, str(year), f"{month:02d}"
                 )
-            errors_wide[col_short] = errors_wide[col_short].fillna(errors_wide[col_long])
-            errors_wide = errors_wide.drop(columns=[col_long])
-            errors_wide = errors_wide.rename(columns={col_short: base})
+                month_files = glob.glob(os.path.join(forecast_error_dir, '*.csv'))
+                month_files = [f for f in month_files if not f.endswith('error_summary.csv')]
+                all_error_files.extend(month_files)
+                print(f"  {model_name.upper()} {year}-{month:02d}: {len(month_files)} station files")
+
+            error_dfs = [pd.read_csv(f) for f in all_error_files]
+            all_errors = pd.concat(error_dfs, ignore_index=True)
+            all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'], format='mixed')
+            all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
+
+            print(f"  Total: {len(all_errors):,} station-hour-lead observations "
+                  f"({model_name.upper()}, {len(months)} months)")
+
+            # Pivot lead_hours into separate columns
+            error_cols = [c for c in all_errors.columns
+                          if c not in ('station_id', 'valid_time', 'lead_hours',
+                                       'hour', 'lat', 'lon')]
+
+            # Build a wide DataFrame for each lead, then merge
+            lead_dfs = {}
+            for lead in model_leads:
+                suffix = f'_{lead}h'
+                lead_df = all_errors[all_errors['lead_hours'] == lead].copy()
+                rename_map = {c: f'{c}{suffix}' for c in error_cols}
+                lead_df = lead_df.rename(columns=rename_map)
+                keep = ['station_id', 'hour', 'lat', 'lon'] + list(rename_map.values())
+                lead_dfs[lead] = lead_df[keep]
+
+            lead_list = list(model_leads)
+            model_wide = lead_dfs[lead_list[0]]
+            for lead in lead_list[1:]:
+                model_wide = model_wide.merge(
+                    lead_dfs[lead].drop(columns=['lat', 'lon']),
+                    on=['station_id', 'hour'],
+                    how='outer',
+                )
+
+            # Deduplicate observed columns within this model (identical across leads)
+            if len(model_leads) > 1:
+                obs_base_cols = [c for c in error_cols if c.startswith('observed_')]
+                first_suffix = f'_{lead_list[0]}h'
+                for base in obs_base_cols:
+                    col_first = f'{base}{first_suffix}'
+                    if col_first not in model_wide.columns:
+                        continue
+                    for lead in lead_list[1:]:
+                        col_other = f'{base}_{lead}h'
+                        if col_other not in model_wide.columns:
+                            continue
+                        model_wide[col_first] = model_wide[col_first].fillna(model_wide[col_other])
+                        model_wide = model_wide.drop(columns=[col_other])
+                    model_wide = model_wide.rename(columns={col_first: base})
+
+            # Merge this model's errors into the combined DataFrame
+            if errors_wide is None:
+                errors_wide = model_wide
+            else:
+                # Drop columns already present in the base (observed_*, lat, lon)
+                dup_cols = [c for c in model_wide.columns
+                            if c in errors_wide.columns
+                            and c not in ('station_id', 'hour')]
+                model_wide = model_wide.drop(columns=dup_cols)
+                errors_wide = errors_wide.merge(
+                    model_wide,
+                    on=['station_id', 'hour'],
+                    how='outer',
+                )
+
+        print(f"  After pivot: {len(errors_wide):,} station-hour rows")
 
         # Build station GeoDataFrame
         print("Building station GeoDataFrame...")
@@ -642,7 +684,7 @@ def prepare_node_level_data(
     print(f"  Hours: {node_hourly['hour_dt'].min()} to {node_hourly['hour_dt'].max()}")
 
     # Report error coverage
-    for lead in [lead_short, lead_long]:
+    for lead in all_leads:
         col = f'temp_error_{lead}h'
         if col in node_hourly.columns:
             n = node_hourly[col].notna().sum()

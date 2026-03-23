@@ -38,11 +38,11 @@ from process_data.prepare_cluster_level_data import (
 # ── Configuration ─────────────────────────────────────────────────────────────
 # =============================================================================
 
-WEATHER_VAR = 'temp'   # 'wspd' or 'temp'
-LEAD_TIME   = 1        # 1 or 18 for HRRR; 1 or 25 for NDFD
+WEATHER_VAR = 'temp'    # 'wspd' or 'temp'
+LEAD_TIME   = 1         # 1 = HRRR short-range; 0 = GFS day-ahead
 
-# Data
-MODEL  = 'hrrr'
+# Data: combined HRRR (1h) + GFS (day-ahead, lead=0)
+LEAD_SHORT, LEAD_DAH = 1, 0
 MONTHS = [(2025, m) for m in range(1, 9)]   # Jan–Aug 2025
 
 # Clustering (mirrors cluster_node_lr.qmd)
@@ -58,8 +58,7 @@ ERROR_TOLERANCE = 0.5  # control error must be within ±(ERROR_TOLERANCE × std)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 # =============================================================================
 
-LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
-UNITS      = {'wspd': 'm/s', 'temp': '°C'}
+UNITS = {'wspd': 'm/s', 'temp': '°C'}
 
 
 def find_treatment_control(cluster_hourly, cluster_id, error_col, window_days, error_tolerance):
@@ -370,11 +369,10 @@ def write_latex(tex_path, output_dir, generated_files, weather_var, lead_time,
 
 def main():
     dirs = setup_directories()
-    LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
 
     # ── Load node-level data ──────────────────────────────────────────────────
     print("Loading node-level data...")
-    df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
+    df = prepare_node_level_data(months=MONTHS, force_rebuild=False)
     df['hour'] = pd.to_datetime(df['hour'])
     if 'hour_dt' in df.columns:
         df['hour_dt'] = pd.to_datetime(df['hour_dt'])
@@ -397,9 +395,9 @@ def main():
 
     # ── Aggregate to cluster × hour ───────────────────────────────────────────
     print("\nAggregating to cluster × hour...")
-    station_errors = load_station_errors_wide(MONTHS, MODEL, dirs)
+    station_errors = load_station_errors_wide(MONTHS, None, dirs)
     cluster_hourly = aggregate_to_cluster_hour(
-        df, node_clusters, LEAD_SHORT, LEAD_LONG,
+        df, node_clusters, (LEAD_SHORT, LEAD_DAH),
         station_errors=station_errors,
         cluster_polygons=cluster_polygons,
     )
@@ -508,7 +506,7 @@ def main():
         generated_files=generated_files,
         weather_var=WEATHER_VAR,
         lead_time=LEAD_TIME,
-        model=MODEL,
+        model="HRRR+GFS",
         months=MONTHS,
         n_clusters=N_CLUSTERS,
     )

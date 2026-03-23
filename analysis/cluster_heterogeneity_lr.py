@@ -30,9 +30,8 @@ from helper_funcs import setup_directories
 from process_data.prepare_cluster_level_data import build_cluster_hourly_data
 
 # ── Configuration (matches cluster_node_lr.qmd) ──────────────────────────────
-MODEL = "hrrr"
-LEAD_TIMES = {"ndfd": (1, 25), "hrrr": (1, 18)}
-LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
+# HRRR 1h short-range + GFS day-ahead (lead=0)
+LEAD_SHORT, LEAD_DAH = 1, 0
 MONTHS = [(2025, m) for m in range(1, 9)]
 
 N_CLUSTERS = 9
@@ -75,7 +74,6 @@ def load_all_data(force_rebuild=False):
     generators_path = os.path.join(dirs["raw"], "eia860", "texas_generators.csv")
     cluster_hourly, node_clusters, cluster_polygons, sil_score = build_cluster_hourly_data(
         months=MONTHS,
-        model=MODEL,
         n_clusters=N_CLUSTERS,
         geo_weight=GEO_WEIGHT,
         n_neighbors=N_NEIGHBORS,
@@ -477,7 +475,7 @@ def main():
     print("\nGenerating cluster map...")
     plot_cluster_map(node_clusters, cluster_polygons, map_path)
 
-    for leadtime, lead_label in [(LEAD_SHORT, "short"), (LEAD_LONG, "long")]:
+    for leadtime, lead_label in [(LEAD_SHORT, "hrrr_1h"), (LEAD_DAH, "gfs_dah")]:
         print(f"\n{'='*60}")
         print(f"Processing {lead_label} lead ({leadtime}h)")
         print(f"{'='*60}")
@@ -505,7 +503,7 @@ def main():
         print("\nCompiling typst PDF...")
         compile_typst_pdf(
             lead=leadtime,
-            model=MODEL,
+            model="HRRR+GFS",
             n_clusters=N_CLUSTERS,
             depvar=DEPVAR,
             map_path=map_path,

@@ -315,90 +315,112 @@ def build_cluster_polygons(node_clusters, buffer_deg=0.1):
     return cluster_polys
 
 
-def load_station_errors_wide(months, model, dirs):
+def load_station_errors_wide(months, models, dirs):
     """
     Load per-station forecast error CSVs and pivot lead times to wide format.
 
-    Returns a DataFrame with one row per (station_id, hour) and columns:
-      station_id, station_lat, station_lon, <error_cols>_<lead>h, <obs_cols>_<lead>h, ...
+    Supports loading from multiple models simultaneously (e.g. HRRR 1h + GFS
+    day-ahead).  Each model contributes columns with its own lead-hour suffix.
 
-    This is the same pivot logic used inside prepare_node_level_data, but
-    exposes it here so aggregate_to_cluster_hour can use all stations in a
-    cluster polygon rather than just the single nearest station per node.
+    Returns a DataFrame with one row per (station_id, hour) and columns:
+      station_id, station_lat, station_lon, <error_cols>_<lead>h, ...
 
     Args:
         months: List of (year, month) tuples
-        model: 'ndfd' or 'hrrr'
+        models: Dict mapping model name → tuple of lead hours,
+                e.g. ``{'hrrr': (1,), 'gfs': (0,)}``.
         dirs: dict from setup_directories()
 
     Returns:
         DataFrame with station-hour rows and wide error columns.
     """
-    MODEL_LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
-    lead_short, lead_long = MODEL_LEAD_TIMES[model]
+    MODEL_LEAD_TIMES = {'hrrr': (1,), 'gfs': (0,)}
+    if models is None:
+        models = dict(MODEL_LEAD_TIMES)
 
-    all_files = []
-    for year, month in sorted(months):
-        error_dir = os.path.join(
-            dirs['processed'], 'forecast_errors', model, str(year), f"{month:02d}"
-        )
-        month_files = glob.glob(os.path.join(error_dir, '*.csv'))
-        month_files = [f for f in month_files if not f.endswith('error_summary.csv')]
-        all_files.extend(month_files)
+    combined_wide = None
 
-    dfs = [pd.read_csv(f) for f in all_files]
-    all_errors = pd.concat(dfs, ignore_index=True)
-    all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'])
-    all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
+    for model_name in sorted(models.keys()):
+        leads = models[model_name]
 
-    error_cols = [c for c in all_errors.columns
-                  if c not in ('station_id', 'valid_time', 'lead_hours', 'hour', 'lat', 'lon')]
-
-    lead_short_df = all_errors[all_errors['lead_hours'] == lead_short].copy()
-    lead_long_df = all_errors[all_errors['lead_hours'] == lead_long].copy()
-
-    rename_short = {c: f'{c}_{lead_short}h' for c in error_cols}
-    rename_long = {c: f'{c}_{lead_long}h' for c in error_cols}
-
-    lead_short_df = lead_short_df.rename(columns=rename_short)
-    lead_long_df = lead_long_df.rename(columns=rename_long)
-
-    keep_short = ['station_id', 'hour', 'lat', 'lon'] + list(rename_short.values())
-    keep_long = ['station_id', 'hour'] + list(rename_long.values())
-
-    errors_wide = lead_short_df[keep_short].merge(
-        lead_long_df[keep_long], on=['station_id', 'hour'], how='outer'
-    )
-    errors_wide = errors_wide.rename(columns={'lat': 'station_lat', 'lon': 'station_lon'})
-
-    # ── Deduplicate observed columns ──
-    # observed_* values should be identical across lead times (same physical observation).
-    # Verify consistency where both are non-NA, then keep only the short-lead version
-    # renamed to observed_* (no suffix).
-    obs_base_cols = [c for c in error_cols if c.startswith('observed_')]
-    for base in obs_base_cols:
-        col_short = f'{base}_{lead_short}h'
-        col_long = f'{base}_{lead_long}h'
-        if col_short not in errors_wide.columns or col_long not in errors_wide.columns:
-            continue
-        both_present = errors_wide[col_short].notna() & errors_wide[col_long].notna()
-        mismatches = (errors_wide.loc[both_present, col_short] !=
-                      errors_wide.loc[both_present, col_long]).sum()
-        if mismatches > 0:
-            raise ValueError(
-                f"Observed column mismatch: {col_short} vs {col_long} differ "
-                f"in {mismatches} rows where both are non-NA."
+        all_files = []
+        for year, month in sorted(months):
+            error_dir = os.path.join(
+                dirs['processed'], 'forecast_errors', model_name, str(year), f"{month:02d}"
             )
-        errors_wide[col_short] = errors_wide[col_short].fillna(errors_wide[col_long])
-        errors_wide = errors_wide.drop(columns=[col_long])
-        errors_wide = errors_wide.rename(columns={col_short: base})
+            month_files = glob.glob(os.path.join(error_dir, '*.csv'))
+            month_files = [f for f in month_files if not f.endswith('error_summary.csv')]
+            all_files.extend(month_files)
 
-    print(f"Loaded {len(errors_wide):,} station-hour rows "
-          f"({errors_wide['station_id'].nunique()} stations, model={model})")
-    return errors_wide
+        dfs = [pd.read_csv(f) for f in all_files]
+        all_errors = pd.concat(dfs, ignore_index=True)
+        all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'])
+        all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
+
+        error_cols = [c for c in all_errors.columns
+                      if c not in ('station_id', 'valid_time', 'lead_hours', 'hour', 'lat', 'lon')]
+
+        # Build a wide DataFrame for each lead, then merge
+        lead_dfs = {}
+        for lead in leads:
+            suffix = f'_{lead}h'
+            lead_df = all_errors[all_errors['lead_hours'] == lead].copy()
+            rename_map = {c: f'{c}{suffix}' for c in error_cols}
+            lead_df = lead_df.rename(columns=rename_map)
+            keep = ['station_id', 'hour', 'lat', 'lon'] + list(rename_map.values())
+            lead_dfs[lead] = lead_df[keep]
+
+        lead_list = list(leads)
+        model_wide = lead_dfs[lead_list[0]]
+        for lead in lead_list[1:]:
+            model_wide = model_wide.merge(
+                lead_dfs[lead].drop(columns=['lat', 'lon']),
+                on=['station_id', 'hour'],
+                how='outer',
+            )
+        model_wide = model_wide.rename(columns={'lat': 'station_lat', 'lon': 'station_lon'})
+
+        # ── Deduplicate observed columns within this model ──
+        if len(leads) > 1:
+            obs_base_cols = [c for c in error_cols if c.startswith('observed_')]
+            first_suffix = f'_{lead_list[0]}h'
+            for base in obs_base_cols:
+                col_first = f'{base}{first_suffix}'
+                if col_first not in model_wide.columns:
+                    continue
+                for lead in lead_list[1:]:
+                    col_other = f'{base}_{lead}h'
+                    if col_other not in model_wide.columns:
+                        continue
+                    model_wide[col_first] = model_wide[col_first].fillna(model_wide[col_other])
+                    model_wide = model_wide.drop(columns=[col_other])
+                model_wide = model_wide.rename(columns={col_first: base})
+
+        print(f"  Loaded {len(model_wide):,} station-hour rows "
+              f"({model_wide['station_id'].nunique()} stations, model={model_name})")
+
+        # Merge this model into the combined DataFrame
+        if combined_wide is None:
+            combined_wide = model_wide
+        else:
+            # Drop columns already present in the base (observed_*, station_lat, station_lon)
+            dup_cols = [c for c in model_wide.columns
+                        if c in combined_wide.columns
+                        and c not in ('station_id', 'hour')]
+            model_wide = model_wide.drop(columns=dup_cols)
+            combined_wide = combined_wide.merge(
+                model_wide,
+                on=['station_id', 'hour'],
+                how='outer',
+            )
+
+    models_key = '+'.join(sorted(models.keys()))
+    print(f"Combined: {len(combined_wide):,} station-hour rows "
+          f"({combined_wide['station_id'].nunique()} stations, models={models_key})")
+    return combined_wide
 
 
-def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
+def aggregate_to_cluster_hour(df, node_clusters, leads,
                                station_errors=None, cluster_polygons=None):
     """
     Aggregate data to cluster x hour level.
@@ -419,8 +441,7 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
     Args:
         df: Node-level DataFrame from prepare_node_level_data()
         node_clusters: DataFrame with columns [settlement_point, cluster, lat, lon]
-        lead_short: Short lead time in hours (e.g. 1)
-        lead_long: Long lead time in hours (e.g. 25)
+        leads: Tuple of lead hours to process (e.g. (1,) or (0,))
         station_errors: Optional wide-format station-hour DataFrame from
                         load_station_errors_wide(). If provided, used for all
                         weather aggregation instead of node-attached errors.
@@ -442,11 +463,9 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
           f"{df_with_cluster['settlement_point'].nunique()} / "
           f"{df['settlement_point'].nunique()}")
 
-    # Build the aggregation dict dynamically so load_error column names are
-    # derived from the lead_short / lead_long parameters rather than hardcoded.
-    # This makes the function work for both HRRR (1h/18h) and NDFD (1h/25h).
-    le_short = f'load_error_{lead_short}h'
-    le_long  = f'load_error_{lead_long}h'
+    # Build the aggregation dict dynamically.  Load-error columns are
+    # detected by prefix (demand forecast leads are independent of weather
+    # model leads, so we don't filter by the `leads` parameter here).
     lmp_agg = {
         'lmp_mean':       ('lmp',         'mean'),
         'lmp_std':        ('lmp',         'std'),
@@ -455,9 +474,8 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
         'actual_load':    ('actual_load', 'mean'),
         'n_nodes_in_hour':('lmp',         'count'),
     }
-    for le_col in [le_short, le_long]:
-        if le_col in df_with_cluster.columns:
-            lmp_agg[le_col] = (le_col, 'mean')
+    for le_col in [c for c in df_with_cluster.columns if c.startswith('load_error_')]:
+        lmp_agg[le_col] = (le_col, 'mean')
 
     lmp_hourly = (
         df_with_cluster
@@ -482,12 +500,12 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
     # ── Weather aggregation ──
     if use_polygons:
         weather_hourly = _aggregate_weather_from_polygons(
-            station_errors, cluster_polygons, lead_short, lead_long
+            station_errors, cluster_polygons, leads
         )
     else:
         # Fallback: use node-attached station errors already in df
         weather_hourly = _aggregate_weather_from_nodes(
-            df_with_cluster, lead_short, lead_long
+            df_with_cluster, leads
         )
 
     # ── Merge LMP and weather ──
@@ -517,7 +535,7 @@ def aggregate_to_cluster_hour(df, node_clusters, lead_short, lead_long,
     return cluster_hourly
 
 
-def _aggregate_weather_from_polygons(station_errors, cluster_polygons, lead_short, lead_long):
+def _aggregate_weather_from_polygons(station_errors, cluster_polygons, leads):
     """
     Spatial join stations to cluster polygons, then aggregate weather per cluster-hour.
     """
@@ -561,28 +579,30 @@ def _aggregate_weather_from_polygons(station_errors, cluster_polygons, lead_shor
     # Attach cluster to station-hour errors
     station_cluster = station_errors.merge(joined, on='station_id', how='inner')
 
-    return _compute_weather_aggs(station_cluster, lead_short, lead_long)
+    return _compute_weather_aggs(station_cluster, leads)
 
 
-def _aggregate_weather_from_nodes(df_with_cluster, lead_short, lead_long):
+def _aggregate_weather_from_nodes(df_with_cluster, leads):
     """
-    Aggregate weather from node-attached station errors (one station per node).
-    Deduplicate so each (station_id, cluster, hour) contributes once.
+    Aggregate weather from node-attached errors (one observation per node).
+    Deduplicate so each (node/station, cluster, hour) contributes once.
     """
     error_prefixes = ('temp_error', 'wspd_error', 'wdir_degree_error',
                       'observed_temp', 'observed_wspd', 'observed_wdir',
                       'forecast_temp', 'forecast_wspd')
     weather_cols = [c for c in df_with_cluster.columns
                     if c.startswith(error_prefixes)]
-    keep = ['station_id', 'cluster', 'hour'] + weather_cols
+    # Use station_id if available (station path), else settlement_point (ERA5 path)
+    id_col = 'station_id' if 'station_id' in df_with_cluster.columns else 'settlement_point'
+    keep = [id_col, 'cluster', 'hour'] + weather_cols
     station_cluster = (
         df_with_cluster[keep]
-        .drop_duplicates(subset=['station_id', 'cluster', 'hour'])
+        .drop_duplicates(subset=[id_col, 'cluster', 'hour'])
     )
-    return _compute_weather_aggs(station_cluster, lead_short, lead_long)
+    return _compute_weather_aggs(station_cluster, leads)
 
 
-def _compute_weather_aggs(station_cluster, lead_short, lead_long):
+def _compute_weather_aggs(station_cluster, leads):
     """
     Compute per (cluster, hour) aggregations for forecast errors and observed weather.
 
@@ -592,7 +612,7 @@ def _compute_weather_aggs(station_cluster, lead_short, lead_long):
     """
     agg_dict = {}
 
-    for lead in [lead_short, lead_long]:
+    for lead in leads:
         suffix = f'_{lead}h'
 
         for err_col in [f'temp_error{suffix}', f'wspd_error{suffix}',
@@ -624,7 +644,7 @@ def _compute_weather_aggs(station_cluster, lead_short, lead_long):
 
     # Add max_abs_error columns from the mean-aggregated data
     # (we need to re-aggregate abs values separately)
-    for lead in [lead_short, lead_long]:
+    for lead in leads:
         suffix = f'_{lead}h'
         for err_col in [f'temp_error{suffix}', f'wspd_error{suffix}',
                         f'wdir_degree_error{suffix}']:
@@ -845,9 +865,10 @@ def compute_cluster_generation_mix(node_clusters, cluster_polygons, generators_p
 
 
 def build_cluster_hourly_data(
-    months, model, n_clusters, geo_weight, n_neighbors,
-    generators_path, force_rebuild=False,
+    months, models=None, n_clusters=9, geo_weight=10.0, n_neighbors=8,
+    generators_path=None, force_rebuild=False,
     error_source='station',
+    model=None,  # backward compat: single model name (str) → converted to models dict
 ):
     """
     Build (or load from cache) the canonical cluster × hour analysis dataset.
@@ -857,20 +878,21 @@ def build_cluster_hourly_data(
       build_cluster_polygons → aggregate_to_cluster_hour →
       compute_cluster_generation_mix
 
-    The generation mix is merged into the cluster-hour DataFrame so every
-    hourly row carries its cluster's capacity totals, broad-category MW,
-    scaled MW, and percentage-share columns (``pct_{cat}``).
+    Supports loading forecast errors from multiple models simultaneously
+    (e.g. HRRR 1h + GFS day-ahead).
 
     Three artefacts are cached in ``dirs["processed"]`` and reloaded on
     subsequent calls (set ``force_rebuild=True`` to bypass):
 
-    * ``cluster_hourly_{model}_k{n_clusters}_{months_tag}.csv``
-    * ``node_clusters_{model}_k{n_clusters}_{months_tag}.csv``
-    * ``cluster_polygons_{model}_k{n_clusters}_{months_tag}.gpkg``
+    * ``cluster_hourly_{models_key}_k{n_clusters}_{months_tag}.csv``
+    * ``node_clusters_{models_key}_k{n_clusters}_{months_tag}.csv``
+    * ``cluster_polygons_{models_key}_k{n_clusters}_{months_tag}.gpkg``
 
     Args:
         months:          List of (year, month) tuples, e.g. [(2025, 1), …].
-        model:           Forecast model — ``'hrrr'`` or ``'ndfd'``.
+        models:          Dict mapping model name → tuple of lead hours,
+                         e.g. ``{'hrrr': (1,), 'gfs': (0,)}``.  Defaults to
+                         combined HRRR 1h + GFS day-ahead when ``None``.
         n_clusters:      Number of clusters to form.
         geo_weight:      Geographic weight for agglomerative clustering.
         n_neighbors:     k-NN connectivity graph size for clustering.
@@ -893,6 +915,18 @@ def build_cluster_hourly_data(
     """
     from process_data.prepare_node_level_data import prepare_node_level_data
 
+    MODEL_LEAD_TIMES = {"hrrr": (1,), "gfs": (0,)}
+
+    # Backward compat: accept model='hrrr' → models={'hrrr': (1,)}
+    if model is not None and models is None:
+        models = {model: MODEL_LEAD_TIMES[model]}
+    elif models is None:
+        models = dict(MODEL_LEAD_TIMES)
+
+    models_key = '+'.join(sorted(models.keys()))
+    # Combined leads across all models (e.g. (1, 0) for HRRR+GFS)
+    leads = tuple(lead for model_leads in models.values() for lead in model_leads)
+
     dirs = setup_directories()
 
     # ── Cache key ─────────────────────────────────────────────────────────
@@ -905,7 +939,7 @@ def build_cluster_hourly_data(
         months_tag = f"{first_y}{first_m:02d}_{last_y}{last_m:02d}"
 
     source_tag = '' if error_source == 'station' else f'_{error_source}'
-    key = f"{model}_k{n_clusters}{source_tag}_{months_tag}"
+    key = f"{models_key}_k{n_clusters}{source_tag}_{months_tag}"
     ch_path  = os.path.join(dirs["processed"], f"cluster_hourly_{key}.csv")
     nc_path  = os.path.join(dirs["processed"], f"node_clusters_{key}.csv")
     gpkg_path = os.path.join(dirs["processed"], f"cluster_polygons_{key}.gpkg")
@@ -923,13 +957,10 @@ def build_cluster_hourly_data(
     print(f"Building cluster-hour dataset ({key}, force_rebuild={force_rebuild})…")
 
     # ── 1. Node-level data ────────────────────────────────────────────────
-    df = prepare_node_level_data(months=months, model=model, force_rebuild=False,
+    df = prepare_node_level_data(months=months, models=models, force_rebuild=False,
                                 error_source=error_source)
 
     # ── 2. Clustering ─────────────────────────────────────────────────────
-    MODEL_LEAD_TIMES = {"ndfd": (1, 25), "hrrr": (1, 18)}
-    lead_short, lead_long = MODEL_LEAD_TIMES[model]
-
     node_features = compute_node_lmp_features(df)
     node_clusters, sil_score = cluster_nodes(
         node_features,
@@ -944,26 +975,26 @@ def build_cluster_hourly_data(
         # ERA5 errors are already attached to nodes at grid-cell resolution.
         # Skip station CSV loading; aggregate directly from node-attached errors.
         cluster_hourly = aggregate_to_cluster_hour(
-            df, node_clusters, lead_short, lead_long,
+            df, node_clusters, leads,
         )
     else:
         # Try polygon-based station aggregation; fall back to node-attached errors
         # if individual station CSV files time out (common with OneDrive sync).
         station_errors = None
         try:
-            station_errors = load_station_errors_wide(months, model, dirs)
+            station_errors = load_station_errors_wide(months, models, dirs)
         except (TimeoutError, OSError) as exc:
             print(f"  Station error loading failed ({exc}); using node-attached fallback.")
 
         if station_errors is not None:
             cluster_hourly = aggregate_to_cluster_hour(
-                df, node_clusters, lead_short, lead_long,
+                df, node_clusters, leads,
                 station_errors=station_errors,
                 cluster_polygons=cluster_polygons,
             )
         else:
             cluster_hourly = aggregate_to_cluster_hour(
-                df, node_clusters, lead_short, lead_long,
+                df, node_clusters, leads,
             )
 
     # ── 4. Generation mix ─────────────────────────────────────────────────

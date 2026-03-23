@@ -2,10 +2,11 @@
 
 Builds a single analysis-ready DataFrame at the (pixel, hour) level by merging:
 1. ERA5 gridded forecast errors (NetCDF) — time-varying, 4D
+   Supports loading from multiple models (e.g., HRRR 1h + GFS day-ahead).
 2. Gridded generation map (NetCDF) — static, 2D
 3. RT SPP system-wide hourly LMP statistics — time-varying, 1D
 
-Output: {processed}/pixel_hourly_{model}_{year}_{month:02d}.parquet
+Output: {processed}/pixel_hourly_{models_key}_{year}_{month:02d}.parquet
 """
 
 import argparse
@@ -22,6 +23,9 @@ from helper_funcs import setup_directories
 from process_data.process_ercot import load_rt_spp_month
 from process_data.gridded_generation_mapping import build_gridded_generation_map
 
+# Default model → lead-hours mapping.  Used when callers pass models=None.
+MODEL_LEAD_TIMES = {'hrrr': (1,), 'gfs': (0,)}
+
 
 def _round_coord_id(lat, lon):
     """Build a pixel ID from rounded lat/lon for grid-safe merging."""
@@ -37,7 +41,7 @@ def flatten_era5_errors(year, month, model='hrrr'):
     Args:
         year: Integer year.
         month: Integer month.
-        model: Forecast model — 'hrrr' or 'ndfd'.
+        model: Forecast model — 'hrrr' or 'gfs'.
 
     Returns:
         DataFrame with columns: pixel_id, latitude, longitude, valid_time,
@@ -124,15 +128,14 @@ def flatten_era5_errors(year, month, model='hrrr'):
     ds.close()
 
     # Merge leads on (pixel_id, valid_time)
-    lead_long = int(lead_hours_vals[1]) if len(lead_hours_vals) > 1 else lead_short
-    if lead_long != lead_short:
-        errors_wide = dfs_by_lead[lead_short].merge(
-            dfs_by_lead[lead_long],
+    lead_list = [int(l) for l in lead_hours_vals]
+    errors_wide = dfs_by_lead[lead_list[0]]
+    for lead_int in lead_list[1:]:
+        errors_wide = errors_wide.merge(
+            dfs_by_lead[lead_int],
             on=['pixel_id', 'valid_time'],
             how='outer',
         )
-    else:
-        errors_wide = dfs_by_lead[lead_short]
 
     print(f"  Flattened ERA5 errors: {len(errors_wide):,} rows")
     return errors_wide
@@ -231,33 +234,60 @@ def compute_system_lmp_hourly(year, month):
     return system_lmp
 
 
-def build_pixel_hourly_dataset(year, month, model='hrrr', force_rebuild=False):
+def build_pixel_hourly_dataset(year, month, models=None, force_rebuild=False):
     """Build the combined pixel x hour analysis DataFrame.
 
-    Merges ERA5 gridded forecast errors, the gridded generation map, and
-    system-wide hourly LMP statistics. Only pixels with infrastructure
-    (generation, transmission, or load centers) are kept.
+    Merges ERA5 gridded forecast errors from one or more forecast models,
+    the gridded generation map, and system-wide hourly LMP statistics.
+    Only pixels with infrastructure (generation, transmission, or load
+    centers) are kept.
 
     Args:
         year: Integer year.
         month: Integer month.
-        model: Forecast model — 'hrrr' or 'ndfd'.
+        models: Dict mapping model name → tuple of lead hours, e.g.
+                ``{'hrrr': (1,), 'gfs': (0,)}``.  Defaults to combined
+                HRRR 1h + GFS day-ahead when ``None``.
         force_rebuild: If True, rebuild even if cached parquet exists.
 
     Returns:
         DataFrame with one row per (pixel_id, valid_time).
     """
+    if models is None:
+        models = dict(MODEL_LEAD_TIMES)
+
+    models_key = '+'.join(sorted(models.keys()))
+
     dirs = setup_directories()
     cache_file = os.path.join(
-        dirs['processed'], "combined_hourly_gridded_data", f'pixel_hourly_{model}_{year}_{month:02d}.parquet'
+        dirs['processed'], "combined_hourly_gridded_data",
+        f'pixel_hourly_{models_key}_{year}_{month:02d}.parquet',
     )
 
     if os.path.exists(cache_file) and not force_rebuild:
         print(f"Loading cached dataset: {cache_file}")
         return pd.read_parquet(cache_file)
 
+    # ── Step 1: Flatten ERA5 forecast errors for each model and merge ──
     print("Step 1: Flattening ERA5 forecast errors...")
-    errors_df = flatten_era5_errors(year, month, model)
+    errors_df = None
+    for model_name in sorted(models.keys()):
+        print(f"  Loading {model_name.upper()} errors...")
+        model_errors = flatten_era5_errors(year, month, model_name)
+        if errors_df is None:
+            errors_df = model_errors
+        else:
+            # Drop columns already present in the base (era5_*, lat, lon)
+            dup_cols = [c for c in model_errors.columns
+                        if c in errors_df.columns
+                        and c not in ('pixel_id', 'valid_time')]
+            model_errors = model_errors.drop(columns=dup_cols)
+            errors_df = errors_df.merge(
+                model_errors,
+                on=['pixel_id', 'valid_time'],
+                how='outer',
+            )
+    print(f"  Combined ERA5 errors: {len(errors_df):,} rows")
 
     print("Step 2: Flattening generation map...")
     gen_df = flatten_generation_map()
@@ -295,6 +325,8 @@ def build_pixel_hourly_dataset(year, month, model='hrrr', force_rebuild=False):
     print(f"  Pixels: {pixel_hourly['pixel_id'].nunique()}")
     print(f"  Hours: {pixel_hourly['valid_time'].nunique()}")
 
+    return pixel_hourly
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -302,11 +334,20 @@ if __name__ == '__main__':
     )
     parser.add_argument('--year', type=int, default=2025)
     parser.add_argument('--month', type=int, default=7)
-    parser.add_argument('--model', type=str, default='hrrr')
+    parser.add_argument(
+        '--models', type=str, default=None,
+        help='Comma-separated model names (e.g. "hrrr,gfs"). '
+             'Defaults to all models in MODEL_LEAD_TIMES.',
+    )
     parser.add_argument('--force-rebuild', action='store_true')
     args = parser.parse_args()
+
+    if args.models is not None:
+        models = {m.strip(): MODEL_LEAD_TIMES[m.strip()]
+                  for m in args.models.split(',')}
+    else:
+        models = None  # use default (all models)
+
     build_pixel_hourly_dataset(
-        args.year, args.month, args.model, args.force_rebuild
+        args.year, args.month, models, args.force_rebuild
     )
-    print(f"\nFinal shape: {df.shape}")
-    print(f"Columns: {list(df.columns)}")

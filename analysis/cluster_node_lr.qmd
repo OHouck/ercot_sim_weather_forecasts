@@ -62,22 +62,20 @@ print("Setup complete")
 
 dirs = setup_directories()
 
-# ── Choose forecast model: 'ndfd' or 'hrrr' ──
-MODEL = 'hrrr'
-LEAD_TIMES = {'ndfd': (1, 25), 'hrrr': (1, 18)}
-LEAD_SHORT, LEAD_LONG = LEAD_TIMES[MODEL]
+# ── Combined HRRR (1h short-range) + GFS (day-ahead, lead=0) ──
+LEAD_SHORT, LEAD_DAH = 1, 0  # HRRR 1h short-range, GFS day-ahead
 
 # ── Months to include ──
 MONTHS = [(2025, m) for m in range(1, 9)]  # Jan to Aug
 
-df = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
+df = prepare_node_level_data(months=MONTHS, force_rebuild=True)
 
 print(f"\n{'='*60}")
 print(f"Dataset Summary ({MODEL.upper()})")
 print(f"{'='*60}")
 print(f"Observations: {len(df):,}")
 print(f"Nodes: {df['settlement_point'].nunique()}")
-print(f"Lead times: {LEAD_SHORT}h (short) / {LEAD_LONG}h (long)")
+print(f"Lead times: {LEAD_SHORT}h (HRRR short-range) / {LEAD_DAH}h (GFS day-ahead)")
 print(f"Date range: {df['hour_dt'].min()} to {df['hour_dt'].max()}")
 ```
 
@@ -94,7 +92,7 @@ for each `k` and can be slow.
 
 # Load node features just for the sweep (not needed once N_CLUSTERS is fixed)
 from process_data.prepare_node_level_data import prepare_node_level_data
-_df_sweep = prepare_node_level_data(months=MONTHS, model=MODEL, force_rebuild=False)
+_df_sweep = prepare_node_level_data(months=MONTHS, force_rebuild=False)
 _node_features = compute_node_lmp_features(_df_sweep)
 sweep_results, sweep_fig = sweep_n_clusters(
     _node_features, k_range=range(5, 30, 1), geo_weight=2.0, n_neighbors=10
@@ -114,7 +112,6 @@ N_NEIGHBORS = 8
 
 cluster_hourly, node_clusters, cluster_polygons, sil_score = build_cluster_hourly_data(
     months=MONTHS,
-    model=MODEL,
     n_clusters=N_CLUSTERS,
     geo_weight=GEO_WEIGHT,
     n_neighbors=N_NEIGHBORS,
@@ -232,7 +229,7 @@ for col in cluster_hourly.columns:
 
 print(f"\nSummary statistics for key variables:")
 key_vars = ['lmp', f'temp_error_{LEAD_SHORT}h', f'wspd_error_{LEAD_SHORT}h',
-            f'temp_error_{LEAD_LONG}h', f'wspd_error_{LEAD_LONG}h',
+            f'temp_error_{LEAD_DAH}h', f'wspd_error_{LEAD_DAH}h',
             'n_nodes_in_hour']
 existing_vars = [v for v in key_vars if v in cluster_hourly.columns]
 print(cluster_hourly[existing_vars].describe().round(3).to_string())

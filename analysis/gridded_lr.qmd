@@ -59,15 +59,15 @@ print("Setup complete")
 dirs = setup_directories()
 
 # ── Configuration ──
-MODEL = 'hrrr'
-LEAD_SHORT, LEAD_LONG = 1, 18
+# Combined HRRR (1h short-range) + GFS (day-ahead, lead=0)
+LEAD_SHORT, LEAD_DAH = 1, 0
 MONTHS = [(2025, m) for m in range(1, 13)]
 
 # ── Load all monthly parquets ──
 data_dir = os.path.join(dirs['processed'], 'combined_hourly_gridded_data')
 dfs = []
 for year, month in MONTHS:
-    path = os.path.join(data_dir, f'pixel_hourly_{MODEL}_{year}_{month:02d}.parquet')
+    path = os.path.join(data_dir, f'pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet')
     if os.path.exists(path):
         dfs.append(pd.read_parquet(path))
         print(f"  Loaded {year}-{month:02d}: {len(dfs[-1]):,} rows")
@@ -77,7 +77,7 @@ for year, month in MONTHS:
 pixel_hourly = pd.concat(dfs, ignore_index=True)
 
 print(f"\n{'='*60}")
-print(f"Pixel-Hourly Dataset ({MODEL.upper()})")
+print(f"Pixel-Hourly Dataset (HRRR 1h + GFS day-ahead)")
 print(f"{'='*60}")
 print(f"Rows: {len(pixel_hourly):,}")
 print(f"Pixels: {pixel_hourly['pixel_id'].nunique()}")
@@ -160,7 +160,7 @@ for cat_name, cat_info in categories.items():
 
 # ── Variables to aggregate ──
 ERROR_VARS = [f'temp_error_{LEAD_SHORT}h', f'wspd_error_{LEAD_SHORT}h',
-              f'temp_error_{LEAD_LONG}h', f'wspd_error_{LEAD_LONG}h']
+              f'temp_error_{LEAD_DAH}h', f'wspd_error_{LEAD_DAH}h']
 OBS_VARS = ['era5_temp', 'era5_wspd']
 AGG_VARS = ERROR_VARS + OBS_VARS
 
@@ -371,7 +371,7 @@ transmission corridors matter more when wind speed forecasts at wind farms are a
 #| label: model-interactions
 #| echo: true
 
-leadtime = LEAD_LONG
+leadtime = LEAD_DAH
 FE = ["hour_of_day", "month"]
 CLUSTER_SE = "date"
 
