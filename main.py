@@ -154,9 +154,63 @@ dirs = setup_directories()
 # montly parquet files
 # Output: pixel_hourly_{models_key}_{YYYYMM}.parquet
 # =============================================================================
-from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
-for year, month in MONTHS:
-    build_pixel_hourly_dataset(
-        year, month, force_rebuild=False  # defaults to HRRR 1h + GFS day-ahead
-    )
+# from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+# for year, month in MONTHS:
+#     build_pixel_hourly_dataset(
+#         year, month, force_rebuild=False  # defaults to HRRR 1h + GFS day-ahead
+#     )
+
+# =============================================================================
+# ANALYSIS PIPELINE
+# Runs all analysis scripts and compiles a unified PDF report via Typst.
+# Each step saves figures to {OneDrive}/figures/ and tables to {repo}/tables/.
+# Comment out individual steps to skip them (outputs are cached on disk).
+# =============================================================================
+
+# ── Analysis configuration ────────────────────────────────────────────────────
+ANALYSIS_MONTHS = [(2025, m) for m in range(1, 13)]
+N_CLUSTERS = 7
+GEO_WEIGHT = 2.0
+N_NEIGHBORS = 8
+
+# ── Step A1: Cluster heterogeneity regressions ─────────────────────────────
+# Per-cluster joint HRRR 1h + GFS day-ahead regression → cluster_heterogeneity/ figures
+# + tables/cluster_regression_results.csv
+# from analysis.cluster_heterogeneity_lr import run_cluster_analysis
+# cluster_outputs = run_cluster_analysis(
+#     months=ANALYSIS_MONTHS,
+#     n_clusters=N_CLUSTERS,
+#     geo_weight=GEO_WEIGHT,
+#     n_neighbors=N_NEIGHBORS,
+# )
+
+# ── Step A2: Raw correlation heatmaps (2×2) ────────────────────────────────
+# Per-pixel Pearson r between forecast error and system LMP std → correlation_heatmaps/
+# from analysis.forecast_error_lmp_corr_heatmap import run_correlation_heatmaps
+# corr_outputs = run_correlation_heatmaps(
+#     months=ANALYSIS_MONTHS,
+#     lmp_var="system_lmp_std",
+# )
+
+# ── Step A3: Pixel-level regression coefficient maps (2×2) ────────────────
+# Per-pixel OLS with controls → pixel_regressions/ + tables/pixel_regression_summary.csv
+# from analysis.pixel_regression_maps import run_pixel_regression_maps
+# pixel_outputs = run_pixel_regression_maps(months=ANALYSIS_MONTHS)
+
+
+# ── Step A4: Infrastructure-level regressions ──────────────────────────────
+# Capacity-weighted aggregation by tech category → infrastructure_regressions/
+# + tables/infrastructure_regression_main.csv + tables/infrastructure_regression_seasonal.csv
+from analysis.gridded_infrastructure_lr import run_infrastructure_analysis
+infra_outputs = run_infrastructure_analysis(months=ANALYSIS_MONTHS)
+
+# ── Step A5: Graph neural network (future) ─────────────────────────────────
+# Uncomment when node_gnn.py produces standardized outputs:
+# from analysis.node_gnn import run_gnn_analysis
+# gnn_outputs = run_gnn_analysis(months=ANALYSIS_MONTHS)
+
+# ── Compile Typst report ───────────────────────────────────────────────────
+# Reads all figures/tables produced above → output/analysis_report.pdf
+# from analysis.create_analysis_report import create_analysis_report
+# create_analysis_report(output_dir="output")
 

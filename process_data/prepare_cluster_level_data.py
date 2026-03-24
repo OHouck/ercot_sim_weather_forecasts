@@ -354,7 +354,17 @@ def load_station_errors_wide(months, models, dirs):
 
         dfs = [pd.read_csv(f) for f in all_files]
         all_errors = pd.concat(dfs, ignore_index=True)
-        all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'])
+        all_errors['valid_time'] = pd.to_datetime(all_errors['valid_time'], format='mixed')
+        # Drop rows that had date-only valid_time (no intra-day hour info) — these
+        # are stations that only matched at daily resolution with no observed values.
+        date_only_mask = (all_errors['valid_time'].dt.hour == 0) & \
+                         (all_errors['observed_temp'].isna()) & \
+                         (all_errors['observed_wspd'].isna())
+        n_dropped = date_only_mask.sum()
+        if n_dropped:
+            print(f"  Warning: dropping {n_dropped} date-only rows (no observed values) "
+                  f"from {all_errors.loc[date_only_mask, 'station_id'].nunique()} stations.")
+            all_errors = all_errors[~date_only_mask].reset_index(drop=True)
         all_errors['hour'] = all_errors['valid_time'].dt.floor('h')
 
         error_cols = [c for c in all_errors.columns
@@ -757,7 +767,7 @@ def compute_cluster_generation_mix(node_clusters, cluster_polygons, generators_p
             crs="EPSG:4326",
         ).to_crs("EPSG:3857")
 
-        unmatched_pts = gen_gdf.loc[unmatched_mask].to_crs("EPSG:3857")
+        unmatched_pts = joined.loc[unmatched_mask].to_crs("EPSG:3857")
         nearest = gpd.sjoin_nearest(
             unmatched_pts[["technology", "nameplate_capacity_mw",
                            "scaled_mw", "geometry"]],
@@ -866,8 +876,9 @@ def compute_cluster_generation_mix(node_clusters, cluster_polygons, generators_p
 
 def build_cluster_hourly_data(
     months, models=None, n_clusters=9, geo_weight=10.0, n_neighbors=8,
+    min_cluster_size=3,
     generators_path=None, force_rebuild=False,
-    error_source='station',
+    error_source='era5', # by default use era5 based errors
     model=None,  # backward compat: single model name (str) → converted to models dict
 ):
     """
@@ -896,6 +907,8 @@ def build_cluster_hourly_data(
         n_clusters:      Number of clusters to form.
         geo_weight:      Geographic weight for agglomerative clustering.
         n_neighbors:     k-NN connectivity graph size for clustering.
+        min_cluster_size: Clusters with fewer nodes are merged into their nearest
+                         neighbour. Default 3 — only merges singletons/pairs.
         generators_path: Path to EIA 860 Texas generators CSV.
         force_rebuild:   If True, ignore existing cache files and rebuild.
         error_source:    ``'station'`` (default) or ``'era5'``. Passed through
@@ -957,7 +970,7 @@ def build_cluster_hourly_data(
     print(f"Building cluster-hour dataset ({key}, force_rebuild={force_rebuild})…")
 
     # ── 1. Node-level data ────────────────────────────────────────────────
-    df = prepare_node_level_data(months=months, models=models, force_rebuild=False,
+    df = prepare_node_level_data(months=months, models=models, force_rebuild=force_rebuild,
                                 error_source=error_source)
 
     # ── 2. Clustering ─────────────────────────────────────────────────────
@@ -967,6 +980,7 @@ def build_cluster_hourly_data(
         n_clusters=n_clusters,
         geo_weight=geo_weight,
         n_neighbors=n_neighbors,
+        min_cluster_size=min_cluster_size,
     )
     cluster_polygons = build_cluster_polygons(node_clusters)
 

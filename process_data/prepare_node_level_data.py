@@ -13,6 +13,7 @@ from process_data.process_ercot import (
     load_rt_spp_month,
     load_actual_load_month,
     extract_demand_forecast_lead_times,
+    extract_demand_forecast_day_ahead,
 )
 
 
@@ -53,7 +54,11 @@ def _hour_ending_to_int(hour_ending):
 
 
 def _load_weather_zone_load_data(months, dirs, cache_tag):
-    """Build and save weather-zone load actuals, 1h/18h forecasts, and errors."""
+    """Build and save weather-zone load actuals, 1h and day-ahead forecasts, and errors.
+
+    Day-ahead load forecast uses the ERCOT demand forecast posted closest to
+    12:00 UTC on the previous day, matching the GFS 12z cycle timing.
+    """
     actual_zone_cols = {
         'coast': 'coast',
         'east': 'east',
@@ -96,19 +101,29 @@ def _load_weather_zone_load_data(months, dirs, cache_tag):
             part = part.rename(columns={col: 'actual_load'})
             actual_parts.append(part)
 
-        forecast_df = extract_demand_forecast_lead_times(year, month, lead_hours=[1, 18]).copy()
-        forecast_df['hour'] = pd.to_datetime(forecast_df['delivery_dt']) - pd.Timedelta(hours=1)
+        # 1h-ahead demand forecast
+        fc_1h = extract_demand_forecast_lead_times(year, month, lead_hours=[1]).copy()
+        fc_1h['hour'] = pd.to_datetime(fc_1h['delivery_dt']) - pd.Timedelta(hours=1)
+        for col, zone in forecast_zone_cols.items():
+            if col not in fc_1h.columns:
+                continue
+            part = fc_1h[['hour', col]].copy()
+            part['weather_zone'] = zone
+            part['lead_label'] = '1h'
+            part = part.rename(columns={col: 'forecast_load'})
+            forecast_parts.append(part)
 
-        for lead in [1, 18]:
-            lead_df = forecast_df[forecast_df['lead_target'] == lead].copy()
-            for col, zone in forecast_zone_cols.items():
-                if col not in lead_df.columns:
-                    continue
-                part = lead_df[['hour', col]].copy()
-                part['weather_zone'] = zone
-                part['lead_hours'] = lead
-                part = part.rename(columns={col: 'forecast_load'})
-                forecast_parts.append(part)
+        # Day-ahead demand forecast (posted closest to 12:00 UTC previous day)
+        fc_dah = extract_demand_forecast_day_ahead(year, month).copy()
+        fc_dah['hour'] = pd.to_datetime(fc_dah['delivery_dt']) - pd.Timedelta(hours=1)
+        for col, zone in forecast_zone_cols.items():
+            if col not in fc_dah.columns:
+                continue
+            part = fc_dah[['hour', col]].copy()
+            part['weather_zone'] = zone
+            part['lead_label'] = 'dah'
+            part = part.rename(columns={col: 'forecast_load'})
+            forecast_parts.append(part)
 
     actual_long = pd.concat(actual_parts, ignore_index=True)
     actual_long['actual_load'] = pd.to_numeric(actual_long['actual_load'], errors='coerce')
@@ -127,18 +142,18 @@ def _load_weather_zone_load_data(months, dirs, cache_tag):
         forecast_long
         .pivot_table(
             index=['weather_zone', 'hour'],
-            columns='lead_hours',
+            columns='lead_label',
             values='forecast_load',
             aggfunc='mean',
         )
-        .rename(columns={1: 'forecast_load_1h', 18: 'forecast_load_18h'})
+        .rename(columns={'1h': 'forecast_load_1h', 'dah': 'forecast_load_dah'})
         .reset_index()
     )
 
     load_errors = actual_long.merge(forecast_wide, on=['weather_zone', 'hour'], how='left')
 
     load_errors['load_error_1h'] = load_errors['forecast_load_1h'] - load_errors['actual_load']
-    load_errors['load_error_18h'] = load_errors['forecast_load_18h'] - load_errors['actual_load']
+    load_errors['load_error_dah'] = load_errors['forecast_load_dah'] - load_errors['actual_load']
 
     out_dir = os.path.join(dirs['processed'], 'load_errors_by_weather_zone')
     os.makedirs(out_dir, exist_ok=True)
@@ -571,6 +586,16 @@ def prepare_node_level_data(
                     how='outer',
                 )
 
+        # Consolidate observed columns across models: observed_temp_1h, observed_temp_0h → observed_temp
+        # (Observed weather is identical regardless of forecast model/lead.)
+        for base in ['observed_temp', 'observed_wspd', 'observed_wdir']:
+            suffixed = [c for c in errors_wide.columns if c.startswith(base + '_')]
+            if suffixed and base not in errors_wide.columns:
+                errors_wide[base] = errors_wide[suffixed[0]]
+                for col in suffixed[1:]:
+                    errors_wide[base] = errors_wide[base].fillna(errors_wide[col])
+                errors_wide = errors_wide.drop(columns=suffixed)
+
         print(f"  After pivot: {len(errors_wide):,} station-hour rows")
 
         # Build station GeoDataFrame
@@ -691,7 +716,7 @@ def prepare_node_level_data(
             pct = 100 * n / len(node_hourly)
             print(f"  {col} non-missing: {n:,} ({pct:.1f}%)")
 
-    for col in ['forecast_load_1h', 'forecast_load_18h', 'load_error_1h', 'load_error_18h']:
+    for col in ['forecast_load_1h', 'forecast_load_dah', 'load_error_1h', 'load_error_dah']:
         if col in node_hourly.columns:
             n = node_hourly[col].notna().sum()
             pct = 100 * n / len(node_hourly)

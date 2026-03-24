@@ -645,9 +645,33 @@ build_cluster_hourly_data(
 # Validate
 uv run python -m download_data.validate_data
 
-# Analysis notebooks (run after Steps 5d and 6)
-quarto render analysis/gridded_lr.qmd
-quarto render analysis/cluster_node_lr.qmd
+# ── Analysis Pipeline (run after Steps 5d and 6) ──────────────────────────────
+
+# A1: Per-cluster heterogeneity regressions (~5-10 min)
+uv run python -m analysis.cluster_heterogeneity_lr
+# → figures/cluster_heterogeneity/{cluster_map,coef_plot_combined,hist_grid_1h,hist_grid_dah}.png
+# → tables/cluster_regression_results.csv
+
+# A2: Raw correlation heatmaps 2×2 (~5-15 min, streams all months)
+uv run python -m analysis.forecast_error_lmp_corr_heatmap
+# → figures/correlation_heatmaps/corr_heatmap_2x2.png
+
+# A3: Pixel-level regression maps 2×2 (~10-30 min, ~5k regressions)
+uv run python -m analysis.pixel_regression_maps
+# → figures/pixel_regressions/pixel_regression_2x2.png
+# → tables/pixel_regression_summary.csv
+
+# A4: Infrastructure-level regressions
+uv run python -m analysis.gridded_infrastructure_lr
+# → figures/infrastructure_regressions/{coef_plot_main,coef_plot_seasonal}.png
+# → tables/infrastructure_regression_{main,seasonal}.csv
+
+# Compile unified PDF report (requires typst CLI)
+uv run python -m analysis.create_analysis_report
+# → output/analysis_report.pdf
+
+# Or run the entire pipeline end-to-end:
+uv run python main.py
 ```
 
 ---
@@ -715,30 +739,98 @@ Reads and processes ERCOT market data:
 
 ---
 
-## Analysis Scripts & Notebooks
+## Analysis Pipeline
 
-All analysis scripts use the combined HRRR+GFS pipeline by default (`LEAD_SHORT=1` for HRRR, `LEAD_DAH=0` for GFS day-ahead). The `model=` kwarg has been removed from all pipeline calls.
-
-### `analysis/gridded_lr.qmd`
-Regression at the pixel × hour level (Step 5d data). Aggregates errors by infrastructure type per hour, then regresses on system LMP. Uses `LEAD_SHORT=1` (HRRR) and `LEAD_DAH=0` (GFS) error variables. Loads `pixel_hourly_gfs+hrrr_{year}_{mm}.parquet`.
-
-### `analysis/cluster_node_lr.qmd`
-Cluster-level regression (Step 6 data). Regresses cluster-level LMP on capacity-weighted forecast errors from both models.
-
-### `analysis/local_node_lr.qmd`
-Node-level regression (Step 5e data). Uses `LEAD_SHORT=1` (HRRR) and `LEAD_DAH=0` (GFS).
+All analysis scripts use the combined HRRR+GFS pipeline by default (`LEAD_SHORT=1` for HRRR, `LEAD_DAH=0` for GFS day-ahead). Each script saves figures to `{OneDrive}/figures/` and tables to `{repo}/tables/`. The `create_analysis_report.py` script assembles everything into `output/analysis_report.pdf`.
 
 ### `analysis/cluster_heterogeneity_lr.py`
-Per-cluster regressions showing heterogeneous treatment effects. Runs two iterations: HRRR 1h lead and GFS day-ahead lead. Outputs two PDFs compiled via Typst.
+Per-cluster regressions showing heterogeneous treatment effects (Step 6 cluster data).
 
-### `analysis/node_gnn.py`
-Graph Neural Network predicting node-level LMP from weather features. Uses transmission graph with virtual super node. `BASE_NUMERIC_COLS` includes both `temp_error_1h`/`wspd_error_1h` (HRRR) and `temp_error_0h`/`wspd_error_0h` (GFS).
+**Entry point**: `run_cluster_analysis(months, n_clusters, geo_weight, n_neighbors, force_rebuild)`
 
-### `analysis/analysis_forecast_error_eda.py`
-EDA: for each cluster, finds the hour with the largest forecast error ("treatment") and a comparable control hour. Produces LMP maps for each pair.
+**Outputs**:
+- `figures/cluster_heterogeneity/cluster_map.png`
+- `figures/cluster_heterogeneity/coef_plot_combined.png` — 2×3 grid (HRRR 1h / GFS day-ahead × temp / wind / load)
+- `figures/cluster_heterogeneity/hist_grid_1h.png` — marginal effect distributions, HRRR 1h
+- `figures/cluster_heterogeneity/hist_grid_dah.png` — marginal effect distributions, GFS day-ahead
+- `tables/cluster_regression_results.csv` — tidy coefficient table
 
 ### `analysis/forecast_error_lmp_corr_heatmap.py`
-Spatial heatmap of per-pixel Pearson correlation between forecast errors and system LMP. Loads `pixel_hourly_gfs+hrrr_{year}_{mm}.parquet`. Pass `error_col='temp_error_1h'` for HRRR or `'temp_error_0h'` for GFS day-ahead.
+Spatial heatmap of per-pixel Pearson correlation between forecast errors and system LMP spread. Streams ERA5 error NetCDFs month-by-month for memory efficiency.
+
+**Entry point**: `run_correlation_heatmaps(months, lmp_var, overlay, save_dir)` — produces 2×2 figure
+
+**Outputs**:
+- `figures/correlation_heatmaps/corr_heatmap_2x2.png` — 2×2: HRRR/GFS × temp/wind
+
+Also provides `plot_forecast_error_lmp_correlation(error_col, ...)` for single-panel standalone use.
+
+### `analysis/pixel_regression_maps.py` *(new)*
+Per-pixel OLS regressions of `system_lmp_std` on all four forecast error variables jointly, with controls (ERA5 observed weather, weekend) and absorbed FE (hour-of-day, month). Maps significant coefficients (p < 0.05) for each error variable.
+
+**Entry point**: `run_pixel_regression_maps(months, save_dir)`
+
+**Regression**: `system_lmp_std ~ temp_error_1h + wspd_error_1h + temp_error_0h + wspd_error_0h + era5_temp + era5_wspd + is_weekend | hour_of_day + month`
+
+**Outputs**:
+- `figures/pixel_regressions/pixel_regression_2x2.png` — 2×2: HRRR/GFS × temp/wind (only significant pixels colored)
+- `tables/pixel_regression_summary.csv` — `pixel_id, lat, lon, error_var, coef, std_err, pvalue, n_obs`
+
+### `analysis/gridded_infrastructure_lr.py` *(new; replaces `gridded_lr.qmd`)*
+Aggregates ERA5 forecast errors by infrastructure type (capacity-weighted per valid hour), then regresses system LMP spread on these category-level errors with cross-category interactions.
+
+**Entry point**: `run_infrastructure_analysis(months, save_dir)`
+
+**Infrastructure categories**: wind, solar, gas, battery, coal, transmission (unweighted), load_center (unweighted)
+
+**Key regression**: `system_lmp_std ~ temp_error_1h_{cat} + wspd_error_1h_{cat} + ... + temp_error_1h_load_center:wspd_error_1h_wind + ... | hour_of_day + month` (clustered SE by date)
+
+**Outputs**:
+- `figures/infrastructure_regressions/coef_plot_main.png`
+- `figures/infrastructure_regressions/coef_plot_seasonal.png` — summer / winter / shoulder
+- `tables/infrastructure_regression_main.csv`
+- `tables/infrastructure_regression_seasonal.csv`
+
+### `analysis/create_analysis_report.py` *(new)*
+Assembles all figures and tables into a unified Typst PDF report. Reads from the standard output paths; sections with missing files are gracefully skipped.
+
+**Entry point**: `create_analysis_report(output_dir)`
+
+**Output**: `output/analysis_report.pdf`
+
+**Report sections**:
+1. Introduction
+2. Raw Correlation Heatmaps (Stage 2)
+3. Pixel-Level Regression Maps (Stage 3)
+4. Infrastructure-Level Results (Stage 4) — coefficient table + seasonal plot
+5. Cluster Heterogeneity (Stage 1) — map, coefficient plot, histogram grids
+6. GNN Results (placeholder)
+7. Appendix — cluster regression table
+
+### `analysis/node_gnn.py`
+Graph Neural Network predicting node-level LMP from weather features. Uses transmission graph with virtual super node. `BASE_NUMERIC_COLS` includes both `temp_error_1h`/`wspd_error_1h` (HRRR) and `temp_error_0h`/`wspd_error_0h` (GFS). Not yet integrated into the report pipeline.
+
+### Interactive / EDA notebooks (not in pipeline)
+- `analysis/local_node_lr.qmd` — node-level regression, interactive use
+- `analysis/analysis_forecast_error_eda.py` — treatment/control LMP maps per cluster
+- `analysis/gridded_lr.qmd` — superseded by `gridded_infrastructure_lr.py`; kept for reference
+
+## Output File Manifest
+
+| Key | Path | Produced by |
+|-----|------|-------------|
+| `cluster_map` | `figures/cluster_heterogeneity/cluster_map.png` | `cluster_heterogeneity_lr.py` |
+| `coef_plot` | `figures/cluster_heterogeneity/coef_plot_combined.png` | `cluster_heterogeneity_lr.py` |
+| `hist_1h` | `figures/cluster_heterogeneity/hist_grid_1h.png` | `cluster_heterogeneity_lr.py` |
+| `hist_dah` | `figures/cluster_heterogeneity/hist_grid_dah.png` | `cluster_heterogeneity_lr.py` |
+| `cluster_table` | `tables/cluster_regression_results.csv` | `cluster_heterogeneity_lr.py` |
+| `corr_heatmap` | `figures/correlation_heatmaps/corr_heatmap_2x2.png` | `forecast_error_lmp_corr_heatmap.py` |
+| `pixel_reg_map` | `figures/pixel_regressions/pixel_regression_2x2.png` | `pixel_regression_maps.py` |
+| `pixel_table` | `tables/pixel_regression_summary.csv` | `pixel_regression_maps.py` |
+| `infra_coef` | `figures/infrastructure_regressions/coef_plot_main.png` | `gridded_infrastructure_lr.py` |
+| `infra_seasonal` | `figures/infrastructure_regressions/coef_plot_seasonal.png` | `gridded_infrastructure_lr.py` |
+| `infra_table` | `tables/infrastructure_regression_main.csv` | `gridded_infrastructure_lr.py` |
+| `report` | `output/analysis_report.pdf` | `create_analysis_report.py` |
 
 ---
 

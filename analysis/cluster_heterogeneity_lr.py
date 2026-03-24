@@ -1,7 +1,7 @@
 """
 Cluster Heterogeneity Visualizations for ERCOT LMP Analysis.
 
-Generates two PDF notes (one per lead time) each containing:
+Generates figures (one per lead time) each containing:
   1. Labeled cluster map with distinctive colors
   2. Coefficient plot for temp_error and load_error across 9 clusters
   3. 3x3 grid of coefficient-scaled histograms (temp, wspd, load error)
@@ -12,8 +12,6 @@ Usage:
 
 import os
 import sys
-import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -29,18 +27,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from helper_funcs import setup_directories
 from process_data.prepare_cluster_level_data import build_cluster_hourly_data
 
+ROOT = Path(__file__).resolve().parent.parent
+
 # ── Configuration (matches cluster_node_lr.qmd) ──────────────────────────────
 # HRRR 1h short-range + GFS day-ahead (lead=0)
 LEAD_SHORT, LEAD_DAH = 1, 0
 MONTHS = [(2025, m) for m in range(1, 9)]
 
-N_CLUSTERS = 9
-GEO_WEIGHT = 10.0
+N_CLUSTERS = 7
+GEO_WEIGHT = 2.0
 N_NEIGHBORS = 8
 
 DEPVAR = "system_lmp_std"
 FE = ["hour_of_day", "month"]
-CONTROLS = ["observed_temp", "observed_wspd", "weekday", "actual_load"]
+CONTROLS = ["weekday", "actual_load"]
+
+# Load error column to use per lead time (GFS day-ahead maps to day-ahead load forecast from 12z)
+LOAD_ERROR_COL = {LEAD_SHORT: f"load_error_{LEAD_SHORT}h", LEAD_DAH: "load_error_dah"}
 
 # 9-color qualitative palette (colorblind-friendly, distinctive)
 CLUSTER_COLORS = [
@@ -63,20 +66,17 @@ def get_cluster_color(cluster_id):
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 
-def load_all_data(force_rebuild=False):
-    """Load cluster-hour dataset via the canonical builder in prepare_cluster_level_data.
-
-    Delegates all pipeline logic (node features, clustering, station errors,
-    generation mix) to build_cluster_hourly_data(), which caches results to
-    processed_data/ so repeated runs are fast.
-    """
+def load_all_data(force_rebuild=False, n_clusters=N_CLUSTERS, geo_weight=GEO_WEIGHT, n_neighbors=N_NEIGHBORS, months=None):
+    """Load cluster-hour dataset via the canonical builder in prepare_cluster_level_data."""
+    if months is None:
+        months = MONTHS
     dirs = setup_directories()
     generators_path = os.path.join(dirs["raw"], "eia860", "texas_generators.csv")
     cluster_hourly, node_clusters, cluster_polygons, sil_score = build_cluster_hourly_data(
-        months=MONTHS,
-        n_clusters=N_CLUSTERS,
-        geo_weight=GEO_WEIGHT,
-        n_neighbors=N_NEIGHBORS,
+        months=months,
+        n_clusters=n_clusters,
+        geo_weight=geo_weight,
+        n_neighbors=n_neighbors,
         generators_path=generators_path,
         force_rebuild=force_rebuild,
     )
@@ -86,22 +86,15 @@ def load_all_data(force_rebuild=False):
 # ── Per-cluster regressions ───────────────────────────────────────────────────
 
 
-def run_cluster_regressions(cluster_hourly, leadtime):
-    """
-    Run per-cluster regressions and return a dict of results.
-
-    Returns:
-        dict mapping cluster_id -> {
-            'model': pyfixest model,
-            'tidy': tidy DataFrame,
-            'data': cleaned subset DataFrame,
-            'n_obs': int,
-        }
-    """
+def run_cluster_regressions(cluster_hourly):
+    """Run one joint regression per cluster including both HRRR 1h and GFS day-ahead."""
     treatments = [
-        f"temp_error_{leadtime}h",
-        f"wspd_error_{leadtime}h",
-        f"load_error_{leadtime}h",
+        f"temp_error_{LEAD_SHORT}h",
+        f"wspd_error_{LEAD_SHORT}h",
+        LOAD_ERROR_COL[LEAD_SHORT],
+        f"temp_error_{LEAD_DAH}h",
+        f"wspd_error_{LEAD_DAH}h",
+        LOAD_ERROR_COL[LEAD_DAH],
     ]
 
     rhs = " + ".join(treatments + CONTROLS)
@@ -129,8 +122,7 @@ def run_cluster_regressions(cluster_hourly, leadtime):
                 "data": subset_clean,
                 "n_obs": len(subset_clean),
             }
-            print(f"  Cluster {cluster_id}: {len(subset_clean):,} obs, "
-                  f"R2={m._r2:.3f}")
+            print(f"  Cluster {cluster_id}: {len(subset_clean):,} obs, R2={m._r2:.3f}")
         except Exception as e:
             print(f"  Cluster {cluster_id}: FAILED — {e}")
 
@@ -145,7 +137,6 @@ def plot_cluster_map(node_clusters, cluster_polygons, save_path):
     proj = ccrs.PlateCarree()
     fig, ax = plt.subplots(figsize=(7, 6), subplot_kw={"projection": proj})
 
-    # Texas outline
     states_shp = shpreader.natural_earth(
         resolution="10m", category="cultural", name="admin_1_states_provinces"
     )
@@ -158,7 +149,6 @@ def plot_cluster_map(node_clusters, cluster_polygons, save_path):
             break
     ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
 
-    # Cluster polygons
     if cluster_polygons is not None:
         for _, row in cluster_polygons.iterrows():
             c = get_cluster_color(row["cluster"])
@@ -169,7 +159,6 @@ def plot_cluster_map(node_clusters, cluster_polygons, save_path):
                 linewidth=1.2, zorder=3,
             )
 
-    # Scatter nodes
     for cid in sorted(node_clusters["cluster"].unique()):
         mask = node_clusters["cluster"] == cid
         ax.scatter(
@@ -180,17 +169,13 @@ def plot_cluster_map(node_clusters, cluster_polygons, save_path):
             transform=proj, zorder=5, label=f"Cluster {cid}",
         )
 
-    # Centroid labels
     centroids = node_clusters.groupby("cluster")[["lat", "lon"]].mean()
     for cid, row in centroids.iterrows():
         ax.text(
             row["lon"], row["lat"], str(cid),
             fontsize=9, fontweight="bold", ha="center", va="center",
             transform=proj, zorder=10,
-            bbox=dict(
-                boxstyle="round,pad=0.2", facecolor="white",
-                edgecolor="gray", alpha=0.8,
-            ),
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="gray", alpha=0.8),
         )
 
     ax.set_title(f"ERCOT Node Clusters (k={N_CLUSTERS})", fontsize=12)
@@ -204,69 +189,67 @@ def plot_cluster_map(node_clusters, cluster_polygons, save_path):
 # ── Figure 2: Coefficient plot ────────────────────────────────────────────────
 
 
-def plot_coef_comparison(results, leadtime, save_path):
-    """
-    Horizontal coefficient plot: temp_error, wspd_error, and load_error for each cluster.
-    Bars colored by cluster. All three panels on one row.
-    """
-    coef_names = [
-        f"temp_error_{leadtime}h",
-        f"wspd_error_{leadtime}h",
-        f"load_error_{leadtime}h",
+def plot_coef_comparison(results, save_path):
+    """Combined coefficient plot: 2 rows × 3 columns."""
+    row_specs = [
+        (LEAD_SHORT, [(f"temp_error_{LEAD_SHORT}h", "Temp Error"), (f"wspd_error_{LEAD_SHORT}h", "Wind Speed Error"), (LOAD_ERROR_COL[LEAD_SHORT], "Load Error")], f"HRRR {LEAD_SHORT}h Short-Range"),
+        (LEAD_DAH, [(f"temp_error_{LEAD_DAH}h", "Temp Error"), (f"wspd_error_{LEAD_DAH}h", "Wind Speed Error"), (LOAD_ERROR_COL[LEAD_DAH], "Load Error")], f"GFS Day-Ahead"),
     ]
-    coef_labels = ["Temp Error", "Wind Speed Error", "Load Error"]
 
     rows = []
-    for cid in sorted(results.keys()):
-        tidy = results[cid]["tidy"]
-        for coef, label in zip(coef_names, coef_labels):
-            if coef in tidy.index:
-                rows.append({
-                    "cluster": cid,
-                    "coef_name": label,
-                    "estimate": tidy.loc[coef, "Estimate"],
-                    "se": tidy.loc[coef, "Std. Error"],
-                })
+    for leadtime, specs, _ in row_specs:
+        for cid in sorted(results.keys()):
+            tidy = results[cid]["tidy"]
+            for coef, label in specs:
+                if coef in tidy.index:
+                    rows.append({
+                        "lead_row": leadtime,
+                        "cluster": cid,
+                        "coef_name": label,
+                        "estimate": tidy.loc[coef, "Estimate"],
+                        "se": tidy.loc[coef, "Std. Error"],
+                    })
 
     plot_df = pd.DataFrame(rows)
     if plot_df.empty:
         print("  No coefficients to plot — skipping coef plot.")
         return
 
-    n_coefs = len(coef_labels)
     n_clusters = len(plot_df["cluster"].unique())
+    panel_h = 0.45 * n_clusters + 1.2
 
-    fig, axes = plt.subplots(1, n_coefs, figsize=(5 * n_coefs, 0.5 * n_clusters + 1.5),
-                             sharey=True)
-    if n_coefs == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 2 * panel_h), sharey="row")
 
-    for ax, label in zip(axes, coef_labels):
-        sub = plot_df[plot_df["coef_name"] == label].sort_values("cluster")
-        y_pos = np.arange(len(sub))
-        colors = [get_cluster_color(c) for c in sub["cluster"]]
+    for row_i, (leadtime, specs, row_label) in enumerate(row_specs):
+        for col_i, (coef, label) in enumerate(specs):
+            ax = axes[row_i, col_i]
+            sub = (plot_df[(plot_df["lead_row"] == leadtime) & (plot_df["coef_name"] == label)].sort_values("cluster"))
+            if sub.empty:
+                ax.set_visible(False)
+                continue
 
-        ci_lo = sub["estimate"] - 1.96 * sub["se"]
-        ci_hi = sub["estimate"] + 1.96 * sub["se"]
+            y_pos = np.arange(len(sub))
+            colors = [get_cluster_color(c) for c in sub["cluster"]]
+            ci_lo = sub["estimate"] - 1.96 * sub["se"]
+            ci_hi = sub["estimate"] + 1.96 * sub["se"]
 
-        # CI whiskers
-        for i, (lo, hi) in enumerate(zip(ci_lo, ci_hi)):
-            ax.plot([lo, hi], [y_pos[i], y_pos[i]], color=colors[i],
-                    linewidth=2, solid_capstyle="butt")
+            for i, (lo, hi) in enumerate(zip(ci_lo, ci_hi)):
+                ax.plot([lo, hi], [y_pos[i], y_pos[i]], color=colors[i], linewidth=2, solid_capstyle="butt")
+            ax.scatter(sub["estimate"], y_pos, c=colors, s=60, edgecolors="k", linewidths=0.5, zorder=5)
+            ax.axvline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels([f"Cluster {c}" for c in sub["cluster"]])
+            ax.set_xlabel("Coefficient (95% CI)", fontsize=9)
+            ax.grid(axis="x", linestyle=":", alpha=0.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
 
-        # Point estimates
-        ax.scatter(sub["estimate"], y_pos, c=colors, s=60,
-                   edgecolors="k", linewidths=0.5, zorder=5)
-        ax.axvline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([f"Cluster {c}" for c in sub["cluster"]])
-        ax.set_xlabel("Coefficient (95% CI)")
-        ax.set_title(label, fontsize=11)
-        ax.grid(axis="x", linestyle=":", alpha=0.4)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+            if row_i == 0:
+                ax.set_title(label, fontsize=11, fontweight="bold")
+            if col_i == 0:
+                ax.set_ylabel(row_label, fontsize=10, labelpad=8)
 
-    fig.suptitle(f"Per-Cluster Coefficients — {leadtime}h Lead", fontsize=13, y=1.02)
+    fig.suptitle("Per-Cluster Coefficients — HRRR 1h (top) vs GFS Day-Ahead (bottom)", fontsize=13, y=1.01)
     plt.tight_layout()
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -277,20 +260,17 @@ def plot_coef_comparison(results, leadtime, save_path):
 
 
 def plot_scaled_histogram_grid(results, cluster_hourly, leadtime, save_path):
-    """
-    3x3 grid: one cell per cluster. Each cell has 3 stacked histograms
-    showing (variable × coefficient), i.e., the distribution of marginal effects.
-    """
+    """3x3 grid: one cell per cluster. Each cell has 3 stacked histograms."""
     var_specs = [
         (f"temp_error_{leadtime}h", "Temp Error"),
         (f"wspd_error_{leadtime}h", "Wind Speed Error"),
-        (f"load_error_{leadtime}h", "Load Error"),
+        (LOAD_ERROR_COL[leadtime], "Load Error"),
     ]
 
     cluster_ids = sorted(results.keys())
     n = len(cluster_ids)
     ncols = 3
-    nrows = (n + ncols - 1) // ncols  # ceil division
+    nrows = (n + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows))
     axes = np.atleast_2d(axes)
@@ -303,20 +283,13 @@ def plot_scaled_histogram_grid(results, cluster_hourly, leadtime, save_path):
         data = results[cid]["data"]
         color = get_cluster_color(cid)
 
-        # We'll create 3 sub-histograms within one axes using offset y-ticks
-        # Actually, stack them vertically using inset axes or just overlay
-        # Using a single axes with three vertically offset histograms
-
-        # Collect scaled values and labels
         scaled_data = []
         labels = []
         for var, label in var_specs:
             if var in tidy.index and var in data.columns:
                 coef = tidy.loc[var, "Estimate"]
                 pval = tidy.loc[var, "Pr(>|t|)"]
-                stars = ("***" if pval < 0.01 else
-                         "**"  if pval < 0.05 else
-                         "*"   if pval < 0.10 else "")
+                stars = ("***" if pval < 0.01 else "**" if pval < 0.05 else "*" if pval < 0.10 else "")
                 vals = (data[var].dropna() * coef).values
                 scaled_data.append(vals)
                 labels.append(f"{label}{stars}\n(β={coef:.4f})")
@@ -324,38 +297,25 @@ def plot_scaled_histogram_grid(results, cluster_hourly, leadtime, save_path):
                 scaled_data.append(np.array([]))
                 labels.append(f"{label}\n(N/A)")
 
-        # Line styles per variable: solid=temp, dashed=wspd, dotted=load
         linestyles = ["-", "--", ":"]
 
         all_vals = np.concatenate([d for d in scaled_data if len(d) > 0])
         if len(all_vals) == 0:
-            ax_cell.text(0.5, 0.5, "No data", transform=ax_cell.transAxes,
-                         ha="center", va="center")
-            ax_cell.set_title(f"Cluster {cid}", fontsize=10, fontweight="bold",
-                              color=color)
+            ax_cell.text(0.5, 0.5, "No data", transform=ax_cell.transAxes, ha="center", va="center")
+            ax_cell.set_title(f"Cluster {cid}", fontsize=10, fontweight="bold", color=color)
             continue
 
-        # Determine common bin edges from the pooled range
         lo, hi = np.percentile(all_vals, [1, 99])
         bins = np.linspace(lo, hi, 40)
 
         for vals, label, ls in zip(scaled_data, labels, linestyles):
             if len(vals) == 0:
                 continue
-            # Semi-transparent fill
-            ax_cell.hist(
-                vals, bins=bins, histtype="stepfilled", density=True,
-                color=color, alpha=0.35, edgecolor="none",
-            )
-            # Outline with linestyle encoding variable type
-            ax_cell.hist(
-                vals, bins=bins, histtype="step", density=True,
-                color=color, linestyle=ls, linewidth=1.5, label=label,
-            )
+            ax_cell.hist(vals, bins=bins, histtype="stepfilled", density=True, color=color, alpha=0.35, edgecolor="none")
+            ax_cell.hist(vals, bins=bins, histtype="step", density=True, color=color, linestyle=ls, linewidth=1.5, label=label)
 
         ax_cell.axvline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.6)
-        ax_cell.set_title(f"Cluster {cid}", fontsize=10, fontweight="bold",
-                          color=color)
+        ax_cell.set_title(f"Cluster {cid}", fontsize=10, fontweight="bold", color=color)
         ax_cell.legend(fontsize=6, loc="upper right", framealpha=0.8)
         ax_cell.set_xlabel("Effect on LMP Std Dev ($/MWh)", fontsize=7)
         ax_cell.set_ylabel("Density", fontsize=7)
@@ -363,14 +323,12 @@ def plot_scaled_histogram_grid(results, cluster_hourly, leadtime, save_path):
         ax_cell.spines["top"].set_visible(False)
         ax_cell.spines["right"].set_visible(False)
 
-    # Hide unused axes
     for idx in range(n, nrows * ncols):
         row_i, col_i = divmod(idx, ncols)
         axes[row_i, col_i].set_visible(False)
 
     fig.suptitle(
-        f"Distribution of Marginal Effects by Cluster — {leadtime}h Lead\n"
-        f"(variable × estimated coefficient)",
+        f"Distribution of Marginal Effects by Cluster — {leadtime}h Lead\n(variable × estimated coefficient)",
         fontsize=13, y=1.01,
     )
     plt.tight_layout()
@@ -379,141 +337,97 @@ def plot_scaled_histogram_grid(results, cluster_hourly, leadtime, save_path):
     print(f"  Saved histogram grid → {save_path}")
 
 
-# ── Typst document assembly ───────────────────────────────────────────────────
-
-
-TYPST_TEMPLATE = r"""
-#set page(paper: "us-letter", margin: 0.75in)
-#set text(font: "New Computer Modern", size: 10pt)
-
-#align(center)[
-  #text(size: 16pt, weight: "bold")[Cluster Heterogeneity — {lead}h Lead Time]
-
-  #text(size: 10pt, fill: gray)[ERCOT LMP Analysis \ Model: {model} | Clusters: {n_clusters} | Dep. Var: {depvar}]
-]
-
-#v(0.3in)
-
-== Cluster Map
-
-#figure(
-  image("{map_path}", width: 85%),
-  caption: [Geographic distribution of {n_clusters} ERCOT resource node clusters.
-  Clusters formed via agglomerative clustering with geographic connectivity constraint.],
-)
-
-#pagebreak()
-
-== Coefficient Estimates by Cluster
-
-#figure(
-  image("{coef_path}", width: 95%),
-  caption: [Per-cluster OLS estimates of temperature forecast error and load forecast error
-  on system LMP standard deviation. Error bars show 95% confidence intervals.
-  FE: hour-of-day, month. Controls: observed temp, observed wind speed, weekday, actual load.],
-)
-
-#pagebreak()
-
-== Distribution of Marginal Effects
-
-#figure(
-  image("{hist_path}", width: 100%),
-  caption: [Each panel shows one cluster. Within each panel, three density histograms
-  display the variable value multiplied by its estimated coefficient, yielding
-  the distribution of marginal effects on system LMP std dev. Variables: temperature
-  forecast error, wind speed forecast error, load forecast error.],
-)
-"""
-
-
-def compile_typst_pdf(lead, model, n_clusters, depvar,
-                      map_path, coef_path, hist_path, output_pdf):
-    """Write a typst source file and compile it to PDF."""
-    # Typst resolves image paths relative to the .typ file location,
-    # so convert absolute paths to relative paths from the output directory.
-    out_dir = os.path.dirname(output_pdf)
-    content = TYPST_TEMPLATE.format(
-        lead=lead,
-        model=model.upper(),
-        n_clusters=n_clusters,
-        depvar=depvar,
-        map_path=os.path.relpath(map_path, out_dir),
-        coef_path=os.path.relpath(coef_path, out_dir),
-        hist_path=os.path.relpath(hist_path, out_dir),
-    )
-
-    typst_src = output_pdf.replace(".pdf", ".typ")
-    with open(typst_src, "w") as f:
-        f.write(content)
-
-    result = subprocess.run(
-        ["typst", "compile", typst_src, output_pdf],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  typst compile FAILED:\n{result.stderr}")
-        return False
-    else:
-        print(f"  Compiled PDF → {output_pdf}")
-        # Clean up .typ source
-        os.remove(typst_src)
-        return True
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
-def main():
-    dirs, node_clusters, sil_score, cluster_polygons, cluster_hourly = load_all_data()
+def run_cluster_analysis(
+    months=None,
+    n_clusters=N_CLUSTERS,
+    geo_weight=GEO_WEIGHT,
+    n_neighbors=N_NEIGHBORS,
+    force_rebuild=False,
+):
+    if months is None:
+        months = MONTHS
+
+    dirs, node_clusters, sil_score, cluster_polygons, cluster_hourly = load_all_data(
+        force_rebuild=force_rebuild,
+        n_clusters=n_clusters,
+        geo_weight=geo_weight,
+        n_neighbors=n_neighbors,
+        months=months,
+    )
 
     out_dir = os.path.join(dirs["figures"], "cluster_heterogeneity")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Cluster map (shared across both lead times)
     map_path = os.path.join(out_dir, "cluster_map.png")
     print("\nGenerating cluster map...")
     plot_cluster_map(node_clusters, cluster_polygons, map_path)
 
-    for leadtime, lead_label in [(LEAD_SHORT, "hrrr_1h"), (LEAD_DAH, "gfs_dah")]:
-        print(f"\n{'='*60}")
-        print(f"Processing {lead_label} lead ({leadtime}h)")
-        print(f"{'='*60}")
+    print("\nRunning per-cluster regressions (joint HRRR 1h + GFS day-ahead)...")
+    results = run_cluster_regressions(cluster_hourly)
 
-        # Run per-cluster regressions
-        print("\nRunning per-cluster regressions...")
-        results = run_cluster_regressions(cluster_hourly, leadtime)
+    if not results:
+        print("No successful regressions — exiting.")
+        return {}
 
-        if not results:
-            print(f"  No successful regressions for {leadtime}h — skipping.")
-            continue
+    coef_path = os.path.join(out_dir, "coef_plot_combined.png")
+    print("\nGenerating combined coefficient plot...")
+    plot_coef_comparison(results, coef_path)
 
-        # Coefficient plot
-        coef_path = os.path.join(out_dir, f"coef_plot_{leadtime}h.png")
-        print("\nGenerating coefficient plot...")
-        plot_coef_comparison(results, leadtime, coef_path)
+    hist_short_path = os.path.join(out_dir, "hist_grid_1h.png")
+    hist_dah_path   = os.path.join(out_dir, "hist_grid_dah.png")
+    print("\nGenerating HRRR 1h histogram grid...")
+    plot_scaled_histogram_grid(results, cluster_hourly, LEAD_SHORT, hist_short_path)
+    print("\nGenerating GFS day-ahead histogram grid...")
+    plot_scaled_histogram_grid(results, cluster_hourly, LEAD_DAH, hist_dah_path)
 
-        # 3x3 histogram grid
-        hist_path = os.path.join(out_dir, f"hist_grid_{leadtime}h.png")
-        print("\nGenerating histogram grid...")
-        plot_scaled_histogram_grid(results, cluster_hourly, leadtime, hist_path)
+    # Export regression results to CSV
+    tables_dir = ROOT / "tables"
+    os.makedirs(tables_dir, exist_ok=True)
+    table_path = tables_dir / "cluster_regression_results.csv"
 
-        # Compile typst PDF
-        pdf_path = os.path.join(out_dir, f"cluster_heterogeneity_{leadtime}h.pdf")
-        print("\nCompiling typst PDF...")
-        compile_typst_pdf(
-            lead=leadtime,
-            model="HRRR+GFS",
-            n_clusters=N_CLUSTERS,
-            depvar=DEPVAR,
-            map_path=map_path,
-            coef_path=coef_path,
-            hist_path=hist_path,
-            output_pdf=pdf_path,
-        )
+    csv_rows = []
+    for cluster_id, res in results.items():
+        tidy = res["tidy"]
+        n_obs = res["n_obs"]
+        for variable in tidy.index:
+            estimate = tidy.loc[variable, "Estimate"]
+            se = tidy.loc[variable, "Std. Error"]
+            t_stat = tidy.loc[variable, "t value"]
+            p_value = tidy.loc[variable, "Pr(>|t|)"]
+            ci_lower = estimate - 1.96 * se
+            ci_upper = estimate + 1.96 * se
+            csv_rows.append({
+                "cluster": cluster_id,
+                "variable": variable,
+                "coefficient": estimate,
+                "std_error": se,
+                "t_stat": t_stat,
+                "p_value": p_value,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
+                "n_obs": n_obs,
+            })
+
+    csv_df = pd.DataFrame(csv_rows, columns=[
+        "cluster", "variable", "coefficient", "std_error",
+        "t_stat", "p_value", "ci_lower", "ci_upper", "n_obs",
+    ])
+    csv_df.to_csv(table_path, index=False)
+    print(f"\n  Saved regression results CSV → {table_path}")
 
     print(f"\nDone! Output in {out_dir}/")
 
+    return {
+        "cluster_map": map_path,
+        "coef_plot": coef_path,
+        "hist_1h": hist_short_path,
+        "hist_dah": hist_dah_path,
+        "cluster_table": str(table_path),
+    }
+
 
 if __name__ == "__main__":
-    main()
+    run_cluster_analysis()

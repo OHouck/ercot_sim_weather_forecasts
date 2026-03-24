@@ -232,6 +232,70 @@ def extract_demand_forecast_lead_times(year, month, lead_hours=None):
     return result
 
 
+def extract_demand_forecast_day_ahead(year, month):
+    """Extract day-ahead demand forecast matching GFS 12z cycle timing.
+
+    For each delivery hour, finds the ERCOT demand forecast posted closest to
+    12:00 UTC on the previous day — the same time the GFS 12z cycle initiates.
+
+    Since ERCOT timestamps are tz-naive US/Central, we compute the Central-time
+    equivalent of 12:00 UTC for each date (06:00 CST or 07:00 CDT) using
+    ``zoneinfo``.
+
+    Returns:
+        DataFrame with the same columns as ``extract_demand_forecast_lead_times``
+        but with ``lead_target='dah'``.
+    """
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    df = load_demand_forecasts_month(year, month)
+
+    df['posted_dt'] = pd.to_datetime(df['postedDatetime'])
+    df['delivery_dt'] = pd.to_datetime(df.apply(_parse_delivery_datetime, axis=1))
+
+    # Filter out backcasts (negative lead times)
+    df['lead_h'] = (df['delivery_dt'] - df['posted_dt']).dt.total_seconds() / 3600
+    df = df[df['lead_h'] > 0].copy()
+
+    # For each unique delivery date (Central), compute 12:00 UTC in Central time.
+    central_tz = ZoneInfo('US/Central')
+    utc_tz = dt.timezone.utc
+    delivery_dates = df['delivery_dt'].dt.normalize().unique()
+    noon_utc_central = {}
+    for d in delivery_dates:
+        prev_day = d - pd.Timedelta(days=1)
+        noon_utc = dt.datetime(prev_day.year, prev_day.month, prev_day.day,
+                               12, 0, tzinfo=utc_tz)
+        noon_central_aware = noon_utc.astimezone(central_tz)
+        noon_utc_central[d] = pd.Timestamp(noon_central_aware.replace(tzinfo=None))
+
+    df['target_posted'] = df['delivery_dt'].dt.normalize().map(noon_utc_central)
+    df['time_diff_h'] = (df['posted_dt'] - df['target_posted']).dt.total_seconds().abs() / 3600
+
+    # For each delivery_dt, select the forecast posted closest to target
+    idx = df.groupby('delivery_dt')['time_diff_h'].idxmin()
+    selected = df.loc[idx].copy()
+    selected['lead_target'] = 'dah'
+    selected['lead_actual'] = selected['lead_h']
+
+    output_cols = [
+        'deliveryDate', 'hourEnding', 'delivery_dt', 'lead_target', 'lead_actual',
+        'postedDatetime', 'model', 'systemTotal',
+        'coast', 'east', 'farWest', 'north', 'northCentral',
+        'southCentral', 'southern', 'west',
+    ]
+    selected = selected[[c for c in output_cols if c in selected.columns]]
+    selected = selected.sort_values('delivery_dt').reset_index(drop=True)
+
+    actual_leads = selected['lead_actual']
+    print(f"Day-ahead (12z): {len(selected)} hours, "
+          f"actual lead mean={actual_leads.mean():.1f}h, "
+          f"range=[{actual_leads.min():.1f}, {actual_leads.max():.1f}]")
+
+    return selected
+
+
 def _clean_substation_name(sub):
     """Strip common ERCOT substation suffixes for name matching."""
     s = sub.replace('_', '')

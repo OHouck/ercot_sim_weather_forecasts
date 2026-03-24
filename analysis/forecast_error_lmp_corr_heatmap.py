@@ -288,7 +288,167 @@ def _load_generation_map_df(dirs: dict) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Main plotting function
+# Private single-panel plotting helper
+# ---------------------------------------------------------------------------
+
+def _plot_single_correlation_panel(
+    ax,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    r_2d: np.ndarray,
+    error_col: str,
+    lmp_var: str,
+    dirs: dict,
+    overlay: list,
+    clim_shared: float = None,
+) -> tuple:
+    """
+    Draw a single correlation heatmap panel onto an existing GeoAxes.
+
+    Parameters
+    ----------
+    ax : cartopy GeoAxes
+        The axes to draw onto.
+    lats, lons : ndarray
+        1-D coordinate arrays (already from ERA5 grid).
+    r_2d : ndarray (n_lat, n_lon)
+        Pre-computed Pearson r, already masked to Texas (NaN outside).
+    error_col : str
+        Error column name used only for colorbar / title labels.
+    lmp_var : str
+        LMP variable name used only for labels.
+    dirs : dict
+        Output of setup_directories().
+    overlay : list of str
+        Infrastructure overlay keys (same as in plot_forecast_error_lmp_correlation).
+    clim_shared : float, optional
+        Shared symmetric colormap limit.  If None, computes from r_2d.
+
+    Returns
+    -------
+    mesh : QuadMesh
+        The pcolormesh artist (used by caller for a shared colorbar).
+    legend_handles : list
+        Matplotlib legend handle objects for the overlays drawn.
+    """
+    proj = ccrs.PlateCarree()
+
+    # Texas state outline
+    states_shp = shpreader.natural_earth(
+        resolution='10m', category='cultural', name='admin_1_states_provinces'
+    )
+    for record in shpreader.Reader(states_shp).records():
+        if record.attributes.get('name') == 'Texas':
+            ax.add_geometries(
+                [record.geometry], proj,
+                facecolor='white', edgecolor='black', linewidth=1.0, zorder=1,
+            )
+            break
+
+    ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
+    ax.set_facecolor('#cce5f0')  # ocean background
+
+    # Colormap limits
+    valid_corrs = r_2d[~np.isnan(r_2d)]
+    if clim_shared is not None:
+        clim = clim_shared
+    else:
+        clim = float(np.nanpercentile(np.abs(valid_corrs), 95))
+        clim = max(clim, 0.05)
+
+    # Correlation filled grid
+    mesh = ax.pcolormesh(
+        lons, lats, r_2d,
+        cmap='RdBu_r', vmin=-clim, vmax=clim,
+        shading='nearest',
+        transform=proj, zorder=3,
+        rasterized=True,
+    )
+
+    # ── Overlays ──
+    legend_handles = []
+
+    # Generation / load center overlays
+    gen_overlay = [o for o in overlay if o != 'transmission']
+    if gen_overlay:
+        gen_df = _load_generation_map_df(dirs)
+
+        for item in gen_overlay:
+            cfg = _OVERLAY_CONFIG.get(item)
+            if cfg is None:
+                print(f"  Unknown overlay '{item}', skipping. "
+                      "Valid: wind, solar, gas, batteries, coal, load_center, transmission")
+                continue
+
+            col = cfg['col']
+            if col not in gen_df.columns:
+                print(f"  Column '{col}' not in generation map, skipping '{item}'")
+                continue
+
+            if cfg['mode'] == 'gt0':
+                subset = gen_df[gen_df[col].fillna(0) > 0]
+            else:  # 'eq1'
+                subset = gen_df[gen_df[col] == 1]
+
+            if len(subset) == 0:
+                print(f"  No pixels for overlay '{item}', skipping")
+                continue
+
+            ax.scatter(
+                subset['longitude'], subset['latitude'],
+                marker=cfg['marker'],
+                s=cfg['size'],
+                facecolors='none',
+                edgecolors=cfg['color'],
+                linewidths=0.9,
+                transform=proj, zorder=6,
+            )
+            legend_handles.append(
+                mlines.Line2D(
+                    [], [],
+                    color=cfg['color'],
+                    marker=cfg['marker'],
+                    linestyle='None',
+                    markersize=6,
+                    markerfacecolor='none',
+                    markeredgewidth=0.9,
+                    label=cfg['label'],
+                )
+            )
+            print(f"  Overlay '{item}': {len(subset):,} pixels")
+
+    # Transmission line overlay
+    if 'transmission' in overlay:
+        tx_shp = os.path.join(Path(__file__).parent.parent, 'data', 'Line_Output.shp')
+        if os.path.exists(tx_shp):
+            tx_lines = gpd.read_file(tx_shp).to_crs(epsg=4326)
+            for geom in tx_lines.geometry:
+                if geom is None:
+                    continue
+                if geom.geom_type == 'LineString':
+                    xs, ys = geom.xy
+                    ax.plot(list(xs), list(ys), color='dimgray', linewidth=0.5,
+                            alpha=0.55, transform=proj, zorder=5)
+                elif geom.geom_type == 'MultiLineString':
+                    for line in geom.geoms:
+                        xs, ys = line.xy
+                        ax.plot(list(xs), list(ys), color='dimgray', linewidth=0.5,
+                                alpha=0.55, transform=proj, zorder=5)
+            legend_handles.append(
+                mlines.Line2D([], [], color='dimgray', linewidth=1.2,
+                              label='Transmission lines')
+            )
+            print(f"  Overlay 'transmission': {len(tx_lines)} line features")
+        else:
+            print(f"  Transmission shapefile not found at {tx_shp}, skipping")
+
+    ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
+
+    return mesh, legend_handles
+
+
+# ---------------------------------------------------------------------------
+# Main plotting function (single-panel, unchanged)
 # ---------------------------------------------------------------------------
 
 def plot_forecast_error_lmp_correlation(
@@ -497,17 +657,172 @@ def plot_forecast_error_lmp_correlation(
 
 
 # ---------------------------------------------------------------------------
+# 2×2 multi-panel correlation heatmap
+# ---------------------------------------------------------------------------
+
+def run_correlation_heatmaps(
+    months: list,
+    lmp_var: str = 'system_lmp_std',
+    overlay: list = None,
+    save_dir: str = None,
+) -> str:
+    """
+    Produce a 2×2 figure showing per-pixel Pearson r between forecast errors
+    (HRRR 1h and GFS day-ahead, for temperature and wind speed) and a system
+    LMP variable.
+
+    Parameters
+    ----------
+    months : list of (int, int)
+        List of (year, month) tuples, e.g. [(2025, m) for m in range(1, 13)].
+    lmp_var : str
+        System LMP column: 'system_lmp_std', 'system_lmp_max', 'system_lmp_mean'.
+    overlay : list of str, optional
+        Infrastructure overlays for each panel.  Defaults to ['wind', 'solar', 'gas'].
+    save_dir : str, optional
+        Directory for the output PNG.  Defaults to
+        {dirs['figures']}/correlation_heatmaps/.
+
+    Returns
+    -------
+    save_path : str
+        Absolute path of the saved PNG file.
+    """
+    dirs = setup_directories()
+    overlay = list(overlay) if overlay is not None else ['wind', 'solar', 'gas']
+
+    if save_dir is None:
+        save_dir = os.path.join(dirs['figures'], 'correlation_heatmaps')
+    os.makedirs(save_dir, exist_ok=True)
+
+    panels = [
+        ('temp_error_1h', 'hrrr', 'HRRR 1h — Temperature Error'),
+        ('wspd_error_1h', 'hrrr', 'HRRR 1h — Wind Speed Error'),
+        ('temp_error_0h', 'gfs',  'GFS Day-Ahead — Temperature Error'),
+        ('wspd_error_0h', 'gfs',  'GFS Day-Ahead — Wind Speed Error'),
+    ]
+
+    # ── Compute correlations and masks for all 4 panels ──
+    panel_data = []
+    abs_p95_values = []
+
+    for error_col, model, title in panels:
+        var_name, lead_h = _parse_error_col(error_col)
+        print(f"\nComputing corr({error_col}, {lmp_var}) [{model.upper()}] ...")
+        lats, lons, r_raw = _compute_pixel_correlations(
+            months, model, var_name, lead_h, lmp_var, dirs
+        )
+        print("Building Texas pixel mask ...")
+        texas_mask = _build_texas_mask(lats, lons)
+        r_2d = np.where(texas_mask, r_raw, np.nan)
+
+        valid_corrs = r_2d[~np.isnan(r_2d)]
+        p95 = float(np.nanpercentile(np.abs(valid_corrs), 95)) if len(valid_corrs) else 0.0
+        abs_p95_values.append(p95)
+        panel_data.append((lats, lons, r_2d, error_col, title))
+        print(f"  {len(valid_corrs):,} Texas pixels, 95th pct |r| = {p95:.3f}")
+
+    # Shared colormap limit: max of per-panel 95th percentiles
+    clim_shared = max(abs_p95_values)
+    clim_shared = max(clim_shared, 0.05)
+    print(f"\nShared colormap limits: ±{clim_shared:.3f}")
+
+    # ── Build 2×2 figure ──
+    proj = ccrs.PlateCarree()
+    fig, axes = plt.subplots(
+        2, 2, figsize=(18, 14),
+        subplot_kw={'projection': proj},
+        gridspec_kw={'hspace': 0.15, 'wspace': 0.05},
+    )
+
+    last_mesh = None
+    all_legend_handles = []
+
+    for idx, (ax, (lats, lons, r_2d, error_col, title)) in enumerate(
+        zip(axes.ravel(), panel_data)
+    ):
+        print(f"\nRendering panel: {title}")
+        mesh, legend_handles = _plot_single_correlation_panel(
+            ax=ax,
+            lats=lats,
+            lons=lons,
+            r_2d=r_2d,
+            error_col=error_col,
+            lmp_var=lmp_var,
+            dirs=dirs,
+            overlay=overlay,
+            clim_shared=clim_shared,
+        )
+        last_mesh = mesh
+        # Collect unique legend handles (by label) from the first panel only
+        # to avoid duplication in the shared legend
+        if idx == 0:
+            all_legend_handles = legend_handles
+
+        # Column titles (top row only)
+        if idx == 0:
+            ax.set_title('Temperature Error', fontsize=12, pad=6)
+        elif idx == 1:
+            ax.set_title('Wind Speed Error', fontsize=12, pad=6)
+        else:
+            ax.set_title('')
+
+    # Row labels via fig.text (left side, vertically centred per row)
+    fig.text(
+        0.01, 0.74, 'HRRR 1h Short-Range',
+        va='center', ha='left', fontsize=13, fontweight='bold', rotation=90,
+    )
+    fig.text(
+        0.01, 0.30, 'GFS Day-Ahead',
+        va='center', ha='left', fontsize=13, fontweight='bold', rotation=90,
+    )
+
+    # Shared figure title
+    fig.suptitle(
+        f'Per-pixel correlation: Forecast Error vs. LMP Spread ({lmp_var})',
+        fontsize=15, y=0.98,
+    )
+
+    # Shared colorbar spanning all 4 axes
+    cbar = fig.colorbar(
+        last_mesh,
+        ax=axes.ravel().tolist(),
+        orientation='vertical',
+        shrink=0.55,
+        pad=0.02,
+        aspect=30,
+    )
+    cbar.set_label(f'Pearson r  (forecast error, {lmp_var})', fontsize=11)
+
+    # Shared legend (from first panel's overlay handles)
+    if all_legend_handles:
+        fig.legend(
+            handles=all_legend_handles,
+            loc='lower center',
+            ncol=len(all_legend_handles),
+            fontsize=9,
+            framealpha=0.85,
+            bbox_to_anchor=(0.45, 0.01),
+        )
+
+    # ── Save ──
+    save_path = os.path.join(save_dir, 'corr_heatmap_2x2.png')
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved 2×2 correlation heatmap to {save_path}")
+
+    return save_path
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    _dirs = setup_directories()
     _months = [(2025, m) for m in range(1, 13)]
 
-    _fig, _ax = plot_forecast_error_lmp_correlation(
-        error_col='temp_error_1h',   # or 'temp_error_0h' for GFS day-ahead
-        lmp_var='system_lmp_std',
+    _save_path = run_correlation_heatmaps(
         months=_months,
+        lmp_var='system_lmp_std',
         overlay=['wind', 'solar', 'gas'],
     )
     plt.show()
