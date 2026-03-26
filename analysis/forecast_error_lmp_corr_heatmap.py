@@ -218,7 +218,7 @@ _OVERLAY_CONFIG = {
         'marker': 's',
         'color':  'dodgerblue',
         'label':  'Wind generation',
-        'size':   22,
+        'size':   9,
     },
     'solar': {
         'col':    'nameplate_mw_tech_solar_photovoltaic',
@@ -226,7 +226,7 @@ _OVERLAY_CONFIG = {
         'marker': '^',
         'color':  'gold',
         'label':  'Solar generation',
-        'size':   22,
+        'size':   9,
     },
     'gas': {
         'col':    '_gas_total',
@@ -234,7 +234,7 @@ _OVERLAY_CONFIG = {
         'marker': 'D',
         'color':  'darkorange',
         'label':  'Gas generation',
-        'size':   20,
+        'size':   8,
     },
     'batteries': {
         'col':    '_bat_total',
@@ -242,7 +242,7 @@ _OVERLAY_CONFIG = {
         'marker': 'P',
         'color':  'limegreen',
         'label':  'Battery storage',
-        'size':   20,
+        'size':   8,
     },
     'coal': {
         'col':    '_coal_total',
@@ -250,7 +250,7 @@ _OVERLAY_CONFIG = {
         'marker': 'X',
         'color':  'saddlebrown',
         'label':  'Coal generation',
-        'size':   20,
+        'size':   8,
     },
     'load_center': {
         'col':    'load_center',
@@ -258,7 +258,7 @@ _OVERLAY_CONFIG = {
         'marker': 'v',
         'color':  'red',
         'label':  'Load center',
-        'size':   24,
+        'size':   9,
     },
 }
 
@@ -419,7 +419,7 @@ def _plot_single_correlation_panel(
 
     # Transmission line overlay
     if 'transmission' in overlay:
-        tx_shp = os.path.join(Path(__file__).parent.parent, 'data', 'Line_Output.shp')
+        tx_shp = os.path.join(dirs['root'], 'Texas_GIS_Data', 'Line', 'Line_Output.shp')
         if os.path.exists(tx_shp):
             tx_lines = gpd.read_file(tx_shp).to_crs(epsg=4326)
             for geom in tx_lines.geometry:
@@ -445,215 +445,6 @@ def _plot_single_correlation_panel(
     ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     return mesh, legend_handles
-
-
-# ---------------------------------------------------------------------------
-# Main plotting function (single-panel, unchanged)
-# ---------------------------------------------------------------------------
-
-def plot_forecast_error_lmp_correlation(
-    error_col: str,
-    lmp_var: str,
-    months: list,
-    model: str = 'hrrr',
-    overlay: list = None,
-    save_dir: str = None,
-    save_file: str = None,
-) -> tuple:
-    """
-    Plot a Texas map of per-pixel Pearson r between a forecast error and system LMP.
-
-    Parameters
-    ----------
-    error_col : str
-        Forecast error column in pixel_hourly notation, e.g. 'wspd_error_1h',
-        'temp_error_18h'.  The variable name and lead time are parsed automatically.
-    lmp_var : str
-        System LMP outcome variable: 'system_lmp_std', 'system_lmp_max', or
-        'system_lmp_mean'.
-    months : list of (int, int)
-        List of (year, month) tuples to include, e.g. [(2025, m) for m in range(1, 13)].
-    model : str
-        Forecast model used for the ERA5 error NetCDF (ERA5 errors are stored
-        per model).  Default 'hrrr'.  Pixel-hourly parquet always uses the
-        combined gfs+hrrr filename.
-    overlay : list of str, optional
-        Infrastructure objects to draw on top of the correlation map.
-        Supported values: 'wind', 'solar', 'gas', 'batteries', 'coal',
-        'load_center', 'transmission'.
-    save_dir : str, optional
-        Directory in which to save the figure.  Created if it does not exist.
-    save_file : str, optional
-        Filename for the saved figure (e.g. 'my_map.png').  If save_dir is
-        provided but save_file is not, a name is generated automatically.
-
-    Returns
-    -------
-    fig, ax : matplotlib Figure and GeoAxes
-    """
-    dirs = setup_directories()
-    overlay = list(overlay) if overlay else []
-
-    var_name, lead_h = _parse_error_col(error_col)
-    print(f"\nComputing corr({error_col}, {lmp_var}) over {len(months)} months ...")
-
-    lats, lons, r_2d = _compute_pixel_correlations(
-        months, model, var_name, lead_h, lmp_var, dirs
-    )
-
-    # Mask to Texas boundary — NaN outside Texas speeds up rendering
-    # and keeps surrounding states/ocean from showing correlation colours.
-    print("Building Texas pixel mask ...")
-    texas_mask = _build_texas_mask(lats, lons)
-    r_2d = np.where(texas_mask, r_2d, np.nan)
-
-    valid_corrs = r_2d[~np.isnan(r_2d)]
-    print(f"\nCorrelation summary ({len(valid_corrs):,} pixels inside Texas):")
-    print(pd.Series(valid_corrs).describe().round(3).to_string())
-
-    clim = float(np.nanpercentile(np.abs(valid_corrs), 95))
-    clim = max(clim, 0.05)
-    print(f"Colormap limits: ±{clim:.3f}")
-
-    # ── Build map ──
-    proj = ccrs.PlateCarree()
-    fig, ax = plt.subplots(figsize=(13, 11), subplot_kw={'projection': proj})
-
-    # Texas state outline
-    states_shp = shpreader.natural_earth(
-        resolution='10m', category='cultural', name='admin_1_states_provinces'
-    )
-    for record in shpreader.Reader(states_shp).records():
-        if record.attributes.get('name') == 'Texas':
-            ax.add_geometries(
-                [record.geometry], proj,
-                facecolor='white', edgecolor='black', linewidth=1.0, zorder=1,
-            )
-            break
-
-    ax.set_extent([-107.5, -93.0, 25.5, 37.0], crs=proj)
-    ax.set_facecolor('#cce5f0')  # ocean background
-
-    # Correlation filled grid — each 0.1° ERA5 cell fully coloured.
-    # pcolormesh with shading='nearest' centres each cell on its lat/lon
-    # coordinate.  NaN cells (outside Texas or missing data) are transparent.
-    mesh = ax.pcolormesh(
-        lons, lats, r_2d,
-        cmap='RdBu_r', vmin=-clim, vmax=clim,
-        shading='nearest',
-        transform=proj, zorder=3,
-        rasterized=True,
-    )
-    cbar = plt.colorbar(mesh, ax=ax, shrink=0.60, pad=0.02)
-    cbar.set_label(f'Pearson r  ({error_col}, {lmp_var})', fontsize=10)
-
-    # ── Overlays ──
-    legend_handles = []
-
-    # Generation / load center overlays
-    gen_overlay = [o for o in overlay if o != 'transmission']
-    if gen_overlay:
-        gen_df = _load_generation_map_df(dirs)
-
-        for item in gen_overlay:
-            cfg = _OVERLAY_CONFIG.get(item)
-            if cfg is None:
-                print(f"  Unknown overlay '{item}', skipping. "
-                      "Valid: wind, solar, gas, batteries, coal, load_center, transmission")
-                continue
-
-            col = cfg['col']
-            if col not in gen_df.columns:
-                print(f"  Column '{col}' not in generation map, skipping '{item}'")
-                continue
-
-            if cfg['mode'] == 'gt0':
-                subset = gen_df[gen_df[col].fillna(0) > 0]
-            else:  # 'eq1'
-                subset = gen_df[gen_df[col] == 1]
-
-            if len(subset) == 0:
-                print(f"  No pixels for overlay '{item}', skipping")
-                continue
-
-            ax.scatter(
-                subset['longitude'], subset['latitude'],
-                marker=cfg['marker'],
-                s=cfg['size'],
-                facecolors='none',
-                edgecolors=cfg['color'],
-                linewidths=0.9,
-                transform=proj, zorder=6,
-            )
-            legend_handles.append(
-                mlines.Line2D(
-                    [], [],
-                    color=cfg['color'],
-                    marker=cfg['marker'],
-                    linestyle='None',
-                    markersize=6,
-                    markerfacecolor='none',
-                    markeredgewidth=0.9,
-                    label=cfg['label'],
-                )
-            )
-            print(f"  Overlay '{item}': {len(subset):,} pixels")
-
-    # Transmission line overlay
-    if 'transmission' in overlay:
-        tx_shp = os.path.join(Path(__file__).parent.parent, 'data', 'Line_Output.shp')
-        if os.path.exists(tx_shp):
-            tx_lines = gpd.read_file(tx_shp).to_crs(epsg=4326)
-            for geom in tx_lines.geometry:
-                if geom is None:
-                    continue
-                if geom.geom_type == 'LineString':
-                    xs, ys = geom.xy
-                    ax.plot(list(xs), list(ys), color='dimgray', linewidth=0.5,
-                            alpha=0.55, transform=proj, zorder=5)
-                elif geom.geom_type == 'MultiLineString':
-                    for line in geom.geoms:
-                        xs, ys = line.xy
-                        ax.plot(list(xs), list(ys), color='dimgray', linewidth=0.5,
-                                alpha=0.55, transform=proj, zorder=5)
-            legend_handles.append(
-                mlines.Line2D([], [], color='dimgray', linewidth=1.2,
-                              label='Transmission lines')
-            )
-            print(f"  Overlay 'transmission': {len(tx_lines)} line features")
-        else:
-            print(f"  Transmission shapefile not found at {tx_shp}, skipping")
-
-    # Title & legend
-    year_lo = min(y for y, _ in months)
-    year_hi = max(y for y, _ in months)
-    month_lo = min(mo for _, mo in months)
-    month_hi = max(mo for _, mo in months)
-    yr_str = str(year_lo) if year_lo == year_hi else f"{year_lo}–{year_hi}"
-    ax.set_title(
-        f"Per-pixel  corr({error_col},  {lmp_var})\n"
-        f"{yr_str}  months {month_lo}–{month_hi}  |  {model.upper()}  |  "
-        f"{len(valid_corrs):,} Texas pixels",
-        fontsize=11,
-    )
-
-    if legend_handles:
-        ax.legend(handles=legend_handles, loc='lower left', fontsize=8,
-                  framealpha=0.85)
-
-    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-    plt.tight_layout()
-
-    # ── Save ──
-    if save_dir is not None or save_file is not None:
-        fname = save_file or f'corr_{error_col}_{lmp_var}_{model}.png'
-        if save_dir is not None:
-            os.makedirs(save_dir, exist_ok=True)
-            fname = os.path.join(save_dir, fname)
-        fig.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved figure to {fname}")
-
-    return fig, ax
 
 
 # ---------------------------------------------------------------------------

@@ -9,12 +9,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
-from process_data.process_ercot import (
-    load_rt_spp_month,
-    load_actual_load_month,
-    extract_demand_forecast_lead_times,
-    extract_demand_forecast_day_ahead,
-)
+from process_data.process_ercot import load_rt_spp_month
 
 
 DEFAULT_WEATHER_ZONE_SHP = (
@@ -54,114 +49,16 @@ def _hour_ending_to_int(hour_ending):
 
 
 def _load_weather_zone_load_data(months, dirs, cache_tag):
-    """Build and save weather-zone load actuals, 1h and day-ahead forecasts, and errors.
+    """Build weather-zone load actuals, forecasts, and errors.
 
-    Day-ahead load forecast uses the ERCOT demand forecast posted closest to
-    12:00 UTC on the previous day, matching the GFS 12z cycle timing.
+    Delegates to process_data.calculate_load_error.build_load_snapshot() for
+    the actual computation. Returns a DataFrame with columns:
+        weather_zone, hour, actual_load,
+        forecast_load_1h, load_error_1h,
+        forecast_load_dam, load_error_dam
     """
-    actual_zone_cols = {
-        'coast': 'coast',
-        'east': 'east',
-        'farWest': 'far_west',
-        'north': 'north',
-        'northC': 'north_central',
-        'southC': 'south_central',
-        'southern': 'south',
-        'west': 'west',
-    }
-    forecast_zone_cols = {
-        'coast': 'coast',
-        'east': 'east',
-        'farWest': 'far_west',
-        'north': 'north',
-        'northCentral': 'north_central',
-        'southCentral': 'south_central',
-        'southern': 'south',
-        'west': 'west',
-    }
-
-    actual_parts = []
-    forecast_parts = []
-
-    for year, month in months:
-        actual_df = load_actual_load_month(year, month).copy()
-        actual_df['operatingDay'] = pd.to_datetime(actual_df['operatingDay'])
-        actual_df['hourEndingNum'] = _hour_ending_to_int(actual_df['hourEnding'])
-        actual_df = actual_df.dropna(subset=['hourEndingNum'])
-        actual_df['hour'] = actual_df['operatingDay'] + pd.to_timedelta(
-            actual_df['hourEndingNum'] - 1,
-            unit='h',
-        )
-
-        for col, zone in actual_zone_cols.items():
-            if col not in actual_df.columns:
-                continue
-            part = actual_df[['hour', col]].copy()
-            part['weather_zone'] = zone
-            part = part.rename(columns={col: 'actual_load'})
-            actual_parts.append(part)
-
-        # 1h-ahead demand forecast
-        fc_1h = extract_demand_forecast_lead_times(year, month, lead_hours=[1]).copy()
-        fc_1h['hour'] = pd.to_datetime(fc_1h['delivery_dt']) - pd.Timedelta(hours=1)
-        for col, zone in forecast_zone_cols.items():
-            if col not in fc_1h.columns:
-                continue
-            part = fc_1h[['hour', col]].copy()
-            part['weather_zone'] = zone
-            part['lead_label'] = '1h'
-            part = part.rename(columns={col: 'forecast_load'})
-            forecast_parts.append(part)
-
-        # Day-ahead demand forecast (posted closest to 12:00 UTC previous day)
-        fc_dah = extract_demand_forecast_day_ahead(year, month).copy()
-        fc_dah['hour'] = pd.to_datetime(fc_dah['delivery_dt']) - pd.Timedelta(hours=1)
-        for col, zone in forecast_zone_cols.items():
-            if col not in fc_dah.columns:
-                continue
-            part = fc_dah[['hour', col]].copy()
-            part['weather_zone'] = zone
-            part['lead_label'] = 'dah'
-            part = part.rename(columns={col: 'forecast_load'})
-            forecast_parts.append(part)
-
-    actual_long = pd.concat(actual_parts, ignore_index=True)
-    actual_long['actual_load'] = pd.to_numeric(actual_long['actual_load'], errors='coerce')
-    actual_long = (
-        actual_long
-        .dropna(subset=['weather_zone', 'hour'])
-        .groupby(['weather_zone', 'hour'], as_index=False)['actual_load']
-        .mean()
-    )
-
-    forecast_long = pd.concat(forecast_parts, ignore_index=True)
-    forecast_long['forecast_load'] = pd.to_numeric(forecast_long['forecast_load'], errors='coerce')
-    forecast_long = forecast_long.dropna(subset=['weather_zone', 'hour'])
-
-    forecast_wide = (
-        forecast_long
-        .pivot_table(
-            index=['weather_zone', 'hour'],
-            columns='lead_label',
-            values='forecast_load',
-            aggfunc='mean',
-        )
-        .rename(columns={'1h': 'forecast_load_1h', 'dah': 'forecast_load_dah'})
-        .reset_index()
-    )
-
-    load_errors = actual_long.merge(forecast_wide, on=['weather_zone', 'hour'], how='left')
-
-    load_errors['load_error_1h'] = load_errors['forecast_load_1h'] - load_errors['actual_load']
-    load_errors['load_error_dah'] = load_errors['forecast_load_dah'] - load_errors['actual_load']
-
-    out_dir = os.path.join(dirs['processed'], 'load_errors_by_weather_zone')
-    os.makedirs(out_dir, exist_ok=True)
-    out_file = os.path.join(out_dir, f'load_errors_wz_{cache_tag}.csv')
-    load_errors.sort_values(['weather_zone', 'hour']).to_csv(out_file, index=False)
-    print(f"Saved weather-zone load forecasts/errors to {out_file}")
-
-    return load_errors
+    from process_data.calculate_load_error import build_load_snapshot
+    return build_load_snapshot(months)
 
 
 def _map_nodes_to_weather_zones(node_station, weather_zone_shapefile):
@@ -716,7 +613,7 @@ def prepare_node_level_data(
             pct = 100 * n / len(node_hourly)
             print(f"  {col} non-missing: {n:,} ({pct:.1f}%)")
 
-    for col in ['forecast_load_1h', 'forecast_load_dah', 'load_error_1h', 'load_error_dah']:
+    for col in ['forecast_load_1h', 'forecast_load_dam', 'load_error_1h', 'load_error_dam']:
         if col in node_hourly.columns:
             n = node_hourly[col].notna().sum()
             pct = 100 * n / len(node_hourly)

@@ -42,8 +42,9 @@ DEPVAR = "system_lmp_std"
 FE = ["hour_of_day", "month"]
 CONTROLS = ["weekday", "actual_load"]
 
-# Load error column to use per lead time (GFS day-ahead maps to day-ahead load forecast from 12z)
-LOAD_ERROR_COL = {LEAD_SHORT: f"load_error_{LEAD_SHORT}h", LEAD_DAH: "load_error_dah"}
+# Load error column to use per lead time
+# HRRR 1h → 1h-ahead load forecast; GFS day-ahead → DAM load forecast (10am CT)
+LOAD_ERROR_COL = {LEAD_SHORT: f"load_error_{LEAD_SHORT}h", LEAD_DAH: "load_error_dam"}
 
 # 9-color qualitative palette (colorblind-friendly, distinctive)
 CLUSTER_COLORS = [
@@ -384,7 +385,7 @@ def run_cluster_analysis(
     plot_scaled_histogram_grid(results, cluster_hourly, LEAD_DAH, hist_dah_path)
 
     # Export regression results to CSV
-    tables_dir = ROOT / "tables"
+    tables_dir = Path(dirs["tables"])
     os.makedirs(tables_dir, exist_ok=True)
     table_path = tables_dir / "cluster_regression_results.csv"
 

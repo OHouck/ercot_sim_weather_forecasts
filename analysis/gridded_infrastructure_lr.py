@@ -58,9 +58,11 @@ TREATMENTS = [
     "temp_error_0h_load_center",
     "wspd_error_0h_transmission",
     "temp_error_0h_transmission",
+    "load_error_1h",
+    "load_error_dam",
 ]
 
-CONTROLS = ["era5_temp_load_center", "era5_wspd_wind", "weekday"]
+CONTROLS = ["era5_temp_load_center", "era5_wspd_wind", "actual_load", "weekday"]
 
 INTERACTIONS = [
     ("temp_error_1h_load_center", "wspd_error_1h_wind"),
@@ -501,7 +503,9 @@ def tidy_to_csv(model, n_obs, output_path, season=None):
         output_path: absolute path to CSV (appended if exists)
         season: season label string or None for main (full-year) regression
     """
-    tidy = model.tidy().reset_index()
+    tidy_raw = model.tidy().reset_index()
+    # pyfixest tidy() columns: Coefficient, Estimate, Std. Error, t value, Pr(>|t|)[, 2.5%, 97.5%]
+    tidy = tidy_raw.iloc[:, :5].copy()
     tidy.columns = ["variable", "estimate", "std_error", "t_value", "pvalue"]
 
     # Significance stars
@@ -560,7 +564,7 @@ def run_infrastructure_analysis(months=None, save_dir=None):
 
     os.makedirs(save_dir, exist_ok=True)
 
-    tables_dir = ROOT / "tables"
+    tables_dir = Path(dirs["tables"])
     os.makedirs(tables_dir, exist_ok=True)
 
     # ── Load data ───────────────────────────────────────────────────────────────
@@ -574,6 +578,13 @@ def run_infrastructure_analysis(months=None, save_dir=None):
     print("Aggregating forecast errors by infrastructure type...")
     print("=" * 60)
     hourly = aggregate_errors_by_infrastructure(pixel_hourly)
+
+    # ── Merge load forecast errors ────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Merging system-total load forecasts/errors...")
+    print("=" * 60)
+    from process_data.calculate_load_error import merge_load_into_hourly
+    hourly = merge_load_into_hourly(hourly, months)
 
     # ── Main regression ─────────────────────────────────────────────────────────
     print("\n" + "=" * 60)

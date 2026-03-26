@@ -176,26 +176,26 @@ N_NEIGHBORS = 8
 # ── Step A1: Cluster heterogeneity regressions ─────────────────────────────
 # Per-cluster joint HRRR 1h + GFS day-ahead regression → cluster_heterogeneity/ figures
 # + tables/cluster_regression_results.csv
-# from analysis.cluster_heterogeneity_lr import run_cluster_analysis
-# cluster_outputs = run_cluster_analysis(
-#     months=ANALYSIS_MONTHS,
-#     n_clusters=N_CLUSTERS,
-#     geo_weight=GEO_WEIGHT,
-#     n_neighbors=N_NEIGHBORS,
-# )
+from analysis.cluster_heterogeneity_lr import run_cluster_analysis
+cluster_outputs = run_cluster_analysis(
+    months=ANALYSIS_MONTHS,
+    n_clusters=N_CLUSTERS,
+    geo_weight=GEO_WEIGHT,
+    n_neighbors=N_NEIGHBORS,
+)
 
 # ── Step A2: Raw correlation heatmaps (2×2) ────────────────────────────────
 # Per-pixel Pearson r between forecast error and system LMP std → correlation_heatmaps/
-# from analysis.forecast_error_lmp_corr_heatmap import run_correlation_heatmaps
-# corr_outputs = run_correlation_heatmaps(
-#     months=ANALYSIS_MONTHS,
-#     lmp_var="system_lmp_std",
-# )
+from analysis.forecast_error_lmp_corr_heatmap import run_correlation_heatmaps
+corr_outputs = run_correlation_heatmaps(
+    months=ANALYSIS_MONTHS,
+    lmp_var="system_lmp_std",
+)
 
 # ── Step A3: Pixel-level regression coefficient maps (2×2) ────────────────
 # Per-pixel OLS with controls → pixel_regressions/ + tables/pixel_regression_summary.csv
-# from analysis.pixel_regression_maps import run_pixel_regression_maps
-# pixel_outputs = run_pixel_regression_maps(months=ANALYSIS_MONTHS)
+from analysis.pixel_regression_maps import run_pixel_regression_maps
+pixel_outputs = run_pixel_regression_maps(months=ANALYSIS_MONTHS)
 
 
 # ── Step A4: Infrastructure-level regressions ──────────────────────────────
@@ -208,9 +208,4 @@ infra_outputs = run_infrastructure_analysis(months=ANALYSIS_MONTHS)
 # Uncomment when node_gnn.py produces standardized outputs:
 # from analysis.node_gnn import run_gnn_analysis
 # gnn_outputs = run_gnn_analysis(months=ANALYSIS_MONTHS)
-
-# ── Compile Typst report ───────────────────────────────────────────────────
-# Reads all figures/tables produced above → output/analysis_report.pdf
-# from analysis.create_analysis_report import create_analysis_report
-# create_analysis_report(output_dir="output")
 
