@@ -313,6 +313,16 @@ def build_pixel_hourly_dataset(year, month, models=None, force_rebuild=False):
         how='left',
     )
 
+    # ── Step 5: Merge congestion metrics (if shadow data exists) ──
+    try:
+        from process_data.process_congestion import merge_congestion_system
+        print("Step 5: Merging congestion metrics...")
+        pixel_hourly = merge_congestion_system(pixel_hourly, year, month)
+        print(f"  Added congestion columns: "
+              f"n_binding_constraints, total_shadow_cost, etc.")
+    except FileNotFoundError:
+        print("Step 5: Shadow price data not found — skipping congestion merge.")
+
     # Add time features
     pixel_hourly['hour_of_day'] = pixel_hourly['valid_time'].dt.hour
     pixel_hourly['day_of_month'] = pixel_hourly['valid_time'].dt.day

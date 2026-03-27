@@ -190,6 +190,7 @@ def compute_hourly_congestion_metrics(year, month):
 4. Return hourly DataFrame
 
 ### C.2: Constraint-level → spatial congestion (geolocated)
+XX This might not work, instead also compare to merging using identified nodes from the build_node_coordinates function in process_ercot.py
 
 ```python
 def geolocate_constraints(shadow_df, bus_gdf):
@@ -641,8 +642,8 @@ print(test.shape, test.columns.tolist())
 uv run python -m download_data.pull_sced_shadow --year 2025
 
 # ── Phase B: Download 60-day SCED disclosure ──────────────────────────────────
-# Manual download from ERCOT MIS portal (60-day lag, so all 2025 is available)
-# Place files in: {raw}/ercot/sced_disclosure/2025/{mm}/
+# Manually downloaded sced disclosure data for 2025
+# data is stored in monthly files of this format: /Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/raw_data/ercot/sced/may2025 
 # Then process:
 uv run python -m download_data.pull_sced_disclosure --year 2025
 

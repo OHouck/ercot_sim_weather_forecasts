@@ -49,6 +49,8 @@ Layout:
 │       ├── rt_spp/2025/{mm}/   # 31 daily CSVs — real-time settlement point prices
 │       ├── actual_load/2025/{mm}/    # hourly actual load by weather zone
 │       ├── demand_forecast/2025/{mm}/ # hourly demand forecasts (1h + 18h) by weather zone
+│       ├── sced_shadow/2025/{mm}/    # Step 7a: SCED shadow prices (31 daily CSVs)
+│       │   └── shadow_{YYYYMMDD}.csv
 │       └── np4_160/            # Step 4a: Settlement point mapping (5 CSVs)
 │           ├── Resource_Node_to_Unit_*.csv
 │           ├── Settlement_Points_*.csv
@@ -69,6 +71,8 @@ Layout:
 │   │   ├── era5_errors_{YYYYMM}.nc
 │   │   └── error_summary.csv
 │   ├── gridded_generation_map.nc              # Step 5c: Static generation/infra map
+│   ├── congestion_metrics/                    # Step 7a: Hourly congestion from shadow prices
+│   │   └── congestion_hourly_{YYYYMM}.csv
 │   ├── load_errors_by_weather_zone/           # Step 5e dependency
 │   │   └── load_errors_wz_{tag}.csv
 │   ├── combined_hourly_gridded_data/          # Step 5d: Pixel × hour dataset
@@ -98,6 +102,7 @@ Layout:
 | NP4-160 SP mapping | ERCOT MIS public download | No | `download_data/pull_np4160.py` |
 | EIA Form 860 plants | EIA website | No | `download_data/pull_eia860.py` |
 | Node coords HTML | ERCOT contour map HTML (4 pages) | No | `data/*_html_source.txt` |
+| SCED shadow prices | ERCOT API (NP6-86-CD) | OAuth2 + subscription key | `download_data/pull_sced_shadow.py` |
 | Node coords KML | GitHub (cached 2019 ERCOT snapshot) | No | `data/rtmLmpPoints.kml` |
 | Transmission GIS | `data/Line_Output.shp` | No | `process_data/gridded_generation_mapping.py` |
 | Bus GIS | `data/Bus_Output.shp` | No | `process_data/gridded_generation_mapping.py` |
@@ -670,6 +675,34 @@ uv run python -m analysis.gridded_infrastructure_lr
 uv run python -m analysis.create_analysis_report
 # → output/analysis_report.pdf
 
+# ── Congestion & Extreme Weather Analysis (run after Steps 5d and shadow download) ──
+
+# Step 7a: Download SCED shadow prices (~2-4 hours for all 12 months)
+uv run python -m download_data.pull_sced_shadow --year 2025
+
+# Step 7b: Process congestion metrics
+uv run python -c "
+from process_data.process_congestion import compute_hourly_congestion_metrics
+for month in range(1, 13):
+    compute_hourly_congestion_metrics(2025, month, force_rebuild=True)
+"
+
+# Step 7c: Rebuild pixel datasets with congestion columns
+uv run python -c "
+from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+for month in range(1, 13):
+    build_pixel_hourly_dataset(2025, month, force_rebuild=True)
+"
+
+# A5: Extreme weather regime regressions
+uv run python -m analysis.extreme_weather_regressions --depvar total_shadow_cost
+
+# A6: Forecast value maps
+uv run python -m analysis.forecast_value_map --depvar total_shadow_cost
+
+# A7: Asymmetry analysis (over- vs under-forecast effects)
+uv run python -m analysis.extreme_weather_regressions --asymmetry --depvar total_shadow_cost
+
 # Or run the entire pipeline end-to-end:
 uv run python main.py
 ```
@@ -810,6 +843,43 @@ Assembles all figures and tables into a unified Typst PDF report. Reads from the
 ### `analysis/node_gnn.py`
 Graph Neural Network predicting node-level LMP from weather features. Uses transmission graph with virtual super node. `BASE_NUMERIC_COLS` includes both `temp_error_1h`/`wspd_error_1h` (HRRR) and `temp_error_0h`/`wspd_error_0h` (GFS). Not yet integrated into the report pipeline.
 
+### `analysis/extreme_weather_regressions.py` *(new)*
+Regime-conditional pixel regressions for extreme weather events. For each regime (extreme cold, extreme heat, high wind, stressed grid), runs per-pixel regressions of congestion measures on forecast errors. Also includes asymmetry analysis (over- vs under-forecast effects).
+
+**Entry point**: `run_regime_regressions(months, depvar)`, `run_asymmetry_regressions(months, depvar, regime_name)`
+
+**Outputs**:
+- `tables/extreme_weather_regression_{depvar}_{regime}.csv`
+- `tables/asymmetry_{depvar}.csv`
+
+### `analysis/forecast_value_map.py` *(new)*
+Computes the dollar value of forecast accuracy at each ERA5 pixel. Combines per-pixel regression coefficients with observed forecast error variance: `value = |β| × σ(error)`.
+
+**Entry point**: `run_forecast_value_analysis(months, depvar)`, `run_regime_value_comparison(months, depvar)`
+
+**Outputs**:
+- `figures/forecast_value/forecast_value_by_error_{depvar}.png` — 2×2 map by error type
+- `figures/forecast_value/forecast_value_total_{depvar}.png` — single total value map
+- `tables/forecast_value_{depvar}.csv`
+
+### `process_data/process_congestion.py` *(new)*
+Processes SCED shadow prices into hourly congestion metrics. System-level metrics (n_binding_constraints, total_shadow_cost, max_shadow_price, etc.) are merged into the pixel × hour dataset.
+
+- `compute_hourly_congestion_metrics(year, month)` — hourly system-level congestion
+- `merge_congestion_system(pixel_df, year, month)` — merge into pixel data
+- `geolocate_constraints(shadow_df)` — map constraints to lat/lon via Bus_Output.shp
+
+### `process_data/classify_weather_regimes.py` *(new)*
+Classifies each hour into weather/grid regimes using system-wide percentile thresholds.
+
+- `classify_regimes(pixel_df)` — adds regime_temp, regime_wind, regime_grid, is_extreme columns
+- `compute_thresholds(hourly_weather)` — compute percentile thresholds
+
+### `download_data/pull_sced_shadow.py` *(new)*
+Downloads SCED shadow prices and binding transmission constraints from ERCOT API (NP6-86-CD).
+
+**Output**: `{raw}/ercot/sced_shadow/{year}/{mm}/shadow_{YYYYMMDD}.csv`
+
 ### Interactive / EDA notebooks (not in pipeline)
 - `analysis/local_node_lr.qmd` — node-level regression, interactive use
 - `analysis/analysis_forecast_error_eda.py` — treatment/control LMP maps per cluster
@@ -831,6 +901,11 @@ Graph Neural Network predicting node-level LMP from weather features. Uses trans
 | `infra_seasonal` | `figures/infrastructure_regressions/coef_plot_seasonal.png` | `gridded_infrastructure_lr.py` |
 | `infra_table` | `tables/infrastructure_regression_main.csv` | `gridded_infrastructure_lr.py` |
 | `report` | `output/analysis_report.pdf` | `create_analysis_report.py` |
+| `forecast_value_map` | `figures/forecast_value/forecast_value_total_{depvar}.png` | `forecast_value_map.py` |
+| `forecast_value_2x2` | `figures/forecast_value/forecast_value_by_error_{depvar}.png` | `forecast_value_map.py` |
+| `forecast_value_table` | `tables/forecast_value_{depvar}.csv` | `forecast_value_map.py` |
+| `extreme_weather_table` | `tables/extreme_weather_regression_{depvar}_{regime}.csv` | `extreme_weather_regressions.py` |
+| `asymmetry_table` | `tables/asymmetry_{depvar}.csv` | `extreme_weather_regressions.py` |
 
 ---
 

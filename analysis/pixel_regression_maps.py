@@ -265,6 +265,12 @@ def load_pixel_data(months):
     lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
 
     LMP_COLS = ["system_lmp_mean", "system_lmp_max", "system_lmp_std"]
+    CONGESTION_COLS = [
+        "n_binding_constraints", "total_shadow_cost", "max_shadow_price",
+        "shadow_cost_weighted", "n_violations", "total_violated_mw",
+        "mean_shadow_cost_per_interval",
+    ]
+    ALL_SYSTEM_COLS = LMP_COLS + CONGESTION_COLS
 
     texas_mask = None
     lats = lons = None
@@ -350,8 +356,14 @@ def load_pixel_data(months):
             "wspd_error_0h": wspd_err_0h.ravel(),
         })
 
-        # Load system-level LMP + time features from parquet (one value per hour)
-        lmp_df = pd.read_parquet(lmp_path, columns=["valid_time"] + LMP_COLS)
+        # Load system-level LMP + congestion from parquet (one value per hour)
+        # Read schema to discover available columns (congestion may not exist)
+        import pyarrow.parquet as pq_schema
+        pq_all_cols = pq_schema.read_schema(lmp_path).names
+        cols_to_load = ["valid_time"] + [
+            c for c in ALL_SYSTEM_COLS if c in pq_all_cols
+        ]
+        lmp_df = pd.read_parquet(lmp_path, columns=cols_to_load)
         lmp_df["valid_time"] = pd.to_datetime(lmp_df["valid_time"])
         if lmp_df["valid_time"].dt.tz is not None:
             lmp_df["valid_time"] = lmp_df["valid_time"].dt.tz_localize(None)
@@ -361,9 +373,8 @@ def load_pixel_data(months):
         if df_month["valid_time"].dt.tz is not None:
             df_month["valid_time"] = df_month["valid_time"].dt.tz_localize(None)
 
-        for col in LMP_COLS:
-            if col in lmp_df.columns:
-                df_month[col] = df_month["valid_time"].map(lmp_df[col])
+        for col in lmp_df.columns:
+            df_month[col] = df_month["valid_time"].map(lmp_df[col])
 
         # Derive time features from valid_time
         df_month["hour_of_day"] = df_month["valid_time"].dt.hour
@@ -384,13 +395,12 @@ def load_pixel_data(months):
     return df
 
 
-def run_pixel_regressions(df, depvar=DEPVAR):
+def run_pixel_regressions(df, depvar=DEPVAR, min_obs=100,
+                          error_vars=None, controls=None, fe=None):
     """Run a per-pixel OLS regression and collect coefficient estimates.
 
     For each pixel, fits:
-        {depvar} ~ temp_error_1h + wspd_error_1h + temp_error_0h +
-                   wspd_error_0h + era5_temp + era5_wspd + is_weekend
-                 | hour_of_day + month
+        {depvar} ~ error_vars + controls | fe
 
     Parameters
     ----------
@@ -398,21 +408,44 @@ def run_pixel_regressions(df, depvar=DEPVAR):
         Full pixel × hour dataset with all required columns.
     depvar : str
         Dependent variable column name (default: DEPVAR).
+    min_obs : int
+        Minimum observations per pixel to run regression.
+    error_vars : list of str, optional
+        Treatment variables. Defaults to ERROR_VARS.
+    controls : list of str, optional
+        Control variables. Defaults to CONTROLS.
+    fe : list of str, optional
+        Fixed effects. Defaults to FE, but drops 'month' if only 1 month.
 
     Returns
     -------
     pd.DataFrame
         Columns: pixel_id, lat, lon, error_var, coef, std_err, pvalue, n_obs
     """
-    fml = (
-        f"{depvar} ~ "
-        + " + ".join(ERROR_VARS + CONTROLS)
-        + " | "
-        + " + ".join(FE)
-    )
+    if error_vars is None:
+        error_vars = ERROR_VARS
+    if controls is None:
+        controls = CONTROLS
+    if fe is None:
+        fe = list(FE)
+
+    # Filter error_vars and controls to only those present in data
+    error_vars = [v for v in error_vars if v in df.columns]
+    controls = [v for v in controls if v in df.columns]
+    fe = [v for v in fe if v in df.columns]
+
+    # Drop 'month' FE if only 1 month of data (no variation)
+    if "month" in fe and df["month"].nunique() <= 1:
+        fe.remove("month")
+        print("  (Dropped 'month' FE — single month of data)")
+
+    rhs = " + ".join(error_vars + controls)
+    if fe:
+        fml = f"{depvar} ~ {rhs} | {' + '.join(fe)}"
+    else:
+        fml = f"{depvar} ~ {rhs}"
 
     # Build a lookup from pixel_id -> (lat, lon).
-    # Some rows have NaN lat/lon (missing ERA5 hours), so drop those first.
     coords = (
         df[["pixel_id", "latitude", "longitude"]]
         .dropna(subset=["latitude", "longitude"])
@@ -425,6 +458,7 @@ def run_pixel_regressions(df, depvar=DEPVAR):
     print(f"\nRunning regressions for {n_pixels:,} pixels...")
     print(f"  Formula: {fml}\n")
 
+    required_cols = [depvar] + error_vars + controls + fe
     records = []
     for i, pid in enumerate(pixel_ids):
         if i % 500 == 0:
@@ -433,14 +467,13 @@ def run_pixel_regressions(df, depvar=DEPVAR):
         pixel_df = df[df["pixel_id"] == pid].copy()
 
         # Drop rows missing any required variable
-        required_cols = [depvar] + ERROR_VARS + CONTROLS + FE
         pixel_df = pixel_df.dropna(subset=required_cols)
 
-        if len(pixel_df) < 100:
+        if len(pixel_df) < min_obs:
             continue
 
         # Pre-cast numeric columns to float64 so pyfixest doesn't do it on a slice
-        float_cols = [c for c in required_cols if c not in FE]
+        float_cols = [c for c in required_cols if c not in fe]
         pixel_df[float_cols] = pixel_df[float_cols].astype("float64")
 
         try:
@@ -453,7 +486,7 @@ def run_pixel_regressions(df, depvar=DEPVAR):
         lat = coords.loc[pid, "latitude"]
         lon = coords.loc[pid, "longitude"]
 
-        for err_var in ERROR_VARS:
+        for err_var in error_vars:
             if err_var not in tidy_df.index:
                 continue
             row = tidy_df.loc[err_var]
@@ -669,7 +702,28 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
     df = merge_load_by_weather_zone(df, months)
 
     # --- Run regressions ---
-    results_df = run_pixel_regressions(df, depvar=depvar)
+    # Use only error vars and controls that are actually present and have
+    # sufficient non-NaN coverage. If a variable drops >80% of obs, skip it.
+    avail_errors = []
+    for v in ERROR_VARS:
+        if v not in df.columns:
+            continue
+        frac_valid = df[v].notna().mean()
+        if frac_valid < 0.2:
+            print(f"  Dropping '{v}' from regression (only {frac_valid*100:.0f}% non-NaN)")
+        else:
+            avail_errors.append(v)
+    avail_controls = [v for v in CONTROLS if v in df.columns and df[v].notna().mean() > 0.2]
+
+    if not avail_errors:
+        print("  WARNING: No error variables available for regression.")
+        results_df = pd.DataFrame()
+    else:
+        results_df = run_pixel_regressions(
+            df, depvar=depvar,
+            error_vars=avail_errors,
+            controls=avail_controls,
+        )
 
     # --- Save regression results table ---
     table_path = tables_dir / f"pixel_regression_summary_{tag}.csv"
@@ -688,7 +742,7 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
     print(f"\nShared color limits: [{vmin:.4f}, {vmax:.4f}]")
 
     # --- Panel layout ---
-    panel_config = [
+    _all_panels = [
         ("temp_error_1h", "HRRR 1h — Temperature Error"),
         ("wspd_error_1h", "HRRR 1h — Wind Speed Error"),
         ("temp_error_0h", "GFS Day-Ahead — Temperature Error"),
@@ -696,6 +750,12 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
         ("load_error_1h", "1h-Ahead — Load Forecast Error"),
         ("load_error_dam", "DAM (10am CT) — Load Forecast Error"),
     ]
+    # Only plot panels for error vars that were estimated
+    estimated_vars = set(results_df["error_var"].unique()) if len(results_df) > 0 else set()
+    panel_config = [(v, t) for v, t in _all_panels if v in estimated_vars]
+    if not panel_config:
+        # Fallback to weather-only panels
+        panel_config = _all_panels[:4]
 
     n_panels = len(panel_config)
     n_cols = 2

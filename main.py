@@ -209,3 +209,27 @@ infra_outputs = run_infrastructure_analysis(months=ANALYSIS_MONTHS)
 # from analysis.node_gnn import run_gnn_analysis
 # gnn_outputs = run_gnn_analysis(months=ANALYSIS_MONTHS)
 
+# ── Step A6: Extreme weather regime regressions ──────────────────────────────
+# Per-pixel regressions conditioned on extreme weather regimes using shadow cost
+from analysis.extreme_weather_regressions import run_regime_regressions
+regime_outputs = run_regime_regressions(
+    months=ANALYSIS_MONTHS,
+    depvar="total_shadow_cost",
+)
+
+# ── Step A7: Forecast value maps ─────────────────────────────────────────────
+# Dollar value of forecast improvement at each pixel
+from analysis.forecast_value_map import run_forecast_value_analysis
+value_outputs = run_forecast_value_analysis(
+    months=ANALYSIS_MONTHS,
+    depvar="total_shadow_cost",
+)
+
+# ── Step A8: Forecast error asymmetry analysis ───────────────────────────────
+# Over-forecast vs under-forecast effects on congestion
+from analysis.extreme_weather_regressions import run_asymmetry_regressions
+asymmetry_outputs = run_asymmetry_regressions(
+    months=ANALYSIS_MONTHS,
+    depvar="total_shadow_cost",
+)
+

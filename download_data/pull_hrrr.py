@@ -14,6 +14,9 @@ changing LEAD_TIMES and adding EXTENDED_CYCLES logic.
 Output: {base_dir}/{element}/{year}/{month:02d}/hrrr_{HH}z_{YYYYMMDD}_f{FF}.nc
 Each file contains one forecast step over the Texas grid (~470×440 points at 3km).
 
+
+This data is very large, so after processing forecast errors, I delete the raw files pulled by this script. 
+
 Usage:
     # Single month
     from download_data.pull_hrrr import download_hrrr_month

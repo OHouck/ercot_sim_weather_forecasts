@@ -36,4 +36,5 @@ dependencies = [
     "great-tables>=0.21.0",
     "torch>=2.2.0",
     "torch-geometric>=2.5.0",
+    "binsreg>=2.1.7",
 ]
