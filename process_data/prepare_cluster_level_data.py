@@ -942,6 +942,10 @@ def build_cluster_hourly_data(
 
     dirs = setup_directories()
 
+    # Default generators path: EIA 860 Texas generators CSV
+    if generators_path is None:
+        generators_path = os.path.join(dirs["raw"], "eia860", "texas_generators.csv")
+
     # ── Cache key ─────────────────────────────────────────────────────────
     months = sorted(months)
     if len(months) == 1:

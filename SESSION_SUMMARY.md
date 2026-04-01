@@ -1,7 +1,7 @@
 # Session Summary — Congestion Analysis Implementation
 
-**Date**: March 26, 2026
-**Scope**: Implementing Phases A–G of `PLAN_congestion_analysis.md`
+**Last Updated**: March 27, 2026
+**Scope**: Implementing Phases A–H of `PLAN_congestion_analysis.md`
 
 ---
 
@@ -149,10 +149,20 @@ Also re-ran the full-year pixel regressions (`system_lmp_std` as DV) with all 12
 | `tables/extreme_weather_regression_total_shadow_cost_extreme_heat.csv` | Regime regression: extreme heat |
 | `tables/extreme_weather_regression_total_shadow_cost_high_wind.csv` | Regime regression: high wind |
 | `tables/extreme_weather_regression_total_shadow_cost_stressed_grid.csv` | Regime regression: stressed grid |
+| `tables/extreme_weather_regression_wind_curtailment_mw_extreme_cold.csv` | Curtailment regime regression: extreme cold |
+| `tables/extreme_weather_regression_wind_curtailment_mw_extreme_heat.csv` | Curtailment regime regression: extreme heat |
+| `tables/extreme_weather_regression_total_curtailment_mw_extreme_cold.csv` | Total curtailment regime regression: extreme cold |
+| `tables/extreme_weather_regression_total_curtailment_mw_extreme_heat.csv` | Total curtailment regime regression: extreme heat |
 | `tables/asymmetry_total_shadow_cost.csv` | Asymmetry analysis: full sample |
 | `tables/forecast_value_total_shadow_cost.csv` | Forecast value per pixel |
 | `tables/forecast_value_regression_total_shadow_cost.csv` | Regression coefficients for value calc |
 | `tables/pixel_regression_summary_system_lmp_std.csv` | Updated full-year pixel regressions |
+
+### Processed Data
+| File | Description |
+|------|-------------|
+| `processed_data/curtailment_metrics/curtailment_hourly_{YYYYMM}.csv` | Hourly curtailment metrics (Jan–Nov 2025; 11 files) |
+| `processed_data/combined_hourly_gridded_data/pixel_hourly_gfs+hrrr_2025_{mm}.parquet` | Pixel × hour dataset (65 cols, all 12 months) |
 
 ---
 
@@ -161,10 +171,52 @@ Also re-ran the full-year pixel regressions (`system_lmp_std` as DV) with all 12
 ### Missing Data (Low Priority)
 - **20 shadow price days** across Aug–Nov (HTTP 500 from ERCOT API — may not yet be in the 60-day disclosure). Analysis already uses available data (80–95% coverage for those months). Can retry later.
 
-### Phase B: 60-Day SCED Disclosure / Curtailment Data (Not Started)
-- Renewable curtailment data (HSL − actual output) from ERCOT's 60-Day SCED Disclosure (NP3-966-ER)
-- Requires manual download from ERCOT MIS portal — not available via API
-- Would enable analysis of forecast error → curtailment pathway
+### Phase B: 60-Day SCED Disclosure / Curtailment Data ✅
+
+**Scripts**: `process_data/process_curtailment.py` (created), `process_data/combine_forecast_generation_node.py` (modified)
+
+Processed ERCOT's 60-Day SCED Disclosure nested ZIP archives to extract per-unit wind and solar curtailment. Curtailment = `max(0, HSL − Telemetered Net Output)` for WIND and PVGR units. Merged 6 new curtailment columns into the pixel × hour parquets (59 → 65 columns).
+
+**Key implementation details**:
+- SCED disclosure is released ~60 days after the operating date; folder naming uses release month (e.g., `sep2025` contains July 2025 operating data)
+- Each folder is a nested ZIP (outer → inner → 7 CSVs per operating day)
+- `_find_sced_folders()` loads N+2 and N+1 release folders, then filters by operating date to get boundary-day coverage
+- Caches to `{processed}/curtailment_metrics/curtailment_hourly_{YYYYMM}.csv`
+
+**Data availability**: Jan–Oct 2025 (full). Nov 2025 has only 24 hours (1 operating day in the available folder). Dec 2025 unavailable (would need `feb2026` folder which doesn't exist yet).
+
+**Curtailment statistics by month**:
+
+| Month | Hours | Mean Wind MW | Mean Total MW | Max Total MW |
+|-------|-------|-------------|--------------|-------------|
+| Jan | 720 | 720 | 1,152 | 15,256 |
+| Feb | 672 | 642 | 1,029 | 12,347 |
+| Mar | 743 | 1,618 | 2,815 | 16,554 |
+| Apr | 720 | 1,601 | 2,423 | 14,914 |
+| May | 744 | 708 | 1,197 | 8,551 |
+| Jun | 720 | 620 | 1,171 | 12,253 |
+| Jul | 744 | 272 | 564 | 4,872 |
+| Aug | 744 | 150 | 286 | 2,086 |
+| Sep | 720 | 131 | 460 | 2,868 |
+| Oct | 744 | 582 | 1,190 | 16,240 |
+| Nov | 24 | 255 | 550 | 1,595 |
+
+Spring months (Mar–Apr) have highest curtailment — consistent with peak wind generation outpacing transmission capacity.
+
+**New pixel parquet columns** (65 total, up from 59):
+- `wind_curtailment_mw`, `solar_curtailment_mw`, `total_curtailment_mw`
+- `wind_curtailment_pct`, `solar_curtailment_pct`, `n_curtailed_units`
+
+**Curtailment regime regressions** (partially complete):
+- Completed: `extreme_cold` and `extreme_heat` for both `wind_curtailment_mw` and `total_curtailment_mw`
+- Pending: `high_wind`, `stressed_grid` regimes; asymmetry analysis; forecast value maps for curtailment DV
+- These 4 tasks were relaunched as background jobs at the start of this session
+
+### Phase B Curtailment Regressions (In Progress)
+- **Regime regressions**: `high_wind` and `stressed_grid` for `wind_curtailment_mw` and `total_curtailment_mw` still pending (only `extreme_cold` and `extreme_heat` completed so far)
+- **Asymmetry analysis**: `run_asymmetry_regressions(depvar='wind_curtailment_mw')` not yet run
+- **Forecast value maps**: `run_forecast_value_analysis(depvar='wind_curtailment_mw')` not yet run
+- All 4 tasks relaunched as background jobs at the start of the most recent session (will need to be rerun on next session if they didn't complete)
 
 ### Phase C.2: Constraint Geolocation (Partially Done, Needs Improvement)
 - Current approach using `Bus_Output.shp` achieves only ~2% match rate (SCED station names are abbreviated differently than bus names)
@@ -173,12 +225,12 @@ Also re-ran the full-year pixel regressions (`system_lmp_std` as DV) with all 12
 - Improving this would enable **constraint-level spatial analysis** — mapping which specific transmission corridors are affected by forecast errors at nearby pixels
 
 ### Phase H: Updated Report (Not Started)
-- Update `analysis/create_analysis_report.py` with new sections:
-  - Regime regression results (maps + tables)
-  - Forecast value maps
-  - Asymmetry analysis
-  - Congestion-focused findings vs. LMP proxy findings
-- Compile updated Typst PDF
+- Update `reports/analysis_report.typ` with new sections:
+  - Regime regression results (tables: extreme_cold, extreme_heat, high_wind, stressed_grid for total_shadow_cost)
+  - Forecast value maps (`figures/forecast_value/forecast_value_by_error_total_shadow_cost.png`)
+  - Asymmetry analysis (`tables/asymmetry_total_shadow_cost.csv`)
+  - Curtailment findings (once remaining regressions complete)
+- Compile updated Typst PDF via `uv run python -m analysis.create_analysis_report`
 
 ### Potential Extensions
 1. **Regime-specific forecast value maps** — `run_regime_value_comparison()` exists but hasn't been run for all regimes
@@ -186,15 +238,21 @@ Also re-ran the full-year pixel regressions (`system_lmp_std` as DV) with all 12
 3. **Regime regression maps** — the regime regressions currently save tables only; generating 2×2 spatial maps for each regime would be valuable for the paper
 4. **Interaction between weather and load errors** — load forecast errors are significant (69% of pixels); interaction with weather errors could reveal compounding effects
 5. **Infrastructure-specific regime analysis** — combine `gridded_infrastructure_lr.py` with regime conditioning
+6. **Dec 2025 curtailment** — retry when `feb2026` SCED disclosure folder is available
 
 ---
 
-## Code Changes Made This Session
+## Code Changes Made (All Sessions Combined)
 
-| File | Change |
-|------|--------|
-| `process_data/process_congestion.py` | Reprocessed all 12 months with updated shadow data |
-| `process_data/combine_forecast_generation_node.py` | Rebuilt all 12 pixel parquets (59 cols with congestion) |
-| `main.py` | Already had Steps A6–A8 from prior session; ran full pipeline |
-
-No new code was written this session — all scripts were created in the prior session. This session focused on **completing data downloads, processing all 12 months, and running full-year analyses**.
+| Session | File | Change |
+|---------|------|--------|
+| Session 1 | `download_data/pull_sced_shadow.py` | Created: downloads SCED shadow prices from ERCOT API |
+| Session 1 | `process_data/process_congestion.py` | Created: shadow prices → hourly congestion metrics |
+| Session 1 | `process_data/classify_weather_regimes.py` | Created: extreme weather regime classification |
+| Session 1 | `analysis/extreme_weather_regressions.py` | Created: regime-conditional pixel regressions + asymmetry |
+| Session 1 | `analysis/forecast_value_map.py` | Created: dollar value of forecast accuracy per pixel |
+| Session 1 | `process_data/combine_forecast_generation_node.py` | Modified: added congestion merge (Step 5), curtailment merge (Step 6) |
+| Session 1 | `analysis/pixel_regression_maps.py` | Modified: added congestion/curtailment DVs and system cols |
+| Session 1 | `main.py` | Modified: added Steps A5–A10 for congestion + curtailment pipeline |
+| Session 2 | `process_data/process_curtailment.py` | Created: SCED disclosure nested ZIPs → hourly curtailment metrics |
+| Session 2 | All 12 pixel parquets | Rebuilt: 52 → 59 cols (congestion) → 65 cols (curtailment) |

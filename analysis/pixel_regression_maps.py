@@ -29,11 +29,10 @@ from helper_funcs import setup_directories
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DEPVAR = "system_lmp_std"
+DEPVAR = "first_interval_shadow_cost"
 # All 4 error variables estimated jointly in one regression per pixel
 ERROR_VARS = [
     "temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h",
-    "load_error_1h", "load_error_dam",
 ]
 CONTROLS = ["era5_temp", "era5_wspd", "actual_load", "is_weekend"]
 FE = ["hour_of_day", "month"]
@@ -268,9 +267,13 @@ def load_pixel_data(months):
     CONGESTION_COLS = [
         "n_binding_constraints", "total_shadow_cost", "max_shadow_price",
         "shadow_cost_weighted", "n_violations", "total_violated_mw",
-        "mean_shadow_cost_per_interval",
+        "mean_shadow_cost_per_interval", "first_interval_shadow_cost",
     ]
-    ALL_SYSTEM_COLS = LMP_COLS + CONGESTION_COLS
+    CURTAILMENT_COLS = [
+        "wind_curtailment_mw", "solar_curtailment_mw", "total_curtailment_mw",
+        "wind_curtailment_pct", "solar_curtailment_pct", "n_curtailed_units",
+    ]
+    ALL_SYSTEM_COLS = LMP_COLS + CONGESTION_COLS + CURTAILMENT_COLS
 
     texas_mask = None
     lats = lons = None
@@ -664,7 +667,7 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
         Infrastructure overlays drawn on each panel.
         Defaults to ['wind', 'solar', 'transmission', 'cities'].
     depvar : str, optional
-        Dependent variable. Defaults to DEPVAR ('system_lmp_std').
+        Dependent variable. Defaults to DEPVAR ('total_shadow_cost').
     tag : str, optional
         Suffix for output filenames (e.g., 'summer', 'system_lmp_max').
         Defaults to depvar if not provided.
@@ -695,11 +698,6 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
 
     # --- Load data ---
     df = load_pixel_data(months)
-
-    # --- Merge load forecast errors ---
-    from process_data.calculate_load_error import merge_load_by_weather_zone
-    print("\nMerging weather-zone load forecasts/errors...")
-    df = merge_load_by_weather_zone(df, months)
 
     # --- Run regressions ---
     # Use only error vars and controls that are actually present and have
@@ -747,8 +745,6 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
         ("wspd_error_1h", "HRRR 1h — Wind Speed Error"),
         ("temp_error_0h", "GFS Day-Ahead — Temperature Error"),
         ("wspd_error_0h", "GFS Day-Ahead — Wind Speed Error"),
-        ("load_error_1h", "1h-Ahead — Load Forecast Error"),
-        ("load_error_dam", "DAM (10am CT) — Load Forecast Error"),
     ]
     # Only plot panels for error vars that were estimated
     estimated_vars = set(results_df["error_var"].unique()) if len(results_df) > 0 else set()
@@ -837,12 +833,8 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
 
 if __name__ == "__main__":
     # ── Configure run here ────────────────────────────────────────────────────
-    # Dependent variable: "system_lmp_std" or "system_lmp_max"
+    vars = ["total_shadow_cost"]
 
-    # vars = ["system_lmp_std", "system_lmp_max"]
-    vars = ["system_lmp_max"]
-
-    # Months to include — change to a seasonal subset or any custom list, e.g.:
     summer = [(2025, m) for m in [6, 7, 8]]
     winter = [(2025, m) for m in [12, 1, 2]]
     spring_fall = [(2025, m) for m in [3, 4, 5, 9, 10, 11]]
@@ -852,19 +844,8 @@ if __name__ == "__main__":
         ("full_year", full_year),
         ("summer", summer),
         ("winter", winter),
-        ("spring_fall", spring_fall)
+        ("spring_fall", spring_fall),
     ]
-
-    # RUN_DEPVAR = "system_lmp_std"
-    # var = RUN_DEPVAR
-    # month_set = full_year
-    # tag = var
-    # print(f"\n=== Running pixel regression maps for {tag} ===")
-    # run_pixel_regression_maps(
-    #     months=month_set,
-    #     depvar=var,
-    #     tag=tag,
-    # )
 
     for var in vars:
         for season_name, month_set in month_sets:

@@ -304,7 +304,7 @@ def plot_total_value_map(value_df, save_path=None, title="Total Forecast Value")
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
-def run_forecast_value_analysis(months=None, depvar="total_shadow_cost",
+def run_forecast_value_analysis(months=None, depvar="first_interval_shadow_cost",
                                  save_dir=None):
     """Run the full forecast value map analysis.
 
@@ -403,7 +403,7 @@ def run_forecast_value_analysis(months=None, depvar="total_shadow_cost",
     }
 
 
-def run_regime_value_comparison(months=None, depvar="total_shadow_cost",
+def run_regime_value_comparison(months=None, depvar="first_interval_shadow_cost",
                                  save_dir=None):
     """Compare forecast value across weather regimes.
 

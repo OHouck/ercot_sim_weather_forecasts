@@ -315,13 +315,29 @@ def build_pixel_hourly_dataset(year, month, models=None, force_rebuild=False):
 
     # ── Step 5: Merge congestion metrics (if shadow data exists) ──
     try:
-        from process_data.process_congestion import merge_congestion_system
+        from process_data.process_congestion import (
+            merge_congestion_system, merge_congestion_local,
+        )
         print("Step 5: Merging congestion metrics...")
         pixel_hourly = merge_congestion_system(pixel_hourly, year, month)
-        print(f"  Added congestion columns: "
+        print(f"  Added system congestion columns: "
               f"n_binding_constraints, total_shadow_cost, etc.")
+        pixel_hourly = merge_congestion_local(pixel_hourly, year, month)
+        n_local = (pixel_hourly['local_shadow_cost'] > 0).sum()
+        print(f"  Added local congestion columns: "
+              f"{n_local:,} pixel-hours with local_shadow_cost > 0")
     except FileNotFoundError:
         print("Step 5: Shadow price data not found — skipping congestion merge.")
+
+    # ── Step 6: Merge curtailment metrics (if SCED disclosure data exists) ──
+    try:
+        from process_data.process_curtailment import merge_curtailment_system
+        print("Step 6: Merging curtailment metrics...")
+        pixel_hourly = merge_curtailment_system(pixel_hourly, year, month)
+        print(f"  Added curtailment columns: "
+              f"wind_curtailment_mw, solar_curtailment_mw, etc.")
+    except FileNotFoundError:
+        print("Step 6: SCED disclosure data not found — skipping curtailment merge.")
 
     # Add time features
     pixel_hourly['hour_of_day'] = pixel_hourly['valid_time'].dt.hour

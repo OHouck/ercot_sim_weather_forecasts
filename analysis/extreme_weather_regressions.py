@@ -16,6 +16,7 @@ import os
 import sys
 from pathlib import Path
 
+import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,6 +29,8 @@ from analysis.pixel_regression_maps import (
     load_pixel_data,
     run_pixel_regressions,
     plot_pixel_coefficient_map,
+    _draw_texas_base,
+    _draw_texas_borders,
     DEPVAR,
     SIG_LEVEL,
 )
@@ -40,10 +43,14 @@ WEATHER_ERROR_VARS = [
 WEATHER_CONTROLS = ["era5_temp", "era5_wspd", "is_weekend"]
 
 CONGESTION_DEPVARS = [
+    "first_interval_shadow_cost",
     "total_shadow_cost",
     "max_shadow_price",
     "n_binding_constraints",
     "system_lmp_std",
+    "wind_curtailment_mw",
+    "solar_curtailment_mw",
+    "total_curtailment_mw",
 ]
 
 DEFAULT_MONTHS = [(2025, m) for m in range(1, 13)]
@@ -126,9 +133,189 @@ ASYMMETRIC_ERROR_VARS = [
 ]
 
 
+# ── Visualisation helpers ────────────────────────────────────────────────────
+
+_PANEL_CONFIG = [
+    ("temp_error_1h", "HRRR 1h — Temperature Error"),
+    ("wspd_error_1h", "HRRR 1h — Wind Speed Error"),
+    ("temp_error_0h", "GFS Day-Ahead — Temperature Error"),
+    ("wspd_error_0h", "GFS Day-Ahead — Wind Speed Error"),
+]
+
+
+def plot_regime_coefficient_maps(all_results, save_dir, dirs, depvar,
+                                  sig_level=SIG_LEVEL):
+    """Create a 2×2 coefficient map for each regime.
+
+    Parameters
+    ----------
+    all_results : dict
+        Mapping regime_name → results DataFrame (output of run_regime_regressions).
+    save_dir : str
+        Directory for output PNG files.
+    dirs : dict
+        Output of setup_directories().
+    depvar : str
+        Dependent variable name (used in filename and title).
+    sig_level : float
+        p-value threshold.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    depvar_label = depvar.replace("_", " ")
+
+    for regime_name, results_df in all_results.items():
+        spec = REGIMES[regime_name]
+        regime_label = spec["label"]
+
+        if results_df.empty:
+            continue
+
+        # Shared color limits across all four panels for this regime
+        sig_mask = results_df["pvalue"] < sig_level
+        if sig_mask.sum() > 0:
+            clim = np.nanpercentile(results_df.loc[sig_mask, "coef"].abs(), 99)
+        else:
+            clim = 1.0
+        vmin, vmax = -clim, clim
+
+        fig, axes = plt.subplots(
+            2, 2,
+            figsize=(18, 14),
+            subplot_kw={"projection": ccrs.PlateCarree()},
+            gridspec_kw={"hspace": 0.15, "wspace": 0.05},
+        )
+
+        sc_last = None
+        legend_handles = []
+        for idx, (err_var, panel_title) in enumerate(_PANEL_CONFIG):
+            row, col = divmod(idx, 2)
+            ax = axes[row, col]
+            sc, handles = plot_pixel_coefficient_map(
+                results_df,
+                error_var=err_var,
+                title=panel_title,
+                ax=ax,
+                vmin=vmin,
+                vmax=vmax,
+                dirs=dirs,
+                overlay=["wind", "solar", "transmission", "cities"],
+                sig_level=sig_level,
+            )
+            if sc is not None:
+                sc_last = sc
+            if idx == 0:
+                legend_handles = handles
+
+        if sc_last is not None:
+            fig.colorbar(
+                sc_last,
+                ax=axes.ravel().tolist(),
+                shrink=0.6,
+                label=f"Coefficient ({depvar_label} per unit error)",
+                pad=0.02,
+            )
+
+        if legend_handles:
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                ncol=len(legend_handles),
+                fontsize=9,
+                framealpha=0.85,
+                bbox_to_anchor=(0.45, 0.01),
+            )
+
+        fig.suptitle(
+            f"Regime: {regime_label}\nDependent variable: {depvar_label}\n"
+            "(only significant pixels shown, p < 0.05)",
+            fontsize=13,
+            y=0.98,
+        )
+
+        save_path = os.path.join(
+            save_dir, f"regime_coef_maps_{regime_name}_{depvar}.png"
+        )
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Regime map saved: {save_path}")
+
+
+def plot_asymmetry_histograms(results_df, save_path, depvar_label="total shadow cost",
+                               sig_level=SIG_LEVEL):
+    """4-panel histogram comparing over- vs under-forecast significant coefficients.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Output of run_asymmetry_regressions() — contains _pos and _neg error vars.
+    save_path : str
+        Path to save the figure.
+    depvar_label : str
+        Human-readable label for the dependent variable.
+    sig_level : float
+        p-value threshold for significance.
+    """
+    base_vars = ["temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h"]
+    var_labels = {
+        "temp_error_1h": "HRRR 1h Temperature Error",
+        "wspd_error_1h": "HRRR 1h Wind Speed Error",
+        "temp_error_0h": "GFS Day-Ahead Temperature Error",
+        "wspd_error_0h": "GFS Day-Ahead Wind Speed Error",
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(
+        f"Forecast Error Asymmetry — {depvar_label}\n"
+        "Distribution of significant pixel coefficients by direction",
+        fontsize=13, fontweight="bold",
+    )
+
+    for ax, base_var in zip(axes.flat, base_vars):
+        pos_var = f"{base_var}_pos"
+        neg_var = f"{base_var}_neg"
+
+        pos_sig = results_df[
+            (results_df["error_var"] == pos_var) & (results_df["pvalue"] < sig_level)
+        ]["coef"]
+        neg_sig = results_df[
+            (results_df["error_var"] == neg_var) & (results_df["pvalue"] < sig_level)
+        ]["coef"]
+
+        # Determine shared bin range
+        all_vals = pd.concat([pos_sig, neg_sig])
+        if len(all_vals) == 0:
+            ax.set_title(var_labels.get(base_var, base_var))
+            ax.text(0.5, 0.5, "No significant pixels", ha="center", va="center",
+                    transform=ax.transAxes, color="gray")
+            continue
+
+        lo = np.percentile(all_vals, 1)
+        hi = np.percentile(all_vals, 99)
+        bins = np.linspace(lo, hi, 30)
+
+        if len(pos_sig) > 0:
+            ax.hist(pos_sig, bins=bins, alpha=0.55, color="steelblue",
+                    label=f"Over-forecast (+), n={len(pos_sig):,}")
+        if len(neg_sig) > 0:
+            ax.hist(neg_sig, bins=bins, alpha=0.55, color="firebrick",
+                    label=f"Under-forecast (−), n={len(neg_sig):,}")
+
+        ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel(f"Coefficient (per unit error)", fontsize=9)
+        ax.set_ylabel("Pixel count", fontsize=9)
+        ax.set_title(var_labels.get(base_var, base_var), fontsize=11)
+        ax.legend(fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Asymmetry histograms saved: {save_path}")
+
+
 # ── Main analysis functions ──────────────────────────────────────────────────
 
-def run_regime_regressions(months=None, depvar="total_shadow_cost",
+def run_regime_regressions(months=None, depvar="first_interval_shadow_cost",
                             save_dir=None):
     """Run per-pixel regressions for each weather regime.
 
@@ -201,10 +388,15 @@ def run_regime_regressions(months=None, depvar="total_shadow_cost",
             print(f"    {ev}: {len(sig)}/{len(sub)} sig ({pct:.0f}%), "
                   f"mean coef={mean_c:.2f}")
 
+    # Generate coefficient maps for each regime
+    if all_results:
+        print("\nGenerating regime coefficient maps...")
+        plot_regime_coefficient_maps(all_results, save_dir, dirs, depvar)
+
     return all_results
 
 
-def run_asymmetry_regressions(months=None, depvar="total_shadow_cost",
+def run_asymmetry_regressions(months=None, depvar="first_interval_shadow_cost",
                                regime_name=None, save_dir=None):
     """Test whether over- and under-forecasts have symmetric effects.
 
@@ -262,6 +454,13 @@ def run_asymmetry_regressions(months=None, depvar="total_shadow_cost",
     results.to_csv(table_path, index=False)
     print(f"\nSaved: {table_path}")
 
+    # Generate asymmetry histogram
+    hist_path = os.path.join(save_dir, f"asymmetry_histograms_{depvar}.png")
+    if regime_name:
+        hist_path = os.path.join(save_dir, f"asymmetry_histograms_{depvar}_{regime_name}.png")
+    depvar_label = depvar.replace("_", " ")
+    plot_asymmetry_histograms(results, hist_path, depvar_label=depvar_label)
+
     # Compare positive vs negative effects
     print("\n=== Asymmetry Summary ===")
     for base_var in WEATHER_ERROR_VARS:
@@ -291,7 +490,7 @@ if __name__ == "__main__":
         help="Months to include (e.g. --months 1 2 12). Default: all 12.",
     )
     parser.add_argument(
-        "--depvar", type=str, default="total_shadow_cost",
+        "--depvar", type=str, default="first_interval_shadow_cost",
         choices=CONGESTION_DEPVARS,
         help="Dependent variable.",
     )
