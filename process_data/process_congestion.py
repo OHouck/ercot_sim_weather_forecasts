@@ -189,7 +189,7 @@ def compute_hourly_congestion_metrics(year, month, force_rebuild=False):
 # ---------------------------------------------------------------------------
 
 def _load_node_coordinates():
-    """Load ERCOT node coordinates from node_coordinates.csv.
+    """Load ERCOT node coordinates from node_coordinates.csv created in process_ercot.build_node_coordinates().
 
     Returns:
         DataFrame with columns: settlement_point, lat, lon, prefix
@@ -262,7 +262,11 @@ def _load_census_tx_places():
     and caches to raw_data/census_places_tx_2025.txt.
 
     Returns:
-        dict mapping cleaned place name (uppercase alpha only) → (lat, lon).
+        dict mapping cleaned place name (uppercase alpha only) to metadata:
+        {
+            "coords": (lat, lon),
+            "source_name": original place name from Census file,
+        }
     """
     dirs = setup_directories()
     cache_places = os.path.join(dirs["raw"], "census_places_tx_2025.txt")
@@ -279,20 +283,30 @@ def _load_census_tx_places():
             except Exception as e:
                 print(f"  WARNING: Could not download Census gazetteer: {e}")
 
-    lookup: dict[str, tuple] = {}
+    lookup: dict[str, dict] = {}
     for local in [cache_places, cache_cousubs]:
         if not os.path.exists(local):
             continue
         df = pd.read_csv(local, sep="|")
         name_col = "NAME" if "NAME" in df.columns else df.columns[4]
         for _, row in df.iterrows():
-            name = str(row[name_col])
+            original_name = str(row[name_col])
             # Strip legal suffixes (city, town, village, CDP)
-            name = re.sub(r"\s+(city|town|village|CDP|borough)$", "", name,
-                          flags=re.IGNORECASE)
+            name = re.sub(
+                r"\s+(city|town|village|CDP|borough)$",
+                "",
+                original_name,
+                flags=re.IGNORECASE,
+            )
             clean = re.sub(r"[^A-Z]", "", name.upper())
             if clean and clean not in lookup:
-                lookup[clean] = (float(row["INTPTLAT"]), float(str(row["INTPTLONG"]).strip()))
+                lookup[clean] = {
+                    "coords": (
+                        float(row["INTPTLAT"]),
+                        float(str(row["INTPTLONG"]).strip()),
+                    ),
+                    "source_name": original_name,
+                }
 
     return lookup
 
@@ -329,7 +343,11 @@ def _load_eia_generators():
     """Load EIA Form 860 Texas generators with lat/lon and LMP node designation.
 
     Returns:
-        dict mapping cleaned name (uppercase alpha only) → (lat, lon).
+        dict mapping cleaned key (uppercase alpha only) to metadata:
+        {
+            "coords": (lat, lon),
+            "source_name": original EIA plant or node designation name,
+        }
     """
     dirs = setup_directories()
     eia_path = os.path.join(dirs["raw"], "eia860", "texas_generators.csv")
@@ -340,19 +358,30 @@ def _load_eia_generators():
         )
     eia = pd.read_csv(eia_path)
     eia_valid = eia.dropna(subset=["lat", "lon"])
-    lookup: dict[str, tuple] = {}
+    lookup: dict[str, dict] = {}
     for _, row in eia_valid.iterrows():
-        pname = re.sub(r"[^A-Z]", "", str(row["plant_name"]).upper())
+        coords = (float(row["lat"]), float(row["lon"]))
+
+        pname_raw = str(row["plant_name"])
+        pname = re.sub(r"[^A-Z]", "", pname_raw.upper())
         if pname and pname not in lookup:
-            lookup[pname] = (float(row["lat"]), float(row["lon"]))
+            lookup[pname] = {
+                "coords": coords,
+                "source_name": pname_raw,
+            }
+
         if pd.notna(row.get("lmp_node_designation")):
-            prefix = str(row["lmp_node_designation"]).split("_")[0].upper()
+            node_raw = str(row["lmp_node_designation"])
+            prefix = node_raw.split("_")[0].upper()
             if prefix and prefix not in lookup:
-                lookup[prefix] = (float(row["lat"]), float(row["lon"]))
+                lookup[prefix] = {
+                    "coords": coords,
+                    "source_name": node_raw,
+                }
     return lookup
 
 
-def _build_station_coords(shadow_stations):
+def _build_station_coords(shadow_stations, return_details=False):
     """Build station → (lat, lon) mapping using multiple data sources.
 
     Matching strategies (applied in priority order):
@@ -376,12 +405,28 @@ def _build_station_coords(shadow_stations):
 
     Args:
         shadow_stations: set of station names from shadow price data.
+        return_details: if True, include station-level matching metadata.
 
     Returns:
-        dict mapping station_name -> (lat, lon), and a dict of match_method.
+        if return_details is False:
+            (station_coords, match_methods)
+        if return_details is True:
+            (station_coords, match_methods, match_details)
+            where match_details[station] has cleaned_name, matched_source_name,
+            and source metadata.
     """
     station_coords: dict[str, tuple] = {}
     match_methods: dict[str, str] = {}
+    match_details: dict[str, dict] = {}
+
+    def _set_match(station, coords, method, cleaned_name=None, matched_name=""):
+        station_coords[station] = coords
+        match_methods[station] = method
+        match_details[station] = {
+            "cleaned_name": cleaned_name or re.sub(r"[^A-Z]", "", str(station).upper()),
+            "matched_source_name": matched_name,
+            "source": method,
+        }
 
     # --- Strategy 1: NP4-160 SUBSTATION → resource node → coordinates ---
     try:
@@ -391,8 +436,13 @@ def _build_station_coords(shadow_stations):
                 continue
             key = str(station).upper()
             if key in sub_lookup:
-                station_coords[station] = sub_lookup[key]
-                match_methods[station] = "np4160_substation"
+                _set_match(
+                    station,
+                    sub_lookup[key],
+                    "np4160_substation",
+                    cleaned_name=key,
+                    matched_name=str(station),
+                )
     except Exception as e:
         print(f"  WARNING: NP4-160 substation matching failed: {e}")
 
@@ -421,28 +471,34 @@ def _build_station_coords(shadow_stations):
             # Exact match
             for cand in candidates:
                 if cand in census:
-                    return census[cand], f"census_exact"
+                    return census[cand]["coords"], "census_exact", cand, census[cand]["source_name"]
             # Prefix match (station is prefix of census name, min 5 chars)
-            for cname, coords in census.items():
+            for cname, info in census.items():
                 for cand in candidates:
                     if len(cand) >= 5 and cname.startswith(cand):
-                        return coords, "census_prefix"
+                        return info["coords"], "census_prefix", cand, info["source_name"]
             # Fuzzy match (cutoff 0.8)
             for cand in candidates:
                 if len(cand) >= 5:
                     hits = get_close_matches(cand, list(census.keys()), n=1,
                                              cutoff=0.8)
                     if hits:
-                        return census[hits[0]], "census_fuzzy"
-            return None, None
+                        hit = hits[0]
+                        return census[hit]["coords"], "census_fuzzy", cand, census[hit]["source_name"]
+            return None, None, None, None
 
         for station in shadow_stations:
             if station in station_coords:
                 continue
-            coords, method = _census_match(station)
+            coords, method, cleaned_name, matched_name = _census_match(station)
             if coords:
-                station_coords[station] = coords
-                match_methods[station] = method
+                _set_match(
+                    station,
+                    coords,
+                    method,
+                    cleaned_name=cleaned_name,
+                    matched_name=matched_name,
+                )
     except Exception as e:
         print(f"  WARNING: Census geocoding failed: {e}")
 
@@ -454,8 +510,13 @@ def _build_station_coords(shadow_stations):
                 continue
             station_upper = re.sub(r"[^A-Z]", "", str(station).upper())
             if station_upper in eia_lookup:
-                station_coords[station] = eia_lookup[station_upper]
-                match_methods[station] = "eia_exact"
+                _set_match(
+                    station,
+                    eia_lookup[station_upper]["coords"],
+                    "eia_exact",
+                    cleaned_name=station_upper,
+                    matched_name=eia_lookup[station_upper]["source_name"],
+                )
     except FileNotFoundError:
         print("  WARNING: texas_generators.csv not found, skipping EIA matching")
 
@@ -476,8 +537,13 @@ def _build_station_coords(shadow_stations):
                 continue
             key = str(station).upper()
             if key in prefix_lookup:
-                station_coords[station] = prefix_lookup[key]
-                match_methods[station] = "node_prefix_legacy"
+                _set_match(
+                    station,
+                    prefix_lookup[key],
+                    "node_prefix_legacy",
+                    cleaned_name=key,
+                    matched_name=key,
+                )
     except FileNotFoundError:
         pass
 
@@ -509,11 +575,18 @@ def _build_station_coords(shadow_stations):
                         continue
                     key = str(station).upper()
                     if key in bus_lookup:
-                        station_coords[station] = bus_lookup[key]
-                        match_methods[station] = "bus_shp"
+                        _set_match(
+                            station,
+                            bus_lookup[key],
+                            "bus_shp",
+                            cleaned_name=key,
+                            matched_name=key,
+                        )
     except Exception as e:
         print(f"  WARNING: Bus shapefile matching failed: {e}")
 
+    if return_details:
+        return station_coords, match_methods, match_details
     return station_coords, match_methods
 
 
@@ -581,6 +654,85 @@ def geolocate_constraints(shadow_df):
     result = pd.DataFrame(rows)
     print(f"  Geolocated {len(result)}/{len(constraints)} constraints")
     return result
+
+
+def build_shadow_station_match_tables(year, month):
+    """Build matched/unmatched substation tables for shadow station geolocation.
+
+    Args:
+        year: Integer year.
+        month: Integer month.
+
+    Returns:
+        (matched_df, unmatched_df)
+        matched_df columns:
+            station_name, cleaned_name, matched_source_name, source, match_method,
+            latitude, longitude
+        unmatched_df columns:
+            station_name, cleaned_name
+    """
+    raw = _load_shadow_month(year, month)
+    from_stations = raw["fromStation"].dropna().unique()
+    to_stations = raw["toStation"].dropna().unique()
+    all_stations = sorted(set(from_stations) | set(to_stations))
+
+    station_coords, match_methods, match_details = _build_station_coords(
+        all_stations, return_details=True
+    )
+
+    def _coarse_source(method):
+        if method.startswith("census"):
+            return "census"
+        if method.startswith("eia"):
+            return "eia"
+        if method.startswith("np4160"):
+            return "np4160"
+        if method.startswith("node_prefix"):
+            return "node_prefix_legacy"
+        if method == "bus_shp":
+            return "bus_shp"
+        return method
+
+    matched_rows = []
+    for station in all_stations:
+        if station not in station_coords:
+            continue
+        method = match_methods.get(station, "")
+        details = match_details.get(station, {})
+        lat, lon = station_coords[station]
+        matched_rows.append(
+            {
+                "station_name": station,
+                "cleaned_name": details.get(
+                    "cleaned_name",
+                    re.sub(r"[^A-Z]", "", str(station).upper()),
+                ),
+                "matched_source_name": details.get("matched_source_name", ""),
+                "source": _coarse_source(method),
+                "match_method": method,
+                "latitude": lat,
+                "longitude": lon,
+            }
+        )
+
+    unmatched_rows = []
+    for station in all_stations:
+        if station in station_coords:
+            continue
+        unmatched_rows.append(
+            {
+                "station_name": station,
+                "cleaned_name": re.sub(r"[^A-Z]", "", str(station).upper()),
+            }
+        )
+
+    matched_df = pd.DataFrame(matched_rows)
+    unmatched_df = pd.DataFrame(unmatched_rows)
+    if not matched_df.empty:
+        matched_df = matched_df.sort_values("station_name").reset_index(drop=True)
+    if not unmatched_df.empty:
+        unmatched_df = unmatched_df.sort_values("station_name").reset_index(drop=True)
+    return matched_df, unmatched_df
 
 
 def compute_constraint_hourly_by_pixel(year, month, force_rebuild=False):
