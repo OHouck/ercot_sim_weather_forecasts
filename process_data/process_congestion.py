@@ -801,7 +801,7 @@ def compute_constraint_hourly_by_pixel(year, month, force_rebuild=False):
 
 
 # ---------------------------------------------------------------------------
-# Merge helpers (for combine_forecast_generation_node.py)
+# Merge helpers (for create_pixel_level_data.py)
 # ---------------------------------------------------------------------------
 
 def merge_congestion_system(pixel_df, year, month, time_col="valid_time"):

@@ -21,8 +21,8 @@ import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
 import geopandas as gpd
 from shapely.geometry import box as shapely_box
-import xarray as xr
 import pyfixest as pf
+import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from helper_funcs import setup_directories
@@ -37,6 +37,29 @@ ERROR_VARS = [
 CONTROLS = ["era5_temp", "era5_wspd", "actual_load", "is_weekend"]
 FE = ["hour_of_day", "month"]
 SIG_LEVEL = 0.05
+
+REGIMES = {
+    "extreme_cold": {
+        "filter_col": "regime_temp",
+        "filter_val": "extreme_cold",
+        "label": "Extreme Cold (Bottom 5% Temp)",
+    },
+    "extreme_heat": {
+        "filter_col": "regime_temp",
+        "filter_val": "extreme_heat",
+        "label": "Extreme Heat (Top 5% Temp)",
+    },
+    "high_wind": {
+        "filter_col": "regime_wind",
+        "filter_val": "high_wind",
+        "label": "High Wind (Top 10% Wind Speed)",
+    },
+    "stressed_grid": {
+        "filter_col": "regime_grid",
+        "filter_val": "stressed",
+        "label": "Stressed Grid (Top 5% LMP Max)",
+    },
+}
 
 SEASONS = {
     "summer":   {"months": [6, 7, 8],               "label": "Summer (Jun–Aug)"},
@@ -224,32 +247,43 @@ def _draw_overlays(ax, dirs, overlay, proj):
     return legend_handles
 
 
-def _build_texas_mask(lats, lons):
-    """Return (n_lat, n_lon) boolean mask — True for pixels inside Texas."""
-    import shapely
 
-    states_shp = shpreader.natural_earth(
-        resolution='10m', category='cultural', name='admin_1_states_provinces'
-    )
-    texas_geom = None
-    for record in shpreader.Reader(states_shp).records():
-        if record.attributes.get('name') == 'Texas':
-            texas_geom = record.geometry
-            break
-    if texas_geom is None:
-        raise ValueError("Texas geometry not found in Natural Earth shapefile.")
 
-    lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
-    points = shapely.points(lon_grid.ravel(), lat_grid.ravel())
-    return shapely.within(points, texas_geom).reshape(len(lats), len(lons))
+def add_regime_columns(df):
+    """Add weather/grid regime columns using system-wide hourly aggregates."""
+    from process_data.classify_weather_regimes import classify_regimes
+    return classify_regimes(df)
+
+
+def filter_to_regime(df, regime_name):
+    """Filter DataFrame to hours matching a specific regime.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with regime columns added by add_regime_columns().
+    regime_name : str
+        Key in REGIMES dict.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    spec = REGIMES[regime_name]
+    mask = df[spec["filter_col"]] == spec["filter_val"]
+    filtered = df[mask].copy()
+    n_hours = filtered["valid_time"].nunique()
+    print(f"  Regime '{regime_name}': {n_hours} hours, {len(filtered):,} rows")
+    return filtered
 
 
 def load_pixel_data(months):
-    """Load all ERA5 pixels inside Texas for the given months.
+    """Load the pixel × hour analysis dataset for the given months.
 
-    Reads ERA5 error NetCDFs (HRRR lead=1h, GFS lead=0h) covering every
-    ERA5 pixel in Texas, then merges system-level LMP and time features
-    from the combined pixel_hourly parquets.
+    Reads directly from the pre-built pixel_hourly parquets, which already
+    contain ERA5 forecast errors (HRRR 1h/18h + GFS 0h), observed weather,
+    generation map, system LMP, congestion metrics, curtailment metrics, and
+    weather-zone load data.  No raw NetCDF reads are needed here.
 
     Parameters
     ----------
@@ -260,137 +294,31 @@ def load_pixel_data(months):
     pd.DataFrame
     """
     dirs = setup_directories()
-    errors_dir = Path(dirs["processed"]) / "forecast_errors_era5"
     lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
-
-    LMP_COLS = ["system_lmp_mean", "system_lmp_max", "system_lmp_std"]
-    CONGESTION_COLS = [
-        "n_binding_constraints", "total_shadow_cost", "max_shadow_price",
-        "shadow_cost_weighted", "n_violations", "total_violated_mw",
-        "mean_shadow_cost_per_interval", "first_interval_shadow_cost",
-    ]
-    CURTAILMENT_COLS = [
-        "wind_curtailment_mw", "solar_curtailment_mw", "total_curtailment_mw",
-        "wind_curtailment_pct", "solar_curtailment_pct", "n_curtailed_units",
-    ]
-    ALL_SYSTEM_COLS = LMP_COLS + CONGESTION_COLS + CURTAILMENT_COLS
-
-    texas_mask = None
-    lats = lons = None
-    tx_lat_idx = tx_lon_idx = None
-    pixel_ids = None
 
     dfs = []
     for year, month in months:
-        hrrr_path = (errors_dir / "hrrr" / str(year) / f"{month:02d}"
-                     / f"era5_errors_{year}{month:02d}.nc")
-        gfs_path  = (errors_dir / "gfs"  / str(year) / f"{month:02d}"
-                     / f"era5_errors_{year}{month:02d}.nc")
-        lmp_path  = lmp_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
-
-        for label, p in [("HRRR errors", hrrr_path), ("GFS errors", gfs_path),
-                         ("pixel_hourly", lmp_path)]:
-            if not p.exists():
-                print(f"  [WARNING] Missing {label}: {p}")
-
-        if not hrrr_path.exists() or not gfs_path.exists() or not lmp_path.exists():
+        lmp_path = lmp_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
+        if not lmp_path.exists():
+            print(f"  [WARNING] Missing pixel_hourly parquet: {lmp_path}")
             continue
 
-        ds_hrrr = xr.open_dataset(hrrr_path)
-        ds_gfs  = xr.open_dataset(gfs_path)
-
-        # Build Texas mask once from the first month's grid
-        if lats is None:
-            lats = ds_hrrr["latitude"].values
-            lons = ds_hrrr["longitude"].values
-            print("Building Texas pixel mask...")
-            texas_mask = _build_texas_mask(lats, lons)
-            tx_lat_idx, tx_lon_idx = np.where(texas_mask)
-            lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
-            tx_lat = lat_grid[texas_mask]
-            tx_lon = lon_grid[texas_mask]
-            pixel_ids = [f"{la:.1f}_{lo:.1f}" for la, lo in zip(tx_lat, tx_lon)]
-
-        hrrr_sel = ds_hrrr.sel(lead_hours=1)
-        gfs_sel  = ds_gfs.sel(lead_hours=0)
-
-        # Align on common valid_times (HRRR and GFS may differ)
-        hrrr_times = pd.DatetimeIndex(hrrr_sel["valid_time"].values)
-        gfs_times  = pd.DatetimeIndex(gfs_sel["valid_time"].values)
-        common_times = hrrr_times.intersection(gfs_times)
-        if len(common_times) == 0:
-            print(f"  [WARNING] No overlapping times for {year}-{month:02d}, skipping")
-            ds_hrrr.close()
-            ds_gfs.close()
-            continue
-
-        hrrr_aligned = hrrr_sel.sel(valid_time=common_times.values)
-        gfs_aligned  = gfs_sel.sel(valid_time=common_times.values)
-
-        valid_times = common_times
-        n_time    = len(valid_times)
-        n_pixels  = len(tx_lat_idx)
-
-        # Extract error/obs arrays: (T, lat, lon) → (T, n_pixels)
-        def _tx(arr):
-            return arr[:, tx_lat_idx, tx_lon_idx]
-
-        temp_err_1h = _tx(hrrr_aligned["temp_error"].values)
-        wspd_err_1h = _tx(hrrr_aligned["wspd_error"].values)
-        era5_temp   = _tx(hrrr_aligned["era5_temp"].values)
-        era5_wspd   = _tx(hrrr_aligned["era5_wspd"].values)
-        temp_err_0h = _tx(gfs_aligned["temp_error"].values)
-        wspd_err_0h = _tx(gfs_aligned["wspd_error"].values)
-
-        ds_hrrr.close()
-        ds_gfs.close()
-
-        # Build long-form DataFrame: (T × n_pixels) rows
-        df_month = pd.DataFrame({
-            "valid_time":    np.repeat(valid_times, n_pixels),
-            "latitude":      np.tile(lat_grid[texas_mask], n_time),
-            "longitude":     np.tile(lon_grid[texas_mask], n_time),
-            "pixel_id":      np.tile(pixel_ids, n_time),
-            "temp_error_1h": temp_err_1h.ravel(),
-            "wspd_error_1h": wspd_err_1h.ravel(),
-            "era5_temp":     era5_temp.ravel(),
-            "era5_wspd":     era5_wspd.ravel(),
-            "temp_error_0h": temp_err_0h.ravel(),
-            "wspd_error_0h": wspd_err_0h.ravel(),
-        })
-
-        # Load system-level LMP + congestion from parquet (one value per hour)
-        # Read schema to discover available columns (congestion may not exist)
-        import pyarrow.parquet as pq_schema
-        pq_all_cols = pq_schema.read_schema(lmp_path).names
-        cols_to_load = ["valid_time"] + [
-            c for c in ALL_SYSTEM_COLS if c in pq_all_cols
-        ]
-        lmp_df = pd.read_parquet(lmp_path, columns=cols_to_load)
-        lmp_df["valid_time"] = pd.to_datetime(lmp_df["valid_time"])
-        if lmp_df["valid_time"].dt.tz is not None:
-            lmp_df["valid_time"] = lmp_df["valid_time"].dt.tz_localize(None)
-        lmp_df = lmp_df.drop_duplicates("valid_time").set_index("valid_time")
-
+        df_month = pd.read_parquet(lmp_path)
         df_month["valid_time"] = pd.to_datetime(df_month["valid_time"])
         if df_month["valid_time"].dt.tz is not None:
             df_month["valid_time"] = df_month["valid_time"].dt.tz_localize(None)
 
-        for col in lmp_df.columns:
-            df_month[col] = df_month["valid_time"].map(lmp_df[col])
+        if "is_weekend" not in df_month.columns:
+            df_month["is_weekend"] = (df_month["weekday"] >= 5).astype(int)
 
-        # Derive time features from valid_time
-        df_month["hour_of_day"] = df_month["valid_time"].dt.hour
-        df_month["month"] = df_month["valid_time"].dt.month
-        df_month["weekday"] = df_month["valid_time"].dt.weekday
-        df_month["is_weekend"] = (df_month["weekday"] >= 5).astype(int)
-
+        n_pixels = df_month["pixel_id"].nunique()
+        n_hours = df_month["valid_time"].nunique()
         print(f"  Loaded {year}-{month:02d}: {len(df_month):,} rows "
-              f"({n_pixels:,} Texas pixels × {n_time} hours)")
+              f"({n_pixels:,} Texas pixels × {n_hours} hours)")
         dfs.append(df_month)
 
     if not dfs:
-        raise FileNotFoundError("No ERA5 error files found.")
+        raise FileNotFoundError("No pixel_hourly parquet files found.")
 
     df = pd.concat(dfs, ignore_index=True)
     n_pixels = df["pixel_id"].nunique()
@@ -435,6 +363,7 @@ def run_pixel_regressions(df, depvar=DEPVAR, min_obs=100,
     # Filter error_vars and controls to only those present in data
     error_vars = [v for v in error_vars if v in df.columns]
     controls = [v for v in controls if v in df.columns]
+    # throw a warning if there are any 
     fe = [v for v in fe if v in df.columns]
 
     # Drop 'month' FE if only 1 month of data (no variation)
@@ -654,7 +583,8 @@ def plot_pixel_coefficient_map(
 
 
 def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
-                               depvar=None, tag=None):
+                               depvar=None, tag=None, regime=None,
+                               no_controls=False):
     """Main entry point: run pixel regressions and produce 2×2 map.
 
     Parameters
@@ -670,7 +600,15 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
         Dependent variable. Defaults to DEPVAR ('total_shadow_cost').
     tag : str, optional
         Suffix for output filenames (e.g., 'summer', 'system_lmp_max').
-        Defaults to depvar if not provided.
+        Defaults to depvar (or depvar_regime when regime is set).
+    regime : str, optional
+        Restrict analysis to an extreme weather regime. One of:
+        'extreme_cold', 'extreme_heat', 'high_wind', 'stressed_grid'.
+        When set, uses min_obs=50 instead of 100 and appends regime label
+        to the figure title.
+    no_controls : bool, optional
+        If True, drop all control variables and fixed effects and regress the
+        outcome only on the forecast error variables.
 
     Returns
     -------
@@ -682,8 +620,12 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
         overlay = ['wind', 'solar', 'transmission', 'cities']
     if depvar is None:
         depvar = DEPVAR
+    if regime is not None and regime not in REGIMES:
+        raise ValueError(
+            f"Unknown regime '{regime}'. Choose from: {list(REGIMES.keys())}"
+        )
     if tag is None:
-        tag = depvar
+        tag = depvar if regime is None else f"{depvar}_{regime}"
 
     dirs = setup_directories()
 
@@ -699,6 +641,20 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
     # --- Load data ---
     df = load_pixel_data(months)
 
+    # --- Apply regime filter ---
+    if regime is not None:
+        print(f"\nApplying regime filter: {REGIMES[regime]['label']}")
+        df = add_regime_columns(df)
+        df = filter_to_regime(df, regime)
+        if df["valid_time"].nunique() < 20:
+            raise ValueError(
+                f"Too few hours ({df['valid_time'].nunique()}) for regime '{regime}'. "
+                "Try a longer time window."
+            )
+
+    min_obs = 50 if regime is not None else 100
+    fe = [] if no_controls else None # setting to none uses defaults
+
     # --- Run regressions ---
     # Use only error vars and controls that are actually present and have
     # sufficient non-NaN coverage. If a variable drops >80% of obs, skip it.
@@ -711,7 +667,12 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
             print(f"  Dropping '{v}' from regression (only {frac_valid*100:.0f}% non-NaN)")
         else:
             avail_errors.append(v)
-    avail_controls = [v for v in CONTROLS if v in df.columns and df[v].notna().mean() > 0.2]
+    if no_controls:
+        avail_controls = []
+        # update tag to reflect no controls
+        tag += "_no_controls"
+    else:
+        avail_controls = [v for v in CONTROLS if v in df.columns and df[v].notna().mean() > 0.2]
 
     if not avail_errors:
         print("  WARNING: No error variables available for regression.")
@@ -721,6 +682,8 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
             df, depvar=depvar,
             error_vars=avail_errors,
             controls=avail_controls,
+            fe=fe,
+            min_obs=min_obs,
         )
 
     # --- Save regression results table ---
@@ -811,13 +774,19 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
     depvar_label = depvar.replace("_", " ")
     period_label = _period_label_from_months(months)
     title_main = f"Pixel-Level Regression Coefficients: Forecast Error \u2192 {depvar_label}"
+    subtitle_parts = []
+    if regime is not None:
+        subtitle_parts.append(REGIMES[regime]["label"])
     if period_label is not None:
-        title_main = f"{title_main} [{period_label}]"
+        subtitle_parts.append(period_label)
+    if subtitle_parts:
+        title_main = f"{title_main} [{', '.join(subtitle_parts)}]"
 
     fig.suptitle(
         f"{title_main}\n"
-        "(only significant pixels shown, p < 0.05; "
-        "controls: observed weather, weekend FE; FE: hour-of-day, month)",
+        f"(only significant pixels shown, p < 0.05; controls: "
+        f"{'none' if no_controls else 'observed weather, weekend'}; "
+        f"{'FE: hour-of-day, month' if not no_controls else 'FE: none'})",
         fontsize=13,
         y=0.98,
     )

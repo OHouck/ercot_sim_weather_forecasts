@@ -1,37 +1,17 @@
 """
-Graph Neural Network: Weather Forecast Error Impact on ERCOT LMP
-================================================================
+Graph Neural Network: Weather Forecast Error Impact on ERCOT Node LMP
+=====================================================================
 
-v3 — Transmission-guided graph with virtual super node
-
-Graph construction:
-  1. Load ERCOT 345 kV transmission lines from Line_Output.shp
-  2. Map each settlement-point node to its nearest simulation bus
-  3. Connect nodes whose mapped buses share a transmission line
-  4. Fix isolated nodes by connecting to k=3 nearest connected nodes
-  5. Add a **virtual super node** connected to every real node
-
-Full propagation mechanism:
-  The virtual super node acts as a system-wide information aggregator,
-  analogous to the ERCOT system operator's global dispatch view.  In the
-  first GAT layer every real node sends its embedding to the virtual node,
-  which computes an attention-weighted global summary.  In the second layer
-  the virtual node broadcasts that summary back, so every real node
-  receives information about every other real node — even those many hops
-  away on the transmission graph.  This gives full shock propagation in
-  just two layers, without O(N^2) global self-attention.  The GAT's
-  learned attention weights control how much each node contributes to (and
-  draws from) the global state versus its local transmission neighbors.
+v4 — Transmission-guided node-level prediction (no virtual super node)
 
 Usage:
-    uv run python -m analysis.node_gnn
+        uv run python -m analysis.node_gnn
 """
 
 import glob
 import os
 import re
 import sys
-import warnings
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -42,6 +22,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
+import statsmodels.api as sm
 from scipy.spatial import KDTree
 from sklearn.preprocessing import StandardScaler
 
@@ -51,34 +32,40 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATConv
+from torch_geometric.utils import dropout_edge
+from captum.attr import IntegratedGradients
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from helper_funcs import setup_directories
-from process_data.prepare_node_level_data import prepare_node_level_data
+from process_data.process_ercot import load_rt_spp_month
 
 # ── Configuration ────────────────────────────────────────────────
 # Uses combined HRRR (1h short-range) + GFS (day-ahead, lead=0) by default
 ERROR_SOURCE = "era5"
 MONTHS = [(2025, m) for m in range(1, 13)]
 
-FALLBACK_K = 3            # k-NN for isolated nodes
-HIDDEN_DIM = 128
-N_HEADS = 4
-N_GAT_LAYERS = 2          # 2 layers suffice (virtual node = diameter-2)
-DROPOUT = 0.3             # v4: increased from 0.2 to reduce overfitting
-MLP_HIDDEN = 64
+HIDDEN_DIM = 64
+N_HEADS = 2
+N_GAT_LAYERS = 4
+DROPOUT = 0.5
+INPUT_DROPOUT = 0.2
+INPUT_NOISE_STD = 0.02
+EMBED_L2 = 5e-4
+EDGE_DROPOUT = 0.30
 
 TRAIN_DAYS = (1, 15)
 VAL_DAYS = (16, 25)
 TEST_DAYS = (26, 31)
 
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+LEARNING_RATE = 7e-4
+WEIGHT_DECAY = 1e-2
 MAX_EPOCHS = 200
-PATIENCE = 40             # v4: increased from 20 (val curve is noisy)
+PATIENCE = 25
 WARMUP_EPOCHS = 5
-NODE_EMBED_DIM = 8        # v5: learnable per-node embedding dimension
+MIN_EPOCHS = 25
+NODE_EMBED_DIM = 0        # disable node-ID memorization by default
+TARGET_TRANSFORM_QUANTILE = 75
 
 dirs = setup_directories()
 _GIS_ROOT = os.path.join(dirs["root"], "Texas_GIS_Data")
@@ -108,23 +95,18 @@ WEATHER_ZONES = [
 ]
 
 BASE_NUMERIC_COLS = [
-    "observed_temp",       # 0
-    "observed_wspd",       # 1
-    "temp_error_1h",       # 2  HRRR short-range
-    "wspd_error_1h",       # 3  HRRR short-range
-    "temp_error_0h",       # 4  GFS day-ahead
-    "wspd_error_0h",       # 5  GFS day-ahead
-    "forecast_temp_1h",    # 6
-    "forecast_wspd_1h",    # 7
-    "actual_load",         # 8
-    "forecast_load_1h",    # 9
-    "load_error_1h",       # 10
-    "lat",                 # 11
-    "lon",                 # 12
+    "temp_error_1h_resid",
+    "wspd_error_1h_resid",
+    "temp_error_0h_resid",
+    "wspd_error_0h_resid",
+    "era5_temp_resid",
+    "era5_wspd_resid",
+    "lat",
+    "lon",
 ]
-TARGET_COL = "lmp"
+TARGET_COL = "lmp_resid"
 
-ERROR_FEATURE_INDICES = [2, 3, 4, 5]
+ERROR_FEATURE_INDICES = [0, 1, 2, 3]
 ERROR_FEATURE_NAMES = [
     "temp_error_1h", "wspd_error_1h",   # HRRR short-range
     "temp_error_0h", "wspd_error_0h",   # GFS day-ahead
@@ -135,8 +117,6 @@ LMP_CLIP_HI = 99
 
 # Edge type constants (stored as edge_attr feature 2)
 EDGE_TRANSMISSION = 0
-EDGE_FALLBACK_KNN = 1
-EDGE_VIRTUAL = 2
 
 # Technology types for node classification
 TECH_TYPES = ["wind", "solar", "gas", "storage", "other"]
@@ -175,17 +155,163 @@ def _classify_node_tech(node_order):
 
 # ── Data Loading ─────────────────────────────────────────────────
 
+def residualize_on_time_fe(series, hour_of_day, weekday, month):
+    """Remove cyclical time fixed effects and return residuals."""
+    hour_sin, hour_cos = _encode_cyclical(hour_of_day.values, 24)
+    wday_sin, wday_cos = _encode_cyclical(weekday.values, 7)
+    mon_sin, mon_cos = _encode_cyclical(month.values, 12)
+    X = np.column_stack([hour_sin, hour_cos, wday_sin, wday_cos, mon_sin, mon_cos])
+    X = sm.add_constant(X, has_constant="add")
+    mask = np.isfinite(series.values)
+    resid = np.full(len(series), np.nan, dtype=np.float32)
+    if mask.sum() < 10:
+        return pd.Series(np.nan_to_num(series.values, nan=0.0), index=series.index)
+    fit = sm.OLS(series.values[mask], X[mask]).fit()
+    resid[mask] = fit.resid.astype(np.float32)
+    return pd.Series(np.nan_to_num(resid, nan=0.0), index=series.index)
+
+
+def _build_rt_hour_timestamp(rt_df):
+    """Build robust hourly timestamp from RT SPP schema variants."""
+    if "deliveryDate" in rt_df.columns:
+        base_date = pd.to_datetime(rt_df["deliveryDate"], errors="coerce")
+    else:
+        base_date = pd.Series(pd.NaT, index=rt_df.index)
+
+    hour_col = None
+    for c in ["deliveryHour", "hourEnding", "hour"]:
+        if c in rt_df.columns:
+            hour_col = c
+            break
+
+    if hour_col is not None:
+        hour_vals = pd.to_numeric(rt_df[hour_col], errors="coerce")
+        # ERCOT hour-ending fields are typically 1..24; convert to hour-beginning.
+        finite_hours = hour_vals[np.isfinite(hour_vals)]
+        if len(finite_hours) and finite_hours.min() >= 1 and finite_hours.max() <= 24:
+            hour_vals = hour_vals - 1
+        ts = base_date + pd.to_timedelta(hour_vals, unit="h")
+    elif "SCEDTimestamp" in rt_df.columns:
+        ts = pd.to_datetime(rt_df["SCEDTimestamp"], errors="coerce")
+    elif "deliveryInterval" in rt_df.columns:
+        interval = pd.to_numeric(rt_df["deliveryInterval"], errors="coerce")
+        ts = base_date + pd.to_timedelta((interval - 1) * 15, unit="m")
+    else:
+        raise ValueError("Could not construct hourly timestamp from RT SPP data.")
+
+    return pd.to_datetime(ts, errors="coerce").dt.floor("h")
+
+
 def load_data():
+    """Load pixel-hour features and node-level hourly LMP targets."""
     dirs = setup_directories()
-    df = prepare_node_level_data(
-        months=MONTHS, error_source=ERROR_SOURCE,
+
+    pixel_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
+    frames = []
+    for year, month in MONTHS:
+        p = pixel_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
+        if not p.exists():
+            continue
+        cols = [
+            "valid_time", "pixel_id", "latitude", "longitude",
+            "temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h",
+            "era5_temp", "era5_wspd", "total_shadow_cost",
+            "hour_of_day", "weekday", "month",
+        ]
+        frames.append(pd.read_parquet(p, columns=cols))
+
+    if not frames:
+        raise FileNotFoundError("No pixel_hourly parquet files found for configured months.")
+
+    pixel_df = pd.concat(frames, ignore_index=True)
+    pixel_df["hour"] = pd.to_datetime(pixel_df["valid_time"]).dt.floor("h")
+
+    rt_frames = []
+    for year, month in MONTHS:
+        try:
+            rt = load_rt_spp_month(year, month)
+        except FileNotFoundError:
+            continue
+
+        sp_col = "settlementPoint"
+        if sp_col not in rt.columns and "settlementPointName" in rt.columns:
+            sp_col = "settlementPointName"
+        if sp_col not in rt.columns:
+            continue
+
+        if "settlementPointType" in rt.columns:
+            rt = rt[rt["settlementPointType"] == "RN"].copy()
+
+        rt["hour"] = _build_rt_hour_timestamp(rt)
+        rt["lmp"] = pd.to_numeric(rt["settlementPointPrice"], errors="coerce")
+        rt = rt.dropna(subset=["hour", "lmp"])
+        rt = rt.rename(columns={sp_col: "settlement_point"})
+        rt_frames.append(rt[["settlement_point", "hour", "lmp"]])
+
+    if not rt_frames:
+        raise FileNotFoundError("No RT SPP data found for configured months.")
+
+    rt_hourly = (
+        pd.concat(rt_frames, ignore_index=True)
+        .groupby(["settlement_point", "hour"], as_index=False)["lmp"]
+        .mean()
     )
-    df["hour"] = pd.to_datetime(df["hour"])
-    node_coords = pd.read_csv(
-        os.path.join(dirs["processed"], "node_coordinates.csv")
+
+    node_coords = pd.read_csv(os.path.join(dirs["processed"], "node_coordinates.csv"))
+    node_coords = node_coords.dropna(subset=["lat", "lon"]).copy()
+
+    pixel_coords = (
+        pixel_df[["pixel_id", "latitude", "longitude"]]
+        .drop_duplicates("pixel_id")
+        .dropna(subset=["latitude", "longitude"])
+        .reset_index(drop=True)
     )
-    node_coords = node_coords.dropna(subset=["lat", "lon"])
-    return df, node_coords, dirs
+    if pixel_coords.empty:
+        pixel_coords = pixel_df[["pixel_id"]].drop_duplicates("pixel_id").copy()
+        latlon = pixel_coords["pixel_id"].str.split("_", n=1, expand=True)
+        pixel_coords["latitude"] = pd.to_numeric(latlon[0], errors="coerce")
+        pixel_coords["longitude"] = pd.to_numeric(latlon[1], errors="coerce")
+        pixel_coords = (
+            pixel_coords
+            .dropna(subset=["latitude", "longitude"])
+            .reset_index(drop=True)
+        )
+    if pixel_coords.empty:
+        raise ValueError("No valid pixel coordinates available for nearest-neighbor mapping.")
+    tree = KDTree(pixel_coords[["latitude", "longitude"]].values)
+    node_coords["pixel_id"] = pd.NA
+    valid_nodes = np.isfinite(node_coords[["lat", "lon"]].to_numpy()).all(axis=1)
+    if valid_nodes.any():
+        _, nn_idx = tree.query(node_coords.loc[valid_nodes, ["lat", "lon"]].to_numpy(), k=1)
+        nn_idx = np.asarray(nn_idx, dtype=int)
+        nn_idx = np.clip(nn_idx, 0, len(pixel_coords) - 1)
+        mapped_pixels = pixel_coords["pixel_id"].to_numpy()[nn_idx]
+        node_coords.loc[valid_nodes, "pixel_id"] = mapped_pixels
+    node_coords = node_coords.dropna(subset=["pixel_id"]).copy()
+
+    node_hour = pixel_df.merge(
+        node_coords[["settlement_point", "pixel_id", "lat", "lon"]],
+        on="pixel_id", how="inner",
+    )
+    node_hour = node_hour.merge(rt_hourly, on=["settlement_point", "hour"], how="inner")
+
+    lo = np.nanpercentile(node_hour["lmp"], LMP_CLIP_LO)
+    hi = np.nanpercentile(node_hour["lmp"], LMP_CLIP_HI)
+    node_hour["lmp"] = node_hour["lmp"].clip(lo, hi)
+
+    node_hour[TARGET_COL] = residualize_on_time_fe(
+        node_hour["lmp"],
+        node_hour["hour_of_day"],
+        node_hour["weekday"],
+        node_hour["month"],
+    )
+
+    for col in ["temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h", "era5_temp", "era5_wspd"]:
+        node_hour[f"{col}_resid"] = residualize_on_time_fe(
+            node_hour[col], node_hour["hour_of_day"], node_hour["weekday"], node_hour["month"]
+        )
+
+    return node_hour, node_coords, dirs
 
 
 # ── Graph Construction ───────────────────────────────────────────
@@ -204,16 +330,13 @@ def build_transmission_graph(node_coords):
       4. The result is a backbone graph where every bus has ≥ 1 mapped node.
       5. Connect settlement-point nodes whose backbone buses share an edge,
          plus all nodes that share the same backbone bus (intra-bus edges).
-      6. Add a virtual super node connected to every real node.
-
-    Returns:
-        edge_index:       (2, E) LongTensor  — includes virtual-node edges
-        edge_attr:        (E, 2) FloatTensor — [normalised distance, edge type]
-        node_order:       list of settlement_point names (length N)
-        positions:        (N, 2) ndarray of (lat, lon) for real nodes
-        virtual_node_idx: int — index of the virtual super node (= N)
-        backbone_bus_pos: (M, 2) ndarray of (lat, lon) for backbone buses
-        backbone_edges:   list of (lat1, lon1, lat2, lon2) for backbone edges
+        Returns:
+                edge_index:       (2, E) LongTensor
+                edge_attr:        (E, 2) FloatTensor — [normalised distance, edge type]
+                node_order:       list of settlement_point names (length N)
+                positions:        (N, 2) ndarray of (lat, lon) for real nodes
+                backbone_bus_pos: (M, 2) ndarray of (lat, lon) for backbone buses
+                backbone_edges:   list of (lat1, lon1, lat2, lon2) for backbone edges
     """
     # ── Load shapefiles ──
     lines = gpd.read_file(LINE_SHP)
@@ -308,12 +431,6 @@ def build_transmission_graph(node_coords):
                     if (s, d) not in edge_set:
                         edge_set[(s, d)] = (dist, EDGE_TRANSMISSION)
 
-    # ── Virtual super node ──
-    virtual_idx = num_nodes
-    for i in range(num_nodes):
-        edge_set[(virtual_idx, i)] = (0.0, EDGE_VIRTUAL)
-        edge_set[(i, virtual_idx)] = (0.0, EDGE_VIRTUAL)
-
     # ── Assemble tensors ──
     src_list, dst_list, dist_list, type_list = [], [], [], []
     for (s, d), (dist, etype) in edge_set.items():
@@ -325,16 +442,14 @@ def build_transmission_graph(node_coords):
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
 
     dist_arr = np.array(dist_list, dtype=np.float32)
-    real_mask = np.array(type_list) != EDGE_VIRTUAL
-    dist_max = dist_arr[real_mask].max() if real_mask.any() else 1.0
-    dist_norm = np.where(real_mask, dist_arr / max(dist_max, 1e-8), 0.0)
+    dist_max = dist_arr.max() if len(dist_arr) else 1.0
+    dist_norm = np.where(np.isfinite(dist_arr), dist_arr / max(dist_max, 1e-8), 0.0)
 
     type_arr = np.array(type_list, dtype=np.float32)
     edge_attr = torch.tensor(
         np.stack([dist_norm, type_arr], axis=1), dtype=torch.float32,
     )
 
-    print(f"  Virtual-node edges: {num_nodes} (bidirectional)")
     print(f"  Total edges: {edge_index.shape[1]}")
 
     # ── Backbone visualisation data ──
@@ -349,7 +464,7 @@ def build_transmission_graph(node_coords):
         if a in bus_latlon and b in bus_latlon
     ]
 
-    return (edge_index, edge_attr, node_order, positions, virtual_idx,
+    return (edge_index, edge_attr, node_order, positions,
             backbone_bus_pos, backbone_edges)
 
 
@@ -360,64 +475,15 @@ def _encode_cyclical(values, period):
     return np.sin(angle), np.cos(angle)
 
 
-def prepare_features(df, node_order, virtual_node_idx):
-    """Build per-hour (X, y, mask) arrays.  Appends a virtual super node
-    whose features are the system-wide mean of all valid real nodes.
-
-    Returns:
-        hours, hour_to_features, num_features
-    """
+def prepare_features(df, node_order):
+    """Build per-hour graph features with node-level targets."""
     node_to_idx = {sp: i for i, sp in enumerate(node_order)}
-    num_real = len(node_order)
-    num_total = num_real + 1   # real nodes + virtual node
+    num_nodes = len(node_order)
 
     df_f = df[df["settlement_point"].isin(node_to_idx)].copy()
     df_f["node_idx"] = df_f["settlement_point"].map(node_to_idx)
 
-    # Weather zone one-hot
-    for zone in WEATHER_ZONES:
-        df_f[f"wz_{zone}"] = (df_f["weather_zone"] == zone).astype(np.float32)
-    wz_cols = [f"wz_{z}" for z in WEATHER_ZONES]
-
-    # Technology type one-hot (v4)
-    tech_map = _classify_node_tech(node_order)
-    tech_counts = pd.Series(tech_map).value_counts()
-    print(f"  Node tech: {tech_counts.to_dict()}")
-    for tt in TECH_TYPES:
-        df_f[f"tech_{tt}"] = (
-            df_f["settlement_point"].map(tech_map) == tt
-        ).astype(np.float32)
-    tech_cols = [f"tech_{tt}" for tt in TECH_TYPES]
-
-    # Interaction features: forecast error × technology (v4)
-    df_f["wspd_err_1h_x_wind"] = df_f["wspd_error_1h"] * df_f["tech_wind"]
-    df_f["temp_err_1h_x_solar"] = df_f["temp_error_1h"] * df_f["tech_solar"]
-    interaction_cols = [
-        "wspd_err_1h_x_wind", 
-        "temp_err_1h_x_solar", 
-    ]
-
-    # System-wide hourly aggregates (v5) — same value for all nodes in an
-    # hour, giving the model context about the overall system state.
-    sys_agg = df_f.groupby("hour").agg(
-        sys_mean_temp_err_1h=("temp_error_1h", "mean"),
-        sys_mean_wspd_err_1h=("wspd_error_1h", "mean"),
-        sys_mean_load=("actual_load", "mean"),
-    ).reset_index()
-    df_f = df_f.merge(sys_agg, on="hour", how="left")
-    sys_cols = list(sys_agg.columns.drop("hour"))
-    print(f"  System-wide features: {sys_cols}")
-
-    # Cyclical time features
-    df_f["hod_sin"], df_f["hod_cos"] = _encode_cyclical(df_f["hour_of_day"], 24)
-    df_f["wday_sin"], df_f["wday_cos"] = _encode_cyclical(df_f["weekday"], 7)
-    df_f["mon_sin"], df_f["mon_cos"] = _encode_cyclical(df_f["month"], 12)
-    cyclical_cols = [
-        "hod_sin", "hod_cos", "wday_sin", "wday_cos", "mon_sin", "mon_cos",
-    ]
-
-    feature_cols = (BASE_NUMERIC_COLS + wz_cols + tech_cols
-                    + interaction_cols + sys_cols + cyclical_cols)
+    feature_cols = BASE_NUMERIC_COLS
     num_features = len(feature_cols)
 
     hours = sorted(df_f["hour"].unique())
@@ -425,28 +491,18 @@ def prepare_features(df, node_order, virtual_node_idx):
 
     grouped = df_f.groupby("hour")
     for hour, group in grouped:
-        X = np.full((num_total, num_features), np.nan, dtype=np.float32)
-        y = np.full(num_total, np.nan, dtype=np.float32)
-        mask = np.zeros(num_total, dtype=bool)
+        X = np.full((num_nodes, num_features), np.nan, dtype=np.float32)
+        y = np.full(num_nodes, np.nan, dtype=np.float32)
+        y_raw = np.full(num_nodes, np.nan, dtype=np.float32)
+        mask = np.zeros(num_nodes, dtype=bool)
 
         idxs = group["node_idx"].values
         X[idxs] = group[feature_cols].values.astype(np.float32)
         y[idxs] = group[TARGET_COL].values.astype(np.float32)
+        y_raw[idxs] = group["lmp"].values.astype(np.float32)
         mask[idxs] = True
 
-        # Virtual node: system-wide mean of all valid real-node features
-        valid = mask[:num_real]
-        if valid.any():
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                vn_feats = np.nanmean(X[:num_real][valid], axis=0)
-            X[virtual_node_idx] = np.nan_to_num(vn_feats, nan=0.0)
-        else:
-            X[virtual_node_idx] = 0.0
-        # Virtual node never has an LMP target
-        mask[virtual_node_idx] = False
-
-        hour_to_features[hour] = (X, y, mask)
+        hour_to_features[hour] = (X, y, y_raw, mask)
 
     return hours, hour_to_features, num_features
 
@@ -465,143 +521,118 @@ def build_pyg_datasets(hours, hour_to_features, edge_index, edge_attr):
     print(f"  Train hours: {len(train_hours)}, Val: {len(val_hours)}, "
           f"Test: {len(test_hours)}")
 
-    # ── Per-node mean LMP from training data (for target demeaning) ──
-    num_total = hour_to_features[hours[0]][0].shape[0]
-    node_lmp_sum = np.zeros(num_total, dtype=np.float64)
-    node_lmp_cnt = np.zeros(num_total, dtype=np.int64)
-    for h in train_hours:
-        _, y, mask = hour_to_features[h]
-        valid = mask & np.isfinite(y)
-        node_lmp_sum[valid] += y[valid]
-        node_lmp_cnt[valid] += 1
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        node_lmp_mean = np.where(
-            node_lmp_cnt > 0, node_lmp_sum / node_lmp_cnt, 0.0,
-        ).astype(np.float32)
-    n_real = num_total - 1
-    print(f"  Node LMP mean range: [{node_lmp_mean[:n_real].min():.1f}, "
-          f"{node_lmp_mean[:n_real].max():.1f}] $/MWh")
-
-    # ── Clip bounds on demeaned LMP ──
-    train_y_demeaned = np.concatenate([
-        (hour_to_features[h][1] - node_lmp_mean)[hour_to_features[h][2]]
+    # Robust signed transform for heavy-tailed scalar targets:
+    # z = asinh(y / scale), then z is standardized for training.
+    train_y = np.concatenate([
+        hour_to_features[h][2][hour_to_features[h][3]]
         for h in train_hours
-    ])
-    train_y_finite = train_y_demeaned[np.isfinite(train_y_demeaned)]
-    lmp_lo = np.percentile(train_y_finite, LMP_CLIP_LO)
-    lmp_hi = np.percentile(train_y_finite, LMP_CLIP_HI)
-    print(f"  Demeaned LMP clipping: [{lmp_lo:.1f}, {lmp_hi:.1f}] $/MWh")
+    ]).astype(np.float32)
+    y_scale = float(np.nanpercentile(np.abs(train_y), TARGET_TRANSFORM_QUANTILE))
+    if not np.isfinite(y_scale) or y_scale < 1e-6:
+        y_scale = 1.0
+
+    def _y_to_z(y_raw):
+        return np.arcsinh(y_raw / y_scale)
+
+    train_z = _y_to_z(train_y)
+    y_mean = float(np.nanmean(train_z))
+    y_std = float(np.nanstd(train_z))
+    y_std = y_std if y_std > 1e-8 else 1.0
+    print(
+        f"  Scalar target transform: asinh(y/{y_scale:.1f}), "
+        f"mean={y_mean:.3f}, std={y_std:.3f}"
+    )
 
     # ── Feature scaler (fit on training X) ──
     train_X_all = np.vstack([hour_to_features[h][0] for h in train_hours])
     scaler = StandardScaler()
     scaler.fit(np.nan_to_num(train_X_all, nan=0.0))
 
-    node_lmp_mean_t = torch.tensor(node_lmp_mean)
-
     def hours_to_data(hour_list):
         out = []
         for h in hour_list:
-            X, y, mask = hour_to_features[h]
+            X, y, y_raw, mask = hour_to_features[h]
             X_s = scaler.transform(np.nan_to_num(X, nan=0.0)).astype(np.float32)
-            y_dm = np.clip(y - node_lmp_mean, lmp_lo, lmp_hi)
+            y_z = _y_to_z(np.nan_to_num(y_raw, nan=0.0)).astype(np.float32)
+            y_norm = ((y_z - y_mean) / y_std).astype(np.float32)
             out.append(Data(
-                x=torch.tensor(X_s), y=torch.tensor(y_dm),
+                x=torch.tensor(X_s), y=torch.tensor(y_norm),
+                y_raw=torch.tensor(y_raw, dtype=torch.float32),
                 edge_index=edge_index, edge_attr=edge_attr,
                 mask=torch.tensor(mask),
-                node_lmp_mean=node_lmp_mean_t,
             ))
         return out
 
     return (
         hours_to_data(train_hours), hours_to_data(val_hours),
-        hours_to_data(test_hours), scaler, lmp_lo, lmp_hi,
-        node_lmp_mean,
+        hours_to_data(test_hours), scaler, y_mean, y_std,
+        y_scale,
     )
 
 
 # ── Model ────────────────────────────────────────────────────────
 
 class ERCOTGraphNet(nn.Module):
-    """2-layer residual GAT with learnable node embeddings.
-
-    v5 additions:
-      - Learnable node embeddings (nn.Parameter): each node (including the
-        virtual super node) gets a trainable vector that captures its unique
-        identity — congestion patterns, local generation mix, typical price
-        regime, etc.  Concatenated with input features before the input
-        projection, so the GAT layers see both time-varying features and
-        static node identity.  Dropout is applied to embeddings during
-        training to prevent memorisation of node-specific biases.
-      - System-wide hourly features are now part of the input feature vector.
-
-    edge_dim=2: [normalised geographic distance, edge-type indicator]
-    """
+    """Residual multi-layer GAT with node-level output."""
 
     def __init__(self, in_channels, num_nodes, embed_dim=NODE_EMBED_DIM,
-                 hidden=HIDDEN_DIM, heads=N_HEADS, dropout=DROPOUT,
-                 mlp_hidden=MLP_HIDDEN, edge_dim=2):
+                 hidden=HIDDEN_DIM, heads=N_HEADS, dropout=DROPOUT, edge_dim=2):
         super().__init__()
-        # Learnable per-node embedding (includes virtual node)
-        self.node_embed = nn.Parameter(
-            torch.randn(num_nodes, embed_dim) * 0.02
-        )
-        self.embed_drop = nn.Dropout(dropout)
-        self.input_proj = nn.Linear(in_channels + embed_dim, hidden)
+        self.embed_dim = embed_dim
+        if embed_dim > 0:
+            # Learnable per-node embedding
+            self.node_embed = nn.Parameter(torch.randn(num_nodes, embed_dim) * 0.02)
+            self.embed_drop = nn.Dropout(dropout)
+            input_dim = in_channels + embed_dim
+        else:
+            self.node_embed = None
+            self.embed_drop = None
+            input_dim = in_channels
 
-        self.gat1 = GATConv(hidden, hidden, heads=heads, dropout=dropout,
-                            concat=True, edge_dim=edge_dim)
-        self.bn1 = nn.BatchNorm1d(hidden * heads)
-        self.proj1 = nn.Linear(hidden * heads, hidden)
-
-        self.gat2 = GATConv(hidden, hidden, heads=heads, dropout=dropout,
-                            concat=False, edge_dim=edge_dim)
-        self.bn2 = nn.BatchNorm1d(hidden)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden, mlp_hidden),
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden, mlp_hidden // 2),
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden // 2, 1),
-        )
+        self.input_proj = nn.Linear(input_dim, hidden)
+        self.gat_layers = nn.ModuleList([
+            GATConv(hidden, hidden, heads=heads, dropout=dropout,
+                    concat=False, edge_dim=edge_dim)
+            for _ in range(N_GAT_LAYERS)
+        ])
+        self.bn_layers = nn.ModuleList([nn.BatchNorm1d(hidden) for _ in range(N_GAT_LAYERS)])
+        self.res_layers = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(N_GAT_LAYERS)])
+        self.out_head = nn.Linear(hidden, 1)
         self.dropout = dropout
-        self._attn_weights = [None, None]
+        self._attn_weights = [None for _ in range(N_GAT_LAYERS)]
 
     def forward(self, data, return_attention=False):
         x, edge_index = data.x, data.edge_index
         edge_attr = data.edge_attr if hasattr(data, "edge_attr") else None
 
-        # Concatenate learnable node embeddings with input features
-        n = self.node_embed.shape[0]
-        B = x.shape[0] // n
-        embeds = self.embed_drop(self.node_embed.repeat(B, 1))
-        x = torch.cat([x, embeds], dim=1)
+        if self.training and EDGE_DROPOUT > 0:
+            edge_index, keep_mask = dropout_edge(edge_index, p=EDGE_DROPOUT, training=True)
+            if edge_attr is not None:
+                edge_attr = edge_attr[keep_mask]
+
+        # Regularize raw inputs for better out-of-sample behavior.
+        x = F.dropout(x, p=INPUT_DROPOUT, training=self.training)
+        if self.training and INPUT_NOISE_STD > 0:
+            x = x + INPUT_NOISE_STD * torch.randn_like(x)
+
+        # Concatenate learnable node embeddings when enabled.
+        if self.node_embed is not None:
+            n = self.node_embed.shape[0]
+            B = x.shape[0] // n
+            embeds = self.embed_drop(self.node_embed.repeat(B, 1))
+            x = torch.cat([x, embeds], dim=1)
 
         x = F.elu(self.input_proj(x))
-        residual = x
+        for i, gat in enumerate(self.gat_layers):
+            residual = self.res_layers[i](x)
+            out, attn = gat(x, edge_index, edge_attr=edge_attr, return_attention_weights=True)
+            self._attn_weights[i] = attn
+            out = self.bn_layers[i](out)
+            out = F.elu(out)
+            out = F.dropout(out, p=self.dropout, training=self.training)
+            x = out + residual
 
-        out, a1 = self.gat1(x, edge_index, edge_attr=edge_attr,
-                            return_attention_weights=True)
-        self._attn_weights[0] = a1
-        out = self.bn1(out)
-        out = F.elu(self.proj1(out))
-        out = F.dropout(out, p=self.dropout, training=self.training)
-        x = out + residual
-        residual = x
-
-        out, a2 = self.gat2(x, edge_index, edge_attr=edge_attr,
-                            return_attention_weights=True)
-        self._attn_weights[1] = a2
-        out = self.bn2(out)
-        out = F.elu(out)
-        out = F.dropout(out, p=self.dropout, training=self.training)
-        x = out + residual
-
-        return self.mlp(x).squeeze(-1)
+        return self.out_head(x).squeeze(-1)
 
 
 # ── Training ─────────────────────────────────────────────────────
@@ -612,7 +643,7 @@ def train_model(model, train_loader, val_loader):
     )
     # v4: ReduceLROnPlateau with warmup — more adaptive than cosine
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6,
+        optimizer, mode="min", factor=0.4, patience=6, min_lr=1e-6,
     )
     huber = nn.SmoothL1Loss(beta=5.0)
 
@@ -634,17 +665,20 @@ def train_model(model, train_loader, val_loader):
             batch = batch.to(DEVICE)
             optimizer.zero_grad()
             pred = model(batch)
-            mask = batch.mask
-            pm, ym = pred[mask], batch.y[mask]
-            loss = huber(pm, ym)
+            ym = batch.y.view(-1)
+            m = batch.mask.view(-1)
+            loss = huber(pred[m], ym[m])
+            # Penalize node embeddings to limit node-specific memorization.
+            if model.node_embed is not None and EMBED_L2 > 0:
+                loss = loss + EMBED_L2 * model.node_embed.pow(2).mean()
             if torch.isnan(loss):
                 raise RuntimeError("NaN loss — check MPS fallback.")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             with torch.no_grad():
-                mae_sum += F.l1_loss(pm, ym, reduction="sum").item()
-                count += mask.sum().item()
+                mae_sum += (pred[m] - ym[m]).abs().sum().item()
+                count += int(m.sum().item())
 
         model.eval()
         v_sum, v_cnt = 0.0, 0
@@ -652,9 +686,10 @@ def train_model(model, train_loader, val_loader):
             for batch in val_loader:
                 batch = batch.to(DEVICE)
                 pred = model(batch)
-                m = batch.mask
-                v_sum += F.l1_loss(pred[m], batch.y[m], reduction="sum").item()
-                v_cnt += m.sum().item()
+                ym = batch.y.view(-1)
+                m = batch.mask.view(-1)
+                v_sum += (pred[m] - ym[m]).abs().sum().item()
+                v_cnt += int(m.sum().item())
 
         t_mae = mae_sum / max(count, 1)
         v_mae = v_sum / max(v_cnt, 1)
@@ -665,9 +700,10 @@ def train_model(model, train_loader, val_loader):
         if epoch >= WARMUP_EPOCHS:
             scheduler.step(v_mae)
 
-        improved = v_mae < best_val_mae
+        v_mae_smooth = np.mean(history["val_mae"][-3:])
+        improved = v_mae_smooth < (best_val_mae - 1e-4)
         if improved:
-            best_val_mae = v_mae
+            best_val_mae = v_mae_smooth
             best_state = {k: v.cpu().clone()
                           for k, v in model.state_dict().items()}
             patience_counter = 0
@@ -677,11 +713,12 @@ def train_model(model, train_loader, val_loader):
         if epoch % 10 == 0 or improved:
             lr = optimizer.param_groups[0]["lr"]
             print(f"  Epoch {epoch:3d}: train={t_mae:.2f}  val={v_mae:.2f}"
-                  f"  lr={lr:.2e}{'  *' if improved else ''}")
+                f"  val_smooth={v_mae_smooth:.2f}"
+                f"  lr={lr:.2e}{'  *' if improved else ''}")
 
-        if patience_counter >= PATIENCE:
+        if (epoch + 1) >= MIN_EPOCHS and patience_counter >= PATIENCE:
             print(f"  Early stopping at epoch {epoch} "
-                  f"(best val_mae={best_val_mae:.2f})")
+                f"(best val_smooth={best_val_mae:.2f})")
             break
 
     if best_state is not None:
@@ -691,34 +728,68 @@ def train_model(model, train_loader, val_loader):
 
 # ── Evaluation ───────────────────────────────────────────────────
 
-def evaluate_model(model, test_loader, node_order):
-    """Metrics for real nodes only (virtual node excluded by mask).
-
-    v4: un-demeans predictions and targets to report metrics in original
-    $/MWh scale.
-    """
+def fit_prediction_calibration(model, val_loader, y_mean, y_std, y_scale):
+    """Fit affine calibration y* = a * y_hat + b on validation set."""
     model.eval()
-    predictions = []
-    n = len(node_order)
-    node_errors = {i: [] for i in range(n)}
+    model_device = next(model.parameters()).device
+    pred_list = []
+    true_list = []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(model_device)
+            pred_n = model(batch).cpu().numpy().reshape(-1)
+            y_n = batch.y.cpu().numpy().reshape(-1)
+            m = batch.mask.cpu().numpy().astype(bool).reshape(-1)
+
+            pred_z = pred_n * y_std + y_mean
+            y_z = y_n * y_std + y_mean
+
+            pred = np.sinh(pred_z) * y_scale
+            y = np.sinh(y_z) * y_scale
+
+            pred_list.append(pred[m])
+            true_list.append(y[m])
+
+    if not pred_list:
+        return 1.0, 0.0
+
+    yhat = np.concatenate(pred_list)
+    ytrue = np.concatenate(true_list)
+    if np.nanstd(yhat) < 1e-8:
+        return 1.0, 0.0
+
+    X = np.column_stack([yhat, np.ones_like(yhat)])
+    a, b = np.linalg.lstsq(X, ytrue, rcond=None)[0]
+    print(f"  Calibration (val): y* = {a:.3f} * y_hat + {b:.3f}")
+    return float(a), float(b)
+
+
+def evaluate_model(model, test_loader, y_mean, y_std, y_scale, calibration=(1.0, 0.0)):
+    """Evaluate node-level predictions on masked test nodes."""
+    model.eval()
+    model_device = next(model.parameters()).device
+    pred_list = []
+    true_list = []
+    cal_a, cal_b = calibration
 
     with torch.no_grad():
         for batch in test_loader:
-            batch = batch.to(DEVICE)
-            pred_dm = model(batch).cpu().numpy()
-            y_dm = batch.y.cpu().numpy()
-            mask = batch.mask.cpu().numpy()
-            nm = batch.node_lmp_mean.cpu().numpy()
-            # Un-demean to original scale
-            pred = pred_dm + nm
-            y = y_dm + nm
-            predictions.append((pred, y, mask))
-            for i in range(n):
-                if mask[i]:
-                    node_errors[i].append(pred[i] - y[i])
+            batch = batch.to(model_device)
+            pred_n = model(batch).cpu().numpy().reshape(-1)
+            y_n = batch.y.cpu().numpy().reshape(-1)
+            m = batch.mask.cpu().numpy().astype(bool).reshape(-1)
 
-    all_p = np.concatenate([p[m] for p, _, m in predictions])
-    all_t = np.concatenate([t[m] for _, t, m in predictions])
+            pred_z = pred_n * y_std + y_mean
+            y_z = y_n * y_std + y_mean
+
+            pred = np.sinh(pred_z) * y_scale
+            y = np.sinh(y_z) * y_scale
+            pred = cal_a * pred + cal_b
+            pred_list.append(pred[m])
+            true_list.append(y[m])
+
+    all_p = np.concatenate(pred_list)
+    all_t = np.concatenate(true_list)
 
     mae = np.mean(np.abs(all_p - all_t))
     rmse = np.sqrt(np.mean((all_p - all_t) ** 2))
@@ -726,21 +797,8 @@ def evaluate_model(model, test_loader, node_order):
     ss_tot = np.sum((all_t - np.mean(all_t)) ** 2)
     r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
 
-    rows = []
-    for i, sp in enumerate(node_order):
-        errs = node_errors[i]
-        if not errs:
-            continue
-        errs = np.array(errs)
-        rows.append({
-            "settlement_point": sp,
-            "node_mae": np.mean(np.abs(errs)),
-            "node_rmse": np.sqrt(np.mean(errs ** 2)),
-            "node_bias": np.mean(errs),
-            "n_obs": len(errs),
-        })
-
-    return {"mae": mae, "rmse": rmse, "r2": r2}, pd.DataFrame(rows), predictions
+    pred_df = pd.DataFrame({"y_pred": all_p, "y_true": all_t})
+    return {"mae": mae, "rmse": rmse, "r2": r2}, pred_df
 
 
 # ── Vulnerability & Attention ────────────────────────────────────
@@ -775,9 +833,8 @@ def compute_vulnerability_scores(model, test_data, node_order):
     return vdf
 
 
-def extract_attention_weights(model, test_data, node_order, virtual_idx):
-    """Aggregate final-layer attention, excluding virtual-node and self-loop
-    edges from the output."""
+def extract_attention_weights(model, test_data, node_order):
+    """Aggregate final-layer attention, excluding self-loop edges."""
     model.eval()
     exp_ei = None
     acc = None
@@ -800,8 +857,8 @@ def extract_attention_weights(model, test_data, node_order, virtual_idx):
     src = exp_ei[0].numpy()
     dst = exp_ei[1].numpy()
 
-    # Keep only real→real edges (no self-loops, no virtual node)
-    keep = (src != dst) & (src != virtual_idx) & (dst != virtual_idx)
+    # Keep only real directed edges (exclude self-loops).
+    keep = (src != dst)
     sf, df_, af = src[keep], dst[keep], mean_a[keep]
 
     edf = pd.DataFrame({
@@ -837,7 +894,7 @@ def _draw_texas(ax, proj):
 
 
 def plot_graph_topology(edge_index, edge_attr, positions, node_order,
-                        virtual_idx, save_path,
+                        save_path,
                         backbone_bus_pos=None, backbone_edges=None):
     """Draw the transmission-guided graph on a Texas map.
 
@@ -846,7 +903,7 @@ def plot_graph_topology(edge_index, edge_attr, positions, node_order,
       2. Steel blue  — backbone buses and edges after empty-bus contraction
       3. Orange      — GNN graph edges (settlement nodes connected via backbone)
       4. Red dots    — settlement-point nodes
-    Virtual-node edges are omitted.
+    All graph edges are transmission-guided.
     """
     proj = ccrs.PlateCarree()
     fig, ax = plt.subplots(figsize=(14, 11), subplot_kw={"projection": proj})
@@ -917,8 +974,6 @@ def plot_graph_topology(edge_index, edge_attr, positions, node_order,
     for idx in range(len(src)):
         s, d = int(src[idx]), int(dst[idx])
         et = int(etypes[idx])
-        if et == EDGE_VIRTUAL:
-            continue
         if s >= len(positions) or d >= len(positions):
             continue
         pair = (min(s, d), max(s, d))
@@ -995,20 +1050,62 @@ def plot_training_curves(history, save_path):
 
 
 def plot_pred_vs_actual(predictions, save_path):
-    ap = np.concatenate([p[m] for p, _, m in predictions])
-    at = np.concatenate([t[m] for _, t, m in predictions])
+    ap = predictions["y_pred"].to_numpy()
+    at = predictions["y_true"].to_numpy()
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(at, ap, s=1, alpha=0.1, color="steelblue")
     lo, hi = min(at.min(), ap.min()), max(at.max(), ap.max())
     ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.8, alpha=0.6)
-    ax.set_xlabel("Actual LMP ($/MWh)")
-    ax.set_ylabel("Predicted LMP ($/MWh)")
-    ax.set_title("Predicted vs Actual LMP — Test Set")
+    ax.set_xlabel("Actual congestion outcome")
+    ax.set_ylabel("Predicted congestion outcome")
+    ax.set_title("Predicted vs Actual Outcome — Test Set")
     ax.set_aspect("equal")
     plt.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {save_path}")
+
+
+def compute_integrated_gradients(model, test_data, error_feature_indices, error_feature_names):
+    """Compute mean absolute IG attribution per error feature."""
+    model.eval()
+    original_device = next(model.parameters()).device
+    # Captum internally constructs float64 integration weights; MPS does not
+    # support float64 tensors, so run attribution on CPU for compatibility.
+    ig_device = torch.device("cpu") if original_device.type == "mps" else original_device
+    model = model.to(ig_device)
+
+    agg = np.zeros(len(error_feature_indices), dtype=np.float64)
+    n_examples = 0
+
+    for d in test_data:
+        d = d.to(ig_device)
+
+        def forward_with_x(x):
+            dd = Data(x=x, edge_index=d.edge_index, edge_attr=d.edge_attr)
+            dd.batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            return model(dd).sum()
+
+        ig = IntegratedGradients(forward_with_x)
+        x_in = d.x.detach().clone().to(torch.float32).requires_grad_(True)
+        baseline = torch.zeros_like(x_in, dtype=torch.float32)
+        attr = ig.attribute(x_in, baselines=baseline)
+        attr_abs = attr.detach().cpu().numpy().mean(axis=0)
+        agg += np.abs(attr_abs[error_feature_indices])
+        n_examples += 1
+
+    if n_examples == 0:
+        return pd.DataFrame(columns=["feature", "mean_abs_ig"])
+
+    agg /= n_examples
+    out = pd.DataFrame({
+        "feature": error_feature_names,
+        "mean_abs_ig": agg,
+    }).sort_values("mean_abs_ig", ascending=False)
+
+    # Restore model device for any downstream work (e.g., checkpoint save).
+    model.to(original_device)
+    return out
 
 
 def plot_node_map(node_df, node_coords, save_path, color_col, cmap,
@@ -1085,11 +1182,11 @@ def main():
         node_coords["settlement_point"].isin(nodes_with_data)
     ].reset_index(drop=True)
 
-    (edge_index, edge_attr, node_order, positions, virtual_idx,
+    (edge_index, edge_attr, node_order, positions,
      backbone_bus_pos, backbone_edges) = build_transmission_graph(coords_with_data)
 
     plot_graph_topology(
-        edge_index, edge_attr, positions, node_order, virtual_idx,
+        edge_index, edge_attr, positions, node_order,
         os.path.join(out_dir, "graph_topology.png"),
         backbone_bus_pos=backbone_bus_pos,
         backbone_edges=backbone_edges,
@@ -1097,16 +1194,14 @@ def main():
 
     # ── Prepare features ──
     print("\nPreparing features...")
-    hours, hour_to_features, num_features = prepare_features(
-        df, node_order, virtual_idx,
-    )
+    hours, hour_to_features, num_features = prepare_features(df, node_order)
     print(f"  Hours: {len(hours)}, Features/node: {num_features}")
-    print(f"  Real nodes: {len(node_order)}, Virtual node idx: {virtual_idx}")
+    print(f"  Nodes: {len(node_order)}")
 
     # ── Build PyG datasets ──
     print("\nBuilding PyG datasets (intra-month split, demeaned targets)...")
-    (train_data, val_data, test_data, scaler, lmp_lo, lmp_hi,
-     node_lmp_mean) = \
+    (train_data, val_data, test_data, scaler, y_mean, y_std,
+     y_scale) = \
         build_pyg_datasets(hours, hour_to_features, edge_index, edge_attr)
 
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
@@ -1117,7 +1212,7 @@ def main():
     print(f"\nDevice: {DEVICE}")
     if DEVICE.type == "mps":
         print("  Apple Silicon GPU (MPS) — sparse ops fall back to CPU")
-    num_nodes = virtual_idx + 1  # includes virtual super node
+    num_nodes = len(node_order)
     model = ERCOTGraphNet(
         in_channels=num_features, num_nodes=num_nodes,
     ).to(DEVICE)
@@ -1125,7 +1220,8 @@ def main():
     print(f"Model: {n_params:,} parameters")
     print(f"  {N_GAT_LAYERS}-layer residual GAT ({N_HEADS} heads, "
           f"hidden={HIDDEN_DIM}), edge_dim=2, "
-          f"node_embed={NODE_EMBED_DIM}")
+                        f"node_embed={NODE_EMBED_DIM}, edge_dropout={EDGE_DROPOUT}, "
+                    f"node-level output")
 
     # ── Train ──
     print("\nTraining...")
@@ -1134,62 +1230,50 @@ def main():
     print("\nGenerating plots...")
     plot_training_curves(history, os.path.join(out_dir, "training_curves.png"))
 
+    print("\nFitting prediction calibration on validation set...")
+    calibration = fit_prediction_calibration(
+        model, val_loader, y_mean=y_mean, y_std=y_std, y_scale=y_scale,
+    )
+
     # ── Evaluate ──
     print("\nEvaluating on test set (days 26+ of each month)...")
-    metrics, node_metrics, predictions = evaluate_model(
-        model, test_loader, node_order,
+    metrics, predictions = evaluate_model(
+        model, test_loader, y_mean=y_mean, y_std=y_std,
+        y_scale=y_scale, calibration=calibration,
     )
     print(f"  MAE:  {metrics['mae']:.2f} $/MWh")
     print(f"  RMSE: {metrics['rmse']:.2f} $/MWh")
     print(f"  R2:   {metrics['r2']:.4f}")
 
     plot_pred_vs_actual(predictions, os.path.join(out_dir, "pred_vs_actual.png"))
-    plot_node_map(node_metrics, coords_with_data,
-                  os.path.join(out_dir, "node_mae_map.png"),
-                  "node_mae", "YlOrRd", "MAE ($/MWh)",
-                  "Per-Node Prediction MAE — Test Set")
 
-    # ── Vulnerability ──
-    print("\nComputing vulnerability scores...")
-    vuln_df = compute_vulnerability_scores(model, test_data, node_order)
-    plot_node_map(vuln_df, coords_with_data,
-                  os.path.join(out_dir, "vulnerability_map.png"),
-                  "vulnerability_score", "hot_r",
-                  "Vulnerability (sum |dLMP/d(error)|)",
-                  "Node Vulnerability to Forecast Errors")
-
-    top20 = vuln_df.nlargest(20, "vulnerability_score")
-    print("\nTop 20 Most Vulnerable Nodes:")
-    print(top20[["settlement_point", "vulnerability_score",
-                  "grad_temp_error_1h", "grad_wspd_error_1h"]].to_string(
-        index=False))
-
-    # ── Attention ──
-    print("\nExtracting attention weights...")
-    edge_attn, node_inf = extract_attention_weights(
-        model, test_data, node_order, virtual_idx,
+    # ── Integrated Gradients attribution ──
+    print("\nComputing Integrated Gradients attribution...")
+    ig_df = compute_integrated_gradients(
+        model,
+        test_data,
+        error_feature_indices=ERROR_FEATURE_INDICES,
+        error_feature_names=ERROR_FEATURE_NAMES,
     )
-    plot_attention_network(edge_attn, coords_with_data, node_order,
-                           os.path.join(out_dir, "attention_network.png"))
+    if not ig_df.empty:
+        print("\nTop feature attributions (IG):")
+        print(ig_df.to_string(index=False))
 
     # ── Save ──
-    node_metrics.to_csv(os.path.join(results_dir, "node_test_metrics.csv"),
-                        index=False)
-    vuln_df.to_csv(os.path.join(results_dir, "vulnerability_scores.csv"),
-                   index=False)
-    edge_attn.to_csv(os.path.join(results_dir, "edge_attention.csv"),
-                     index=False)
-    node_inf.to_csv(os.path.join(results_dir, "node_influence.csv"),
-                    index=False)
+    predictions.to_csv(os.path.join(results_dir, "hourly_test_predictions.csv"),
+                       index=False)
+    ig_df.to_csv(os.path.join(results_dir, "integrated_gradients_summary.csv"),
+                 index=False)
     torch.save({
         "model_state_dict": model.state_dict(),
         "scaler_mean": scaler.mean_,
         "scaler_scale": scaler.scale_,
         "node_order": node_order,
-        "node_lmp_mean": node_lmp_mean,
         "metrics": metrics,
-        "lmp_clip": (lmp_lo, lmp_hi),
-        "virtual_node_idx": virtual_idx,
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "y_scale": y_scale,
+        "calibration": {"a": calibration[0], "b": calibration[1]},
         "config": {
             "HIDDEN_DIM": HIDDEN_DIM, "N_HEADS": N_HEADS,
             "N_GAT_LAYERS": N_GAT_LAYERS, "DROPOUT": DROPOUT,

@@ -164,7 +164,7 @@ dirs = setup_directories()
 # congestion metrics, and curtailment into one parquet per month.
 # Requires Steps 5b, 5c, 3, 3b.
 # =============================================================================
-# from process_data.combine_forecast_generation_node import build_pixel_hourly_dataset
+# from process_data.create_pixel_level_data import build_pixel_hourly_dataset
 # for year, month in MONTHS:
 #     build_pixel_hourly_dataset(year, month, force_rebuild=True)
 
@@ -185,23 +185,23 @@ dirs = setup_directories()
 # Clusters ERCOT nodes geographically + by LMP, aggregates to cluster level.
 # Requires Step 5e.
 # =============================================================================
-from process_data.prepare_cluster_level_data import build_cluster_hourly_data
-build_cluster_hourly_data(
-    months=MONTHS,
-    n_clusters=7,
-    geo_weight=2.0,
-    n_neighbors=8,
-    force_rebuild=True,
-)
+# from process_data.prepare_cluster_level_data import build_cluster_hourly_data
+# build_cluster_hourly_data(
+#     months=MONTHS,
+#     n_clusters=7,
+#     geo_weight=2.0,
+#     n_neighbors=8,
+#     force_rebuild=True,
+# )
 
 # =============================================================================
 # STEP 7a: Process congestion metrics from shadow prices
 # Converts raw SCED shadow price CSVs into hourly system-level congestion.
 # Requires Step 3b. (Also called automatically by Step 5d if shadow data exists.)
 # =============================================================================
-from process_data.process_congestion import compute_hourly_congestion_metrics
-for year, month in MONTHS:
-    compute_hourly_congestion_metrics(year, month, force_rebuild=True)
+# from process_data.process_congestion import compute_hourly_congestion_metrics
+# for year, month in MONTHS:
+#     compute_hourly_congestion_metrics(year, month, force_rebuild=True)
 
 # =============================================================================
 # STEP 7b: Process curtailment metrics from 60-day SCED disclosure
@@ -209,13 +209,13 @@ for year, month in MONTHS:
 # Also geolocates resources to ERA5 pixels using node_coordinates + EIA 860.
 # Requires SCED disclosure ZIPs to be downloaded (manual from ERCOT MIS).
 # =============================================================================
-from process_data.process_curtailment import (
-    compute_hourly_curtailment,
-    compute_hourly_curtailment_by_pixel,
-)
-for year, month in MONTHS:
-    compute_hourly_curtailment(year, month, force_rebuild=True)
-    compute_hourly_curtailment_by_pixel(year, month, force_rebuild=True)
+# from process_data.process_curtailment import (
+#     compute_hourly_curtailment,
+#     compute_hourly_curtailment_by_pixel,
+# )
+# for year, month in MONTHS:
+#     compute_hourly_curtailment(year, month, force_rebuild=True)
+#     compute_hourly_curtailment_by_pixel(year, month, force_rebuild=True)
 
 
 # #############################################################################
@@ -249,48 +249,60 @@ N_NEIGHBORS = 8
 
 # ── Step A3: Pixel-level regression coefficient maps (2x2) ────────────────
 # Per-pixel OLS with controls and absorbed FE
-from analysis.pixel_regression_maps import run_pixel_regression_maps
-pixel_outputs = run_pixel_regression_maps(months=ANALYSIS_MONTHS)
+from analysis.pixel_regression_maps import run_pixel_regression_maps, REGIMES
+
+PIXEL_DEPVARS = ["first_interval_shadow_cost", "total_curtailment_mw"]
+
+# Full-sample maps
+for depvar in PIXEL_DEPVARS:
+    # run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar)
+
+    # No-controls maps just plotting raw correlation between error and outcome 
+    run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar, 
+                              no_controls=True)
+
+# Regime-conditioned maps (extreme cold, heat, wind, stressed grid)
+for depvar in PIXEL_DEPVARS:
+    for regime_name in REGIMES:
+        # run_pixel_regression_maps(
+        #     months=ANALYSIS_MONTHS,
+        #     depvar=depvar,
+        #     regime=regime_name,
+        # )
+        run_pixel_regression_maps(
+            months=ANALYSIS_MONTHS,
+            depvar=depvar,
+            regime=regime_name,
+            no_controls=True
+        )
+        run_pixel_regression_maps(
+            months=ANALYSIS_MONTHS,
+            depvar=depvar,
+            regime=regime_name,
+            no_controls=True,
+            no_fe=True,
+        )
 
 # # ── Step A4: Infrastructure-level regressions ──────────────────────────────
 # # Capacity-weighted aggregation by tech category
 # from analysis.gridded_infrastructure_lr import run_infrastructure_analysis
 # infra_outputs = run_infrastructure_analysis(months=ANALYSIS_MONTHS)
 
-# ── Step A5: Extreme weather regime regressions (shadow cost DV) ───────────
-# Per-pixel regressions conditioned on extreme weather regimes
-from analysis.extreme_weather_regressions import run_regime_regressions
-regime_outputs = run_regime_regressions(
-    months=ANALYSIS_MONTHS,
-    depvar="first_interval_shadow_cost",
-)
-
 # ── Step A6: Forecast value maps (shadow cost DV) ──────────────────────────
 # Dollar value of forecast improvement at each pixel
-from analysis.forecast_value_map import run_forecast_value_analysis
-value_outputs = run_forecast_value_analysis(
-    months=ANALYSIS_MONTHS,
-    depvar="first_interval_shadow_cost",
-)
+# from analysis.forecast_value_map import run_forecast_value_analysis
+# value_outputs = run_forecast_value_analysis(
+#     months=ANALYSIS_MONTHS,
+#     depvar="first_interval_shadow_cost",
+# )
 
 # ── Step A7: Forecast error asymmetry analysis (shadow cost DV) ────────────
 # Over-forecast vs under-forecast effects on congestion
-from analysis.extreme_weather_regressions import run_asymmetry_regressions
-asymmetry_outputs = run_asymmetry_regressions(
-    months=ANALYSIS_MONTHS,
-    depvar="first_interval_shadow_cost",
-)
+# from analysis.asymmetric_forecast_error_analysis import run_asymmetry_regressions
+# asymmetry_outputs = run_asymmetry_regressions(
+#     months=ANALYSIS_MONTHS,
+#     depvar="first_interval_shadow_cost",
+# )
 
-# ── Step A8: Curtailment-focused regime regressions ────────────────────────
-# How forecast errors affect renewable curtailment during extreme weather
-curtailment_regime_outputs = run_regime_regressions(
-    months=ANALYSIS_MONTHS,
-    depvar="wind_curtailment_mw",
-)
 
-# ── Step A9: Forecast value maps for curtailment ──────────────────────────
-curtailment_value_outputs = run_forecast_value_analysis(
-    months=ANALYSIS_MONTHS,
-    depvar="wind_curtailment_mw",
-)
 

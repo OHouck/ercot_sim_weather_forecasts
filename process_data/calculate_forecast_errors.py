@@ -523,6 +523,60 @@ def _regrid_regular_wind_to_era5(wspd_2d, wdir_2d, fc_lats_1d, fc_lons_1d,
 
 # ── Forecast data loading ─────────────────────────────────────────────────────
 
+def load_hrrr_forecasts(hrrr_base_dir, variable_name, year, month):
+    """Load HRRR forecasts from the combined per-(day, cycle) NetCDF format.
+
+    Reads files matching hrrr_{HH}z_{YYYYMMDD}.nc in
+    {hrrr_base_dir}/{year}/{month:02d}/. Each file has dims (lead_hour, y, x)
+    and stores t2m, si10, wdir10 for all lead times in one file.
+
+    This is the new space-efficient format produced by pull_hrrr.py.
+    The old per-element format (temp/wspd/wdir subdirs) is not supported here;
+    use load_forecasts() for GFS which still uses that layout.
+
+    Returns a list of dicts with keys:
+        issuance_time [UTC], valid_time [US/Central tz-naive], lead_hours,
+        data (2D array, shape (ny, nx))
+    One entry per (file, lead_hour) combination.
+    """
+    nc_dir = os.path.join(hrrr_base_dir, str(year), f"{month:02d}")
+    nc_files = sorted(Path(nc_dir).glob('hrrr_*.nc'))
+
+    records = []
+    n_skipped = 0
+    for fpath in nc_files:
+        try:
+            ds = xr.open_dataset(str(fpath))
+        except Exception as e:
+            print(f"  WARNING: skipping {fpath.name} — {e}")
+            n_skipped += 1
+            continue
+
+        try:
+            issuance_time = pd.Timestamp(ds.time.values)
+
+            for i, lead_h in enumerate(ds.lead_hour.values):
+                data = ds[variable_name].isel(lead_hour=i).values
+                vt = ds.valid_time.isel(lead_hour=i).values
+                vt_central = _to_central(pd.Series([pd.Timestamp(vt)])).iloc[0]
+                records.append({
+                    'issuance_time': issuance_time,
+                    'valid_time': vt_central,
+                    'lead_hours': int(lead_h),
+                    'data': data,
+                })
+        except Exception as e:
+            print(f"  WARNING: error reading contents of {fpath.name} — {e}")
+            n_skipped += 1
+        finally:
+            ds.close()
+
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped}/{len(nc_files)} files due to errors")
+
+    return records
+
+
 def load_forecasts(element_dir, variable_name, year, month):
     """Load all forecast NetCDF files for one element and extract metadata.
 
@@ -777,8 +831,12 @@ def calculate_station_errors_for_month(year, month, model='hrrr', lead_hours=Non
     print(f"Loaded {len(stations_gdf)} stations as GeoDataFrame")
 
     # Build forecast grid GeoDataFrame and spatially join stations
-    temp_dir = os.path.join(fc_base, 'temp', str(year), f"{month:02d}")
-    sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
+    if model_lower == 'hrrr':
+        fc_month_dir = os.path.join(fc_base, str(year), f"{month:02d}")
+        sample_nc = sorted(Path(fc_month_dir).glob('hrrr_*.nc'))[0]
+    else:
+        temp_dir = os.path.join(fc_base, 'temp', str(year), f"{month:02d}")
+        sample_nc = sorted(Path(temp_dir).glob('*.nc'))[0]
     print(f"Building {cfg['display_name']} grid GeoDataFrame and joining stations...")
     grid_gdf = build_forecast_grid_gdf(str(sample_nc))
     station_grid_map = spatial_join_stations_to_grid(stations_gdf, grid_gdf)
@@ -790,14 +848,19 @@ def calculate_station_errors_for_month(year, month, model='hrrr', lead_hours=Non
     obs_dict = load_all_observations(stations_gdf, year, month, raw_dir)
     print(f"  Loaded observations for {len(obs_dict)} stations")
 
-    # Load forecasts (valid_time converted to Central inside load_forecasts)
+    # Load forecasts (valid_time converted to Central inside loader)
     print(f"Loading {cfg['display_name']} forecasts for {year}-{month:02d}...")
-    temp_forecasts = load_forecasts(
-        os.path.join(fc_base, 'temp'), 't2m', year, month)
-    wspd_forecasts = load_forecasts(
-        os.path.join(fc_base, 'wspd'), 'si10', year, month)
-    wdir_forecasts = load_forecasts(
-        os.path.join(fc_base, 'wdir'), 'wdir10', year, month)
+    if model_lower == 'hrrr':
+        temp_forecasts = load_hrrr_forecasts(fc_base, 't2m', year, month)
+        wspd_forecasts = load_hrrr_forecasts(fc_base, 'si10', year, month)
+        wdir_forecasts = load_hrrr_forecasts(fc_base, 'wdir10', year, month)
+    else:
+        temp_forecasts = load_forecasts(
+            os.path.join(fc_base, 'temp'), 't2m', year, month)
+        wspd_forecasts = load_forecasts(
+            os.path.join(fc_base, 'wspd'), 'si10', year, month)
+        wdir_forecasts = load_forecasts(
+            os.path.join(fc_base, 'wdir'), 'wdir10', year, month)
     print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
           f"{len(wdir_forecasts)} wdir forecast fields")
 
@@ -1204,10 +1267,15 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
     era5_ds = xr.open_dataset(era5_nc)
 
     # ── Get forecast grid lat/lon from a sample file ──
-    temp_dir = os.path.join(fc_base, 'temp', str(year), f'{month:02d}')
-    nc_files = sorted(Path(temp_dir).glob('*.nc'))
+    if model_lower == 'hrrr':
+        fc_month_dir = os.path.join(fc_base, str(year), f'{month:02d}')
+        nc_files = sorted(Path(fc_month_dir).glob('hrrr_*.nc'))
+    else:
+        temp_dir = os.path.join(fc_base, 'temp', str(year), f'{month:02d}')
+        nc_files = sorted(Path(temp_dir).glob('*.nc'))
     if not nc_files:
-        raise FileNotFoundError(f"No {model_name} NetCDF files found in {temp_dir}")
+        raise FileNotFoundError(f"No {model_name} NetCDF files found in "
+                                f"{fc_month_dir if model_lower == 'hrrr' else temp_dir}")
 
     sample_ds = xr.open_dataset(str(nc_files[0]))
     fc_lats = sample_ds.latitude.values
@@ -1221,11 +1289,16 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
         print(f"  {model_name} grid: {fc_lats.shape[0]}×{fc_lats.shape[1]} (2D projected) "
               f"→ ERA5 grid: {len(era5_ds.latitude)}×{len(era5_ds.longitude)}")
 
-    # ── Load forecasts (valid_time → Central inside load_forecasts) ─────────
+    # ── Load forecasts (valid_time → Central inside loader) ─────────────────
     print(f"Loading {model_name} forecasts for {year}-{month:02d}...")
-    temp_forecasts = load_forecasts(os.path.join(fc_base, 'temp'), 't2m', year, month)
-    wspd_forecasts = load_forecasts(os.path.join(fc_base, 'wspd'), 'si10', year, month)
-    wdir_forecasts = load_forecasts(os.path.join(fc_base, 'wdir'), 'wdir10', year, month)
+    if model_lower == 'hrrr':
+        temp_forecasts = load_hrrr_forecasts(fc_base, 't2m', year, month)
+        wspd_forecasts = load_hrrr_forecasts(fc_base, 'si10', year, month)
+        wdir_forecasts = load_hrrr_forecasts(fc_base, 'wdir10', year, month)
+    else:
+        temp_forecasts = load_forecasts(os.path.join(fc_base, 'temp'), 't2m', year, month)
+        wspd_forecasts = load_forecasts(os.path.join(fc_base, 'wspd'), 'si10', year, month)
+        wdir_forecasts = load_forecasts(os.path.join(fc_base, 'wdir'), 'wdir10', year, month)
     print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
           f"{len(wdir_forecasts)} wdir forecast fields")
 

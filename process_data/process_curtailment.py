@@ -594,7 +594,7 @@ def compute_hourly_curtailment_by_pixel(year, month, force_rebuild=False):
 
 
 # ---------------------------------------------------------------------------
-# Merge helper (for combine_forecast_generation_node.py)
+# Merge helper (for create_pixel_level_data.py)
 # ---------------------------------------------------------------------------
 
 def merge_curtailment_system(pixel_df, year, month, time_col="valid_time"):

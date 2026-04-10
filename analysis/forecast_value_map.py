@@ -427,7 +427,7 @@ def run_regime_value_comparison(months=None, depvar="first_interval_shadow_cost"
     os.makedirs(save_dir, exist_ok=True)
 
     from process_data.classify_weather_regimes import classify_regimes
-    from analysis.extreme_weather_regressions import REGIMES, filter_to_regime
+    from analysis.pixel_regression_maps import REGIMES, filter_to_regime
 
     print("Loading pixel data...")
     df = load_pixel_data(months)
