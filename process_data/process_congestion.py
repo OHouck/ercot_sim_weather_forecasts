@@ -95,7 +95,7 @@ def compute_hourly_congestion_metrics(year, month, force_rebuild=False):
 
     For each hour, aggregates across all binding constraints to produce:
     - n_binding_constraints: distinct constraint names
-    - total_shadow_cost: sum of |shadowPrice| across all SCED intervals
+    - total_shadow_cost: sum of |shadowPrice| across all SCED intervals 
     - max_shadow_price: peak shadow price in the hour
     - mean_shadow_price: mean shadow price across binding intervals
     - n_violations: constraints with violatedMW > 0
@@ -801,6 +801,101 @@ def compute_constraint_hourly_by_pixel(year, month, force_rebuild=False):
 
 
 # ---------------------------------------------------------------------------
+# Economic congestion cost (congestion rent)
+# ---------------------------------------------------------------------------
+
+def compute_economic_congestion_cost(year, month, force_rebuild=False):
+    """Compute hourly economic congestion rent = Σ_z (LMP_z - λ_sys) × Q_z.
+
+    System lambda is approximated as the minimum load zone LMP per hour —
+    the cheapest zone sets the uncongested marginal energy price floor.
+    All other zones pay a congestion premium above that floor.
+
+    Load zone quantities are approximated from weather zone actual load
+    using the TDSP territory mapping in process_ercot._WEATHER_ZONE_TO_LZ.
+
+    Args:
+        year: Integer year.
+        month: Integer month.
+        force_rebuild: If True, recompute even if cached.
+
+    Returns:
+        DataFrame with columns:
+            valid_time, system_lambda [$/MWh], economic_congestion_cost [$/h],
+            zone_lmp_spread_mw [$/MWh load-weighted std dev across zones].
+    """
+    dirs = setup_directories()
+    cache_path = os.path.join(
+        dirs["processed"], "congestion_metrics",
+        f"economic_congestion_{year}{month:02d}.csv",
+    )
+
+    if os.path.exists(cache_path) and not force_rebuild:
+        print(f"  Loading cached economic congestion: {cache_path}")
+        return pd.read_csv(cache_path, parse_dates=["valid_time"])
+
+    from process_data.process_ercot import compute_hourly_zone_lmp, compute_hourly_load_by_lz
+
+    zone_lmp = compute_hourly_zone_lmp(year, month)
+    zone_load = compute_hourly_load_by_lz(year, month)
+
+    zones = [
+        "LZ_AEN", "LZ_CPS", "LZ_HOUSTON", "LZ_LCRA",
+        "LZ_NORTH", "LZ_RAYBN", "LZ_SOUTH", "LZ_WEST",
+    ]
+    lmp_zones = [z for z in zones if z in zone_lmp.columns]
+    load_zones = [z for z in zones if z in zone_load.columns]
+    common_zones = [z for z in lmp_zones if z in load_zones]
+
+    if not common_zones:
+        raise ValueError("No load zones matched between LMP and load data")
+
+    merged = zone_lmp[["valid_time"] + lmp_zones].merge(
+        zone_load[["valid_time"] + load_zones],
+        on="valid_time",
+        how="inner",
+        suffixes=("_lmp", "_mw"),
+    )
+
+    lmp_cols = [f"{z}_lmp" for z in common_zones]
+    mw_cols = [f"{z}_mw" for z in common_zones]
+
+    # System lambda = minimum zone LMP per hour
+    merged["system_lambda"] = merged[lmp_cols].min(axis=1)
+
+    # Congestion rent = Σ_z (LMP_z - λ) × Q_z  [$/h]
+    merged["economic_congestion_cost"] = sum(
+        (merged[f"{z}_lmp"] - merged["system_lambda"]) * merged[f"{z}_mw"]
+        for z in common_zones
+    )
+
+    # Load-weighted LMP std dev across zones [$/MWh]
+    total_load = merged[mw_cols].sum(axis=1).replace(0, np.nan)
+    load_wtd_mean = sum(
+        merged[f"{z}_lmp"] * merged[f"{z}_mw"] for z in common_zones
+    ) / total_load
+    load_wtd_var = sum(
+        merged[f"{z}_mw"] * (merged[f"{z}_lmp"] - load_wtd_mean) ** 2
+        for z in common_zones
+    ) / total_load
+    merged["zone_lmp_spread_mw"] = np.sqrt(load_wtd_var.clip(lower=0))
+
+    result = merged[
+        ["valid_time", "system_lambda", "economic_congestion_cost", "zone_lmp_spread_mw"]
+    ].copy()
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    result.to_csv(cache_path, index=False)
+    print(f"  Saved economic congestion: {cache_path}")
+    print(
+        f"    {len(result)} hours, "
+        f"mean cost={result['economic_congestion_cost'].mean():.1f} $/h, "
+        f"mean λ={result['system_lambda'].mean():.2f} $/MWh"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Merge helpers (for create_pixel_level_data.py)
 # ---------------------------------------------------------------------------
 
@@ -808,7 +903,8 @@ def merge_congestion_system(pixel_df, year, month, time_col="valid_time"):
     """Merge system-level congestion metrics into a pixel-hourly DataFrame.
 
     Adds: n_binding_constraints, total_shadow_cost, max_shadow_price,
-          shadow_cost_weighted, n_violations, total_violated_mw.
+          shadow_cost_weighted, n_violations, total_violated_mw,
+          economic_congestion_cost, zone_lmp_spread_mw, system_lambda.
 
     Args:
         pixel_df: DataFrame with a time column.
@@ -831,7 +927,23 @@ def merge_congestion_system(pixel_df, year, month, time_col="valid_time"):
     if time_col != "valid_time":
         congestion = congestion.rename(columns={"valid_time": time_col})
 
-    return pixel_df.merge(congestion, on=time_col, how="left")
+    result = pixel_df.merge(congestion, on=time_col, how="left")
+
+    # Also merge economic congestion rent
+    try:
+        econ = compute_economic_congestion_cost(year, month)
+        econ_cols = [
+            "valid_time", "economic_congestion_cost",
+            "zone_lmp_spread_mw", "system_lambda",
+        ]
+        econ = econ[[c for c in econ_cols if c in econ.columns]]
+        if time_col != "valid_time":
+            econ = econ.rename(columns={"valid_time": time_col})
+        result = result.merge(econ, on=time_col, how="left")
+    except Exception as e:
+        print(f"  WARNING: Could not compute economic congestion cost: {e}")
+
+    return result
 
 
 def merge_congestion_local(pixel_df, year, month, time_col="valid_time"):

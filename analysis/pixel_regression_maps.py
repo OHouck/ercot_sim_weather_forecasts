@@ -29,7 +29,7 @@ from helper_funcs import setup_directories
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DEPVAR = "first_interval_shadow_cost"
+DEPVAR = "economic_congestion_cost"
 # All 4 error variables estimated jointly in one regression per pixel
 ERROR_VARS = [
     "temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h",
@@ -802,7 +802,7 @@ def run_pixel_regression_maps(months=None, save_dir=None, overlay=None,
 
 if __name__ == "__main__":
     # ── Configure run here ────────────────────────────────────────────────────
-    vars = ["total_shadow_cost"]
+    vars = ["economic_congestion_cost"]
 
     summer = [(2025, m) for m in [6, 7, 8]]
     winter = [(2025, m) for m in [12, 1, 2]]

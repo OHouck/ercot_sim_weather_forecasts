@@ -194,29 +194,6 @@ dirs = setup_directories()
 #     force_rebuild=True,
 # )
 
-# =============================================================================
-# STEP 7a: Process congestion metrics from shadow prices
-# Converts raw SCED shadow price CSVs into hourly system-level congestion.
-# Requires Step 3b. (Also called automatically by Step 5d if shadow data exists.)
-# =============================================================================
-# from process_data.process_congestion import compute_hourly_congestion_metrics
-# for year, month in MONTHS:
-#     compute_hourly_congestion_metrics(year, month, force_rebuild=True)
-
-# =============================================================================
-# STEP 7b: Process curtailment metrics from 60-day SCED disclosure
-# Extracts wind/solar curtailment (HSL - output) from nested ZIP archives.
-# Also geolocates resources to ERA5 pixels using node_coordinates + EIA 860.
-# Requires SCED disclosure ZIPs to be downloaded (manual from ERCOT MIS).
-# =============================================================================
-# from process_data.process_curtailment import (
-#     compute_hourly_curtailment,
-#     compute_hourly_curtailment_by_pixel,
-# )
-# for year, month in MONTHS:
-#     compute_hourly_curtailment(year, month, force_rebuild=True)
-#     compute_hourly_curtailment_by_pixel(year, month, force_rebuild=True)
-
 
 # #############################################################################
 #                        ANALYSIS PIPELINE (Steps A1–A10)
@@ -239,23 +216,16 @@ N_NEIGHBORS = 8
 #     n_neighbors=N_NEIGHBORS,
 # )
 
-# # ── Step A2: Raw correlation heatmaps (2x2) ────────────────────────────────
-# # Per-pixel Pearson r between forecast error and system LMP spread
-# from analysis.forecast_error_lmp_corr_heatmap import run_correlation_heatmaps
-# corr_outputs = run_correlation_heatmaps(
-#     months=ANALYSIS_MONTHS,
-#     lmp_var="system_lmp_std",
-# )
-
 # ── Step A3: Pixel-level regression coefficient maps (2x2) ────────────────
 # Per-pixel OLS with controls and absorbed FE
 from analysis.pixel_regression_maps import run_pixel_regression_maps, REGIMES
 
-PIXEL_DEPVARS = ["first_interval_shadow_cost", "total_curtailment_mw"]
+# PIXEL_DEPVARS = ["economic_congestion_cost", "total_curtailment_mw"]
+PIXEL_DEPVARS = ["economic_congestion_cost"]
 
 # Full-sample maps
 for depvar in PIXEL_DEPVARS:
-    # run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar)
+    run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar)
 
     # No-controls maps just plotting raw correlation between error and outcome 
     run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar, 
@@ -264,23 +234,16 @@ for depvar in PIXEL_DEPVARS:
 # Regime-conditioned maps (extreme cold, heat, wind, stressed grid)
 for depvar in PIXEL_DEPVARS:
     for regime_name in REGIMES:
-        # run_pixel_regression_maps(
-        #     months=ANALYSIS_MONTHS,
-        #     depvar=depvar,
-        #     regime=regime_name,
-        # )
         run_pixel_regression_maps(
             months=ANALYSIS_MONTHS,
             depvar=depvar,
             regime=regime_name,
-            no_controls=True
         )
         run_pixel_regression_maps(
             months=ANALYSIS_MONTHS,
             depvar=depvar,
             regime=regime_name,
-            no_controls=True,
-            no_fe=True,
+            no_controls=True
         )
 
 # # ── Step A4: Infrastructure-level regressions ──────────────────────────────

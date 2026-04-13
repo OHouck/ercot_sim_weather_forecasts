@@ -890,5 +890,100 @@ def build_node_coordinates(force_rebuild=False):
     return result_df
 
 
+# ---------------------------------------------------------------------------
+# Load zone LMPs and quantities (for economic congestion cost)
+# ---------------------------------------------------------------------------
+
+# Approximate mapping from ERCOT weather zones (actual load data) to
+# load zones (LMP settlement zones). Based on TDSP service territory geography.
+# Each entry: load_zone → {weather_zone_col: fraction_of_that_weather_zone}
+# The fractions for east and southC reflect a 50/50 split between two load
+# zones that share the same weather zone.
+_WEATHER_ZONE_TO_LZ = {
+    "LZ_AEN":     {"east": 0.5},
+    "LZ_CPS":     {"southC": 0.5},
+    "LZ_HOUSTON": {"coast": 1.0},
+    "LZ_LCRA":    {"southC": 0.5},
+    "LZ_NORTH":   {"north": 1.0, "northC": 1.0},
+    "LZ_RAYBN":   {"east": 0.5},
+    "LZ_SOUTH":   {"southern": 1.0},
+    "LZ_WEST":    {"west": 1.0, "farWest": 1.0},
+}
+
+
+def compute_hourly_zone_lmp(year, month):
+    """Extract hourly load zone LMPs from RT SPP data.
+
+    Filters to LZ-type settlement points, averages across 15-min intervals
+    within each (zone, hour), and pivots to one column per zone.
+
+    Args:
+        year: Integer year.
+        month: Integer month.
+
+    Returns:
+        DataFrame with valid_time + one column per load zone (LZ_AEN, etc.).
+    """
+    rt_spp = load_rt_spp_month(year, month)
+    rt_spp = rt_spp[rt_spp["settlementPointType"] == "LZ"].copy()
+
+    rt_spp["deliveryDate"] = pd.to_datetime(rt_spp["deliveryDate"])
+    rt_spp["valid_time"] = rt_spp["deliveryDate"] + pd.to_timedelta(
+        rt_spp["deliveryHour"] - 1, unit="h"
+    )
+
+    zone_hourly = (
+        rt_spp.groupby(["settlementPoint", "valid_time"])["settlementPointPrice"]
+        .mean()
+        .reset_index()
+    )
+
+    zone_wide = zone_hourly.pivot(
+        index="valid_time", columns="settlementPoint", values="settlementPointPrice"
+    ).reset_index()
+    zone_wide.columns.name = None
+
+    n_zones = zone_wide.shape[1] - 1
+    print(f"  Load zone LMPs: {len(zone_wide)} hours, {n_zones} zones")
+    return zone_wide
+
+
+def compute_hourly_load_by_lz(year, month):
+    """Approximate actual hourly load by ERCOT load zone from weather zone data.
+
+    Maps ERCOT weather zone actual load (8 zones) to load settlement zones
+    (LZ_AEN, LZ_CPS, etc.) using the documented TDSP territory mapping in
+    _WEATHER_ZONE_TO_LZ. The east and southC weather zones are split evenly
+    between two load zones each.
+
+    Args:
+        year: Integer year.
+        month: Integer month.
+
+    Returns:
+        DataFrame with valid_time + one column per load zone [MW].
+    """
+    load = load_actual_load_month(year, month)
+
+    wz_cols = ["coast", "east", "farWest", "north", "northC", "southern", "southC", "west"]
+    for col in wz_cols:
+        if col in load.columns:
+            load[col] = pd.to_numeric(load[col], errors="coerce")
+
+    load["operatingDay"] = pd.to_datetime(load["operatingDay"])
+    load["hour_int"] = load["hourEnding"].str.split(":").str[0].astype(int)
+    load["valid_time"] = load["operatingDay"] + pd.to_timedelta(
+        load["hour_int"] - 1, unit="h"
+    )
+
+    result = load[["valid_time"]].copy()
+    for lz, wz_weights in _WEATHER_ZONE_TO_LZ.items():
+        result[lz] = sum(
+            load[wz] * w for wz, w in wz_weights.items() if wz in load.columns
+        )
+
+    return result.reset_index(drop=True)
+
+
 if __name__ == '__main__':
     coords = build_node_coordinates(force_rebuild=True)
