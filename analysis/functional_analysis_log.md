@@ -221,3 +221,130 @@ Forecast errors explain 13pp more variance in Winter/Spring (higher curtailment 
 4. **Next step:** Full-resolution FNO/MLP on GPU, with regime-stratified training to test whether the multi-field nonlinear advantage is concentrated in extreme cold/heat hours.
 
 ---
+
+## Run 5 — Neural Architecture Expansion Plan
+
+**Script:** `analysis/nn_analysis.py`
+**Status:** Planned (not yet run)
+
+### Motivation
+
+Run 4B established a strong MLP baseline (R²=0.901) and confirmed that nonlinear spatial-to-scalar regression decisively beats linear functional methods. However, Run 4B had four significant limitations that leave R² gains on the table:
+
+1. **Spatial downsampling**: 4× stride reduces 105×130 → 27×33, discarding fine-scale structure.
+2. **Underpowered FNO**: 2 layers, modes=8, hidden=32 — the smallest viable configuration.
+3. **Only 2 channels**: wind + temperature errors from HRRR 1h only; GFS day-ahead (0h) fields were excluded.
+4. **Shallow CV / short training**: 3-fold CV, 50 epochs — high-variance estimates, undertrained models.
+
+### Literature Context
+
+Five papers directly inform the next experiments:
+
+| Paper | Finding | Implication |
+|-------|---------|-------------|
+| Pathak et al. 2022, *FourCastNet* (arXiv:2202.11214) | AFNO (vision-transformer + Fourier mixing) achieves near-operational weather forecast accuracy at 0.25° | Transformer-based spatial mixing may outperform standard FNO for our non-periodic ERCOT domain |
+| Duruisseaux et al. 2024, *NeuralOperator 2.0 guide* (arXiv:2512.01421) | `domain_padding`, instance norm, linear skip, soft-gating ChannelMLP are critical for non-periodic data | Already adopted in Run 4B/5 code; deeper/wider FNO with these settings is the right next step |
+| Shi et al. 2025, *Conv-FNO* (arXiv:2503.17797) | CNN pre-extractor (1–2 conv layers) feeding into FNO improves benchmark performance by capturing local features before spectral processing | Directly explains FNO R²=0.74 underperformance vs MLP R²=0.90; hybrid can bridge the gap |
+| Tran et al. 2024, *Spectral Analysis of FNO* (arXiv:2404.07200) | FNO truncates high-frequency spatial modes, causing artificial smoothing of fine-scale structure | Frequency-aware loss and SpecBoost ensembles can recover high-frequency curtailment drivers (e.g., clustered wind farm effects) |
+| Lanthaler et al. 2023, *Nonlinear FPCA via Neural Networks* (arXiv:2306.14388) | Nonlinear FPCA extracts interpretable spatial modes before scalar prediction; superior to linear FPCA for nonlinear data | Autoencoder pre-training + regression head may combine interpretability of FPCA β(s) with nonlinear expressiveness of MLP |
+
+### Experiment Design
+
+#### Experiment A: Full-resolution Architecture Comparison (primary)
+
+**Goal:** Establish the best architecture at 0.25° resolution with all 4 error channels.
+
+| Architecture | Description | New vs Run 4B |
+|---|---|---|
+| **MLP** (improved) | 4×(H×W)→512→LN→GELU→Dropout→256→LN→GELU→128→1 | LayerNorm + Dropout; 4-channel input |
+| **FNO** (deep) | 4 layers, modes=16, hidden=64, domain_padding=0.1, instance_norm | 2× layers, 2× hidden, 2× modes |
+| **U-Net → scalar** | Encoder-decoder with skip connections + global avg pool + MLP head | New; tests whether multi-scale spatial feature extraction helps |
+| **Conv-FNO** | 2 conv layers (local features) → FNO trunk → global pool → head | New; implements Conv-FNO paper insight |
+| **Attention-MLP** | Learned spatial attention weights → weighted sum → MLP | New; explicit attention over spatial locations |
+
+**Protocol:**
+- Resolution: 0.25° (≈43×53 grid = 2,279 cells; 4 channels → ~9,116 input dims)
+- Data: 6 months (Jan, Mar, May, Jul, Sep, Nov 2025) — same as Runs 1–4 for comparability
+- CV: 5-fold (improved from 3-fold in Run 4B)
+- Epochs: 150, patience=20, AdamW lr=5e-4 with OneCycleLR scheduler
+- Device: MPS (Apple Silicon) for MLP; CPU for FNO (rfft2 not on MPS)
+- Batch size: 32
+
+#### Experiment B: Resolution Ablation (MLP + FNO)
+
+**Goal:** Quantify the R² gain from moving to higher spatial resolution.
+
+| Resolution | Grid Size | Input Dims (4ch) |
+|---|---|---|
+| 0.50° | ~22×27 | 2,376 |
+| 0.25° | ~43×53 | 9,116 |
+| 0.10° (native ERA5) | 105×130 (infra pixels only, ~6,500) | 26,000 |
+
+The 0.1° case uses native infrastructure pixels scattered on the ERA5 grid — same representation as Runs 1–4. MLP and FNO are compared at each resolution. Hypothesis: MLP gains modestly at higher resolution (global patterns already captured at 0.25°); FNO gains more (fine-scale spectral structure becomes accessible).
+
+#### Experiment C: Channel Ablation
+
+**Goal:** Decompose the predictive value of each error field.
+
+| Channel Set | Fields |
+|---|---|
+| 2-ch HRRR | wspd_error_1h, temp_error_1h |
+| 2-ch GFS | wspd_error_0h, temp_error_0h |
+| 4-ch all | wspd_error_1h, temp_error_1h, wspd_error_0h, temp_error_0h |
+| 1-ch wind only | wspd_error_1h |
+| 1-ch temp only | temp_error_1h |
+
+Hypothesis: 4-channel model outperforms 2-channel HRRR; GFS 0h channels add incremental signal (especially in extreme heat, per Run 3C).
+
+#### Experiment D: Regime-Stratified Evaluation
+
+**Goal:** Determine whether the nonlinear advantage of MLP/FNO is concentrated in extreme weather regimes.
+
+Protocol: Train the best architecture (from Exp A) on all hours; evaluate R² separately on:
+- Extreme cold (sys_temp < 2.3°C, ~212 hours)
+- Extreme heat (sys_temp > 32.1°C, ~212 hours)
+- Normal hours (remainder)
+
+Additionally, train regime-specific models and compare to the pooled model. Hypothesis: regime-specific MLP training achieves higher R² in extreme cold (where nonlinearity between wind error spatial patterns and curtailment is highest, per Run 3C).
+
+#### Experiment E: Gradient Saliency Maps
+
+**Goal:** Recover spatial attribution from the black-box MLP and compare to interpretable PLS β(s).
+
+Method: Compute `∂output/∂input` (vanilla gradient saliency) averaged over the test set. Overlay on the Texas map alongside PLS n=20 β(s). Test Pearson r between saliency map and PLS β(s) to quantify how much the MLP's spatial weighting aligns with the supervised linear model.
+
+Hypothesis: MLP saliency concentrates in West TX / Panhandle wind belt (consistent with PLS β(s)), but may reveal additional high-value pixels in South TX coastal zone invisible to linear methods.
+
+### Expected Outcomes
+
+| Experiment | Expected Best R² | Key Comparison |
+|---|---|---|
+| A: Architecture sweep | MLP ≥ 0.91, Conv-FNO ≥ 0.82 | Conv-FNO should close FNO→MLP gap |
+| B: Resolution | 0.1° MLP ≈ 0.92–0.93 | Modest gain from full resolution |
+| C: 4-channel | +0.01–0.03 R² vs 2-channel | GFS day-ahead adds incremental signal |
+| D: Extreme cold MLP | R² ≈ 0.70–0.80 (per-regime) | Much higher than full-sample FPCA (0.55) |
+| E: Saliency | r ≈ 0.3–0.6 vs PLS β(s) | MLP and PLS partially align |
+
+### Training Protocol
+
+```
+Optimizer : AdamW, weight_decay=1e-4
+Scheduler : OneCycleLR (pct_start=0.1, anneal_strategy='cos')
+Loss      : MSE on normalized Y (subtract mean, divide std)
+Grad clip : 1.0 (all architectures)
+Early stop: patience=20 on validation MSE
+Seeds     : random_state=42 (all folds reproducible)
+```
+
+### Run Command
+
+```bash
+uv run python -m analysis.nn_analysis --exp all        # all experiments
+uv run python -m analysis.nn_analysis --exp arch       # Experiment A only
+uv run python -m analysis.nn_analysis --exp resolution # Experiment B
+uv run python -m analysis.nn_analysis --exp channels   # Experiment C
+uv run python -m analysis.nn_analysis --exp regime     # Experiment D
+uv run python -m analysis.nn_analysis --exp saliency   # Experiment E
+```
+
+---
