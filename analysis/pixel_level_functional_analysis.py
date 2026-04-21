@@ -413,6 +413,399 @@ def run_spatial_regularization(beta_raw, pixel_coords, lambda_smooth=1.0,
     return beta
 
 
+# ── Fused Lasso Spatial Regression ───────────────────────────────────────────
+
+
+def _build_edge_incidence_matrix(pixel_coords, threshold=0.15):
+    """Build a sparse signed edge-incidence matrix for the spatial pixel graph.
+
+    Each row represents one edge (i, j) with D[e, i] = +1, D[e, j] = -1.
+    Used by the fused lasso solver to encode the spatial fusion penalty
+    λ₂ ||D β||₁ = λ₂ Σ_{(i,j)∈E} |βᵢ - βⱼ|.
+
+    Parameters
+    ----------
+    pixel_coords : ndarray (N, 2) — (lat, lon) per pixel
+    threshold : float — max distance (degrees) to call two pixels neighbors
+
+    Returns
+    -------
+    D : scipy.sparse.csr_matrix, shape (n_edges, N)
+    edges : list of (i, j) tuples
+    """
+    from scipy.spatial import cKDTree
+    from scipy import sparse
+
+    tree = cKDTree(pixel_coords)
+    pairs = list(tree.query_pairs(r=threshold))
+    n = len(pixel_coords)
+    m = len(pairs)
+
+    rows = np.repeat(np.arange(m), 2)
+    cols = np.array([[i, j] for i, j in pairs]).ravel()
+    data = np.tile([1.0, -1.0], m)
+
+    D = sparse.csr_matrix((data, (rows, cols)), shape=(m, n))
+    return D, pairs
+
+
+def _soft_threshold(x, threshold):
+    """Proximal operator for the L1 norm (element-wise soft thresholding).
+
+    Parameters
+    ----------
+    x : ndarray
+    threshold : float — must be >= 0
+
+    Returns
+    -------
+    ndarray, same shape as x
+    """
+    return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
+
+
+def _flsa_admm(beta_raw, D, lambda1, lambda2,
+               rho=1.0, max_iter=600, tol=1e-5):
+    """ADMM solver for the Fused Lasso Signal Approximator (FLSA).
+
+    Solves the convex problem:
+        min_{γ}  ½ ||β_raw - γ||²  +  λ₁ ||γ||₁  +  λ₂ ||D γ||₁
+
+    where D is the edge-incidence matrix of the spatial neighbor graph.
+    The L1 penalty on γ drives pixel coefficients toward zero (sparsity)
+    and the L1 penalty on differences across edges creates piecewise-constant
+    spatial regions (fusion).
+
+    ADMM splitting: introduce z₁ = γ (for L1 on γ) and z₂ = D γ (for TV).
+
+    Parameters
+    ----------
+    beta_raw : ndarray (N,) — noisy spatial coefficient map to denoise
+    D : sparse matrix (M, N) — edge-incidence matrix
+    lambda1 : float — L1 sparsity weight
+    lambda2 : float — spatial fusion (total-variation) weight
+    rho : float — ADMM penalty parameter
+    max_iter : int
+    tol : float — primal residual convergence threshold
+
+    Returns
+    -------
+    gamma : ndarray (N,) — denoised piecewise-constant coefficient map
+    n_iter : int — iterations until convergence
+    """
+    from scipy import sparse
+    from scipy.sparse.linalg import factorized
+
+    n = beta_raw.shape[0]
+    I_n = sparse.eye(n, format="csc")
+    DTD = (D.T @ D).tocsc()
+
+    # A is constant — factorize once and reuse across all iterations
+    A = I_n * (1.0 + rho) + rho * DTD
+    A_solve = factorized(A)
+
+    z1 = np.zeros(n)
+    z2 = np.zeros(D.shape[0])
+    u1 = np.zeros(n)
+    u2 = np.zeros(D.shape[0])
+
+    for it in range(max_iter):
+        rhs = beta_raw + rho * (z1 - u1) + rho * (D.T @ (z2 - u2))
+        gamma = A_solve(rhs)
+
+        d_gamma = D @ gamma  # compute once; used three times below
+        z1_new = _soft_threshold(gamma + u1, lambda1 / rho)
+        z2_new = _soft_threshold(d_gamma + u2, lambda2 / rho)
+
+        u1 = u1 + gamma - z1_new
+        u2 = u2 + d_gamma - z2_new
+
+        r_primal = (np.linalg.norm(gamma - z1_new)
+                    + np.linalg.norm(d_gamma - z2_new))
+        z1, z2 = z1_new, z2_new
+
+        # Skip early stopping in the first 10 iterations (warm-up)
+        if r_primal < tol and it > 10:
+            break
+
+    return gamma, it + 1
+
+
+def run_fused_lasso(X, Y, pixel_coords, pixel_ids,
+                    K_fpca=100,
+                    lambda1_values=None,
+                    lambda2_values=None,
+                    n_folds=N_CV_FOLDS,
+                    rho=1.0,
+                    save_dir=None):
+    """Two-stage spatial fused lasso for identifying important forecast-error regions.
+
+    **Stage 1 — FPCA ridge regression**: Reduces the T × N pixel design matrix
+    to T × K FPCA scores, fits a Ridge regressor, and recovers the spatial
+    coefficient map β̂(s) ∈ R^N.
+
+    **Stage 2 — Fused Lasso Signal Approximator (FLSA)**: Applies the fused
+    lasso to β̂(s), producing γ̂(s) that is simultaneously sparse (many pixels
+    exactly zero) and piecewise-constant over spatially contiguous regions.
+    This directly identifies *which geographic areas* drive forecast-error
+    sensitivity in curtailment outcomes.
+
+    Cross-validation picks the best (λ₁, λ₂) pair by splitting on time: for
+    each fold the full two-stage pipeline (FPCA → Ridge → FLSA) is refit on
+    the training split and evaluated on the held-out split.
+
+    Parameters
+    ----------
+    X : ndarray (T, N) — standardized pixel error field
+    Y : ndarray (T,) — outcome (e.g. total curtailment MW)
+    pixel_coords : ndarray (N, 2) — (lat, lon) per pixel
+    pixel_ids : ndarray (N,) — pixel_id strings
+    K_fpca : int — number of FPCA components for Stage 1
+    lambda1_values : list of float — L1 sparsity grid (default: 5 log-spaced)
+    lambda2_values : list of float — fusion penalty grid (default: 5 log-spaced)
+    n_folds : int — time-blocked CV folds
+    rho : float — ADMM step size for FLSA
+    save_dir : Path or None — directory for saved figures
+
+    Returns
+    -------
+    dict with keys:
+        beta_raw : ndarray (N,) — FPCA ridge coefficient surface (no fused lasso)
+        beta_fused : ndarray (N,) — best fused-lasso-regularized surface
+        lambda1_best, lambda2_best : floats — selected penalty values
+        cv_r2_grid : ndarray — R² on grid of (lambda1, lambda2)
+        cv_r2_best : float — best held-out R²
+        r2_raw : float — held-out R² from raw Ridge (no fused lasso)
+        zero_fraction : float — fraction of pixels exactly zero in beta_fused
+        n_regions : int — connected components of nonzero pixels
+        results_grid : dict — full grid results
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import RidgeCV
+
+    if lambda1_values is None:
+        lambda1_values = [0.0, 0.01, 0.05, 0.2, 1.0]
+    if lambda2_values is None:
+        lambda2_values = [0.0, 0.01, 0.05, 0.2, 1.0]
+
+    print("\n=== Fused Lasso Spatial Regression ===")
+    K_fpca = min(K_fpca, min(X.shape) - 1)
+
+    # Build spatial graph once (shared across all CV folds and λ grid)
+    print("  Building spatial neighbor graph...")
+    D, edges = _build_edge_incidence_matrix(pixel_coords, threshold=0.15)
+    print(f"  Graph: {len(pixel_coords)} pixels, {len(edges)} edges")
+
+    # ── Stage 1 helper: FPCA ridge → beta_spatial ─────────────────────────
+    def _fit_stage1(X_tr, Y_tr):
+        pca = PCA(n_components=K_fpca, random_state=RANDOM_STATE)
+        Theta_tr = pca.fit_transform(X_tr)
+        ridge = RidgeCV(alphas=np.logspace(0, 6, 20), cv=3, scoring="r2")
+        ridge.fit(Theta_tr, Y_tr)
+        beta = pca.components_.T @ ridge.coef_
+        return pca, ridge, beta
+
+    # ── Fit on full data for the final coefficient surface ─────────────────
+    pca_full, ridge_full, beta_raw = _fit_stage1(X, Y)
+
+    # Variance explained
+    print(f"  FPCA K={K_fpca}: explains "
+          f"{pca_full.explained_variance_ratio_[:K_fpca].sum()*100:.1f}% variance")
+    print(f"  Ridge α={ridge_full.alpha_:.2f}")
+    print(f"  beta_raw: min={beta_raw.min():.4f}, max={beta_raw.max():.4f}, "
+          f"std={beta_raw.std():.4f}")
+
+    # ── Cross-validation over (λ₁, λ₂) grid ──────────────────────────────
+    T = X.shape[0]
+    fold_size = T // n_folds
+    # Time-blocked folds (avoid leakage between adjacent hours)
+    fold_indices = [
+        (
+            np.concatenate([np.arange(0, f * fold_size),
+                            np.arange((f + 1) * fold_size, T)]),
+            np.arange(f * fold_size, (f + 1) * fold_size),
+        )
+        for f in range(n_folds)
+    ]
+
+    l1_grid = lambda1_values
+    l2_grid = lambda2_values
+    cv_r2_grid = np.zeros((len(l1_grid), len(l2_grid)))
+    cv_r2_raw = 0.0
+
+    print(f"\n  Cross-validating {len(l1_grid)}×{len(l2_grid)} λ grid "
+          f"with {n_folds} time-blocked folds...")
+
+    for fi, (train_idx, test_idx) in enumerate(fold_indices):
+        X_tr, Y_tr = X[train_idx], Y[train_idx]
+        X_te, Y_te = X[test_idx], Y[test_idx]
+
+        _, _, beta_fold = _fit_stage1(X_tr, Y_tr)
+        Y_pred_raw = X_te @ beta_fold
+        cv_r2_raw += r2_score(Y_te, Y_pred_raw) / n_folds
+
+        for li, l1 in enumerate(l1_grid):
+            for lj, l2 in enumerate(l2_grid):
+                if l1 == 0.0 and l2 == 0.0:
+                    beta_fused_fold = beta_fold
+                else:
+                    beta_fused_fold, _ = _flsa_admm(
+                        beta_fold, D, l1, l2, rho=rho
+                    )
+                Y_pred = X_te @ beta_fused_fold
+                cv_r2_grid[li, lj] += r2_score(Y_te, Y_pred) / n_folds
+
+        print(f"    Fold {fi+1}/{n_folds} complete")
+
+    best_idx = np.unravel_index(np.argmax(cv_r2_grid), cv_r2_grid.shape)
+    lambda1_best = l1_grid[best_idx[0]]
+    lambda2_best = l2_grid[best_idx[1]]
+    cv_r2_best = cv_r2_grid[best_idx]
+
+    print(f"\n  Best λ₁={lambda1_best}, λ₂={lambda2_best} → "
+          f"CV R²={cv_r2_best:.4f}  (raw Ridge CV R²={cv_r2_raw:.4f})")
+
+    # ── Apply best FLSA to full-data beta_raw ─────────────────────────────
+    if lambda1_best == 0.0 and lambda2_best == 0.0:
+        beta_fused = beta_raw.copy()
+        n_iters = 0
+    else:
+        beta_fused, n_iters = _flsa_admm(
+            beta_raw, D, lambda1_best, lambda2_best, rho=rho
+        )
+    print(f"  FLSA converged in {n_iters} iterations")
+
+    # Sparsity statistics
+    zero_fraction = np.mean(np.abs(beta_fused) < 1e-8)
+    nonzero_mask = np.abs(beta_fused) >= 1e-8
+    n_nonzero = nonzero_mask.sum()
+
+    # Count connected components of nonzero pixels using the already-built graph
+    from scipy import sparse as _sp
+    from scipy.sparse.csgraph import connected_components
+    n_pix = len(beta_fused)
+    if edges:
+        row_idx = [i for i, j in edges] + [j for i, j in edges]
+        col_idx = [j for i, j in edges] + [i for i, j in edges]
+        adj = _sp.csr_matrix(
+            (np.ones(2 * len(edges)), (row_idx, col_idx)), shape=(n_pix, n_pix)
+        )
+    else:
+        adj = _sp.csr_matrix((n_pix, n_pix))
+    nz_idx = np.where(nonzero_mask)[0]
+    subadj = adj[nz_idx][:, nz_idx]
+    n_regions = int(connected_components(subadj, directed=False)[0]) if n_nonzero else 0
+
+    print(f"  beta_fused: zero_fraction={zero_fraction:.3f} "
+          f"({n_nonzero} nonzero pixels), {n_regions} contiguous region(s)")
+
+    results = {
+        "beta_raw": beta_raw,
+        "beta_fused": beta_fused,
+        "lambda1_best": lambda1_best,
+        "lambda2_best": lambda2_best,
+        "cv_r2_grid": cv_r2_grid,
+        "cv_r2_best": cv_r2_best,
+        "r2_raw": cv_r2_raw,
+        "zero_fraction": zero_fraction,
+        "n_regions": n_regions,
+        "lambda1_values": l1_grid,
+        "lambda2_values": l2_grid,
+        "pca": pca_full,
+        "ridge": ridge_full,
+    }
+
+    if save_dir is not None:
+        plot_fused_lasso_results(results, pixel_coords, save_dir)
+
+    return results
+
+
+def plot_fused_lasso_results(results, pixel_coords, save_dir):
+    """Save a 3-panel figure summarizing the fused lasso spatial analysis.
+
+    Panel 1 — Raw FPCA-ridge β map (before fused lasso).
+    Panel 2 — Fused lasso γ map (piecewise-constant regions).
+    Panel 3 — CV R² heatmap over the (λ₁, λ₂) grid.
+
+    Parameters
+    ----------
+    results : dict — output of run_fused_lasso()
+    pixel_coords : ndarray (N, 2)
+    save_dir : Path
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    beta_raw = results["beta_raw"]
+    beta_fused = results["beta_fused"]
+    cv_grid = results["cv_r2_grid"]
+    l1_vals = results["lambda1_values"]
+    l2_vals = results["lambda2_values"]
+    l1_best = results["lambda1_best"]
+    l2_best = results["lambda2_best"]
+
+    vmax = max(np.abs(beta_raw).max(), np.abs(beta_fused).max())
+    vmin = -vmax
+
+    # Create 2 cartopy map axes and 1 plain matplotlib axis directly —
+    # avoids the remove/re-add dance that mixed subplot_kw would require.
+    fig = plt.figure(figsize=(18, 5))
+    ax1 = fig.add_subplot(1, 3, 1, projection=ccrs.PlateCarree())
+    ax2 = fig.add_subplot(1, 3, 2, projection=ccrs.PlateCarree())
+    ax_heat = fig.add_subplot(1, 3, 3)
+
+    for ax, beta, title in [
+        (ax1, beta_raw,
+         f"FPCA Ridge β (before fused lasso)\nCV R²={results['r2_raw']:.3f}"),
+        (ax2, beta_fused,
+         f"Fused Lasso γ  (λ₁={l1_best}, λ₂={l2_best})\n"
+         f"CV R²={results['cv_r2_best']:.3f}  |  "
+         f"zeros={results['zero_fraction']*100:.0f}%  |  "
+         f"{results['n_regions']} region(s)"),
+    ]:
+        _draw_texas_base(ax)
+        sc = ax.scatter(
+            pixel_coords[:, 1], pixel_coords[:, 0],
+            c=beta, cmap="RdBu_r", vmin=vmin, vmax=vmax,
+            s=18, transform=ccrs.PlateCarree(), linewidths=0,
+        )
+        plt.colorbar(sc, ax=ax, orientation="horizontal", pad=0.04,
+                     label="β coefficient")
+        ax.set_title(title, fontsize=9)
+
+    im = ax_heat.imshow(
+        cv_grid, aspect="auto", origin="lower",
+        cmap="viridis",
+        extent=[-0.5, len(l2_vals) - 0.5, -0.5, len(l1_vals) - 0.5],
+    )
+    ax_heat.set_xticks(range(len(l2_vals)))
+    ax_heat.set_xticklabels([str(v) for v in l2_vals], fontsize=8)
+    ax_heat.set_yticks(range(len(l1_vals)))
+    ax_heat.set_yticklabels([str(v) for v in l1_vals], fontsize=8)
+    ax_heat.set_xlabel("λ₂ (fusion / TV)")
+    ax_heat.set_ylabel("λ₁ (L1 sparsity)")
+    ax_heat.set_title(f"CV R² grid\nbest: λ₁={l1_best}, λ₂={l2_best}")
+    l1_arr, l2_arr = np.array(l1_vals), np.array(l2_vals)
+    best_i = int(np.argmin(np.abs(l1_arr - l1_best)))
+    best_j = int(np.argmin(np.abs(l2_arr - l2_best)))
+    ax_heat.add_patch(plt.Rectangle(
+        (best_j - 0.5, best_i - 0.5), 1, 1,
+        fill=False, edgecolor="red", linewidth=2,
+    ))
+    plt.colorbar(im, ax=ax_heat, label="CV R²")
+
+    fig.suptitle(
+        "Spatial Fused Lasso — ERCOT Forecast Error → Curtailment",
+        fontsize=11, y=1.01,
+    )
+    plt.tight_layout()
+    out = save_dir / "fused_lasso_results.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Fused lasso figure saved → {out}")
+
+
 # ── Bootstrap Significance Testing ───────────────────────────────────────────
 
 def bootstrap_pixel_pvalues(X, Y, fit_fn, B=100, random_state=RANDOM_STATE):
@@ -3744,6 +4137,10 @@ if __name__ == "__main__":
                         help="Generate clean individual beta maps for report inclusion")
     parser.add_argument("--run5", action="store_true",
                         help="Run Step 5: high-res (0.25°) MLP+FNO with MPS acceleration")
+    parser.add_argument("--fused-lasso", action="store_true",
+                        help="Run spatial fused lasso to identify important forecast-error regions")
+    parser.add_argument("--fused-lasso-field", default="wspd_error_1h",
+                        help="Error field for fused lasso (default: wspd_error_1h)")
     args = parser.parse_args()
 
     if args.extensions_only:
@@ -3862,6 +4259,39 @@ if __name__ == "__main__":
         )
         print("\n" + "=" * 70)
         print("RUN 4B COMPLETE")
+        print("=" * 70)
+
+    elif args.fused_lasso:
+        print("\n" + "=" * 70)
+        print("FUSED LASSO: SPATIAL REGION IDENTIFICATION")
+        print("=" * 70)
+        dirs_fl = setup_directories()
+        fig_dir_fl = Path(dirs_fl["figures"]) / "functional_analysis"
+        df_fl = load_pixel_data(DEFAULT_MONTHS)
+        X_fl, Y_fl, pc_fl, pid_fl, _ = prepare_functional_data(
+            df_fl, error_field=args.fused_lasso_field
+        )
+        fl_results = run_fused_lasso(
+            X_fl, Y_fl, pc_fl, pid_fl,
+            K_fpca=100,
+            lambda1_values=[0.0, 0.01, 0.05, 0.2, 1.0],
+            lambda2_values=[0.0, 0.01, 0.05, 0.2, 1.0],
+            save_dir=fig_dir_fl,
+        )
+        # Save summary table
+        tables_dir_fl = Path(dirs_fl["tables"])
+        pd.DataFrame([{
+            "field": args.fused_lasso_field,
+            "lambda1_best": fl_results["lambda1_best"],
+            "lambda2_best": fl_results["lambda2_best"],
+            "cv_r2_best": fl_results["cv_r2_best"],
+            "r2_raw": fl_results["r2_raw"],
+            "zero_fraction": fl_results["zero_fraction"],
+            "n_regions": fl_results["n_regions"],
+        }]).to_csv(tables_dir_fl / "fused_lasso_summary.csv", index=False)
+        print("  Fused lasso summary saved.")
+        print("\n" + "=" * 70)
+        print("FUSED LASSO COMPLETE")
         print("=" * 70)
 
     elif args.report_maps:
