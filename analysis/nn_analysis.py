@@ -2939,16 +2939,19 @@ def compute_block_bootstrap_ci(
     delta_actual = _r2(y_true, pred_full) - _r2(y_true, pred_base)
 
     n_blocks_needed = int(np.ceil(n / block_len))
-    deltas = []
-    for _ in range(n_boot):
-        starts = rng.integers(0, n, size=n_blocks_needed)
-        idx = np.concatenate([
-            np.arange(s, s + block_len) % n for s in starts
-        ])[:n]
-        d = _r2(y_true[idx], pred_full[idx]) - _r2(y_true[idx], pred_base[idx])
-        deltas.append(d)
+    starts = rng.integers(0, n, size=(n_boot, n_blocks_needed))
+    idx_all = (
+        (starts[:, :, None] + np.arange(block_len)[None, None, :]).reshape(n_boot, -1) % n
+    )[:, :n]
 
-    deltas = np.array(deltas)
+    yt = y_true[idx_all]       # (n_boot, n)
+    pf = pred_full[idx_all]
+    pb = pred_base[idx_all]
+    ss_tot = np.sum((yt - yt.mean(axis=1, keepdims=True)) ** 2, axis=1)
+    ss_tot = np.maximum(ss_tot, 1e-12)
+    r2_full = 1 - np.sum((yt - pf) ** 2, axis=1) / ss_tot
+    r2_base = 1 - np.sum((yt - pb) ** 2, axis=1) / ss_tot
+    deltas = r2_full - r2_base
     return {
         "delta_r2": float(delta_actual),
         "ci_lo": float(np.percentile(deltas, 100 * alpha / 2)),
@@ -3031,29 +3034,31 @@ def build_capacity_scalar_features(df, hour_idx):
         + (work["longitude"] >= -100.0).astype(int)
     )
 
-    out: dict = {}
-    for err_col in ["wspd_error_1h", "wspd_error_0h", "temp_error_1h", "temp_error_0h"]:
+    err_cols = ["wspd_error_1h", "wspd_error_0h", "temp_error_1h", "temp_error_0h"]
+    weight_for = {
+        "wspd_error_1h": "wind_cap", "wspd_error_0h": "wind_cap",
+        "temp_error_1h": "load_c",   "temp_error_0h": "load_c",
+    }
+
+    weighted_cols = {}
+    for err_col in err_cols:
         e = work[err_col].fillna(0)
-        weight = work["wind_cap"] if "wspd" in err_col else work["load_c"]
-        weighted = weight * e
-
-        # System-wide
-        sys_key = f"sys_{err_col}"
-        out[sys_key] = work.assign(_w=weighted).groupby("valid_time")["_w"].sum()
-
-        # Per-quadrant
+        w = work[weight_for[err_col]]
+        weighted_cols[f"sys_{err_col}"] = w * e
         for q in range(4):
-            q_weight = weighted * (work["quad"] == q).astype(float)
-            q_key = f"q{q}_{err_col}"
-            out[q_key] = work.assign(_w=q_weight).groupby("valid_time")["_w"].sum()
+            weighted_cols[f"q{q}_{err_col}"] = w * e * (work["quad"] == q)
 
-    agg = pd.DataFrame(out).reindex(hour_idx).fillna(0)
+    agg = (
+        work[["valid_time"]].assign(**weighted_cols)
+        .groupby("valid_time").sum()
+        .reindex(hour_idx).fillna(0)
+    )
     return agg.values.astype(np.float32), list(agg.columns)
 
 
 def _lgb_fit_eval(
     X_train, X_val, X_test, y_train_log, y_val_log, y_true_test, log1p_inv,
-    label="", n_estimators=1000, learning_rate=0.02,
+    label="",
 ):
     """Shared LightGBM fit/eval helper used across Round-3 experiments.
 
@@ -3064,7 +3069,6 @@ def _lgb_fit_eval(
     y_true_test             : ndarray — native-scale test targets
     log1p_inv               : callable — inverse transform (np.expm1)
     label                   : str — printed after fitting
-    n_estimators, learning_rate : LGB hyperparams
 
     Returns
     -------
@@ -3077,7 +3081,7 @@ def _lgb_fit_eval(
         return {}
 
     model = lgb.LGBMRegressor(
-        n_estimators=n_estimators, learning_rate=learning_rate, num_leaves=31,
+        n_estimators=1000, learning_rate=0.02, num_leaves=31,
         min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
         reg_alpha=0.1, reg_lambda=0.1, random_state=RANDOM_STATE, verbose=-1,
     )
@@ -3350,9 +3354,17 @@ def run_exp_fpc(months, fig_dir, tables_dir, device, df=None):
     rows = []
     best_eofs = None  # Save EOFs for K=20 visualization
 
+    # Fit PCA once for K=40; slice to smaller K values below
+    K_max = 40
+    print(f"\n  Fitting PCA with K={K_max} per channel (fit once, slice for smaller K)...")
+    X_fpc_40, comps_40, var_ratios_40 = build_fpc_features(grid_np, train_idx, n_components_per_channel=K_max)
+
     for K in K_values:
         print(f"\n  K={K} modes per channel ({K * C} total FPC features)...")
-        X_fpc, comps, var_ratios = build_fpc_features(grid_np, train_idx, n_components_per_channel=K)
+        # Slice first K components from each channel's block in the concatenated scores
+        X_fpc = np.concatenate([X_fpc_40[:, c * K_max:c * K_max + K] for c in range(C)], axis=1)
+        comps = [comps_40[c][:K] for c in range(C)]
+        var_ratios = [var_ratios_40[c][:K] for c in range(C)]
         if K == 20:
             best_eofs = (comps, var_ratios)
 
