@@ -1,27 +1,41 @@
 """
-MLP analysis for ERCOT curtailment prediction from spatial forecast error fields.
+MLP/CNN/FNO analysis for ERCOT congestion cost prediction from spatial forecast error fields.
 
-Implements a 3-block MLP trained on a chunk-based train/val/test split that
-prevents temporal leakage from high hourly autocorrelation. Data is divided
-into 5-day blocks, shuffled, and split 70/15/15 across train/val/test.
+Predicts economic_congestion_cost using spatial weather forecast error grids
+(HRRR 1h and GFS day-ahead wind/temp errors) plus scalar temporal controls.
 
-Spatial weather fields are kept as (T, C, H, W) tensors so that future CNN
-or FNO architectures can be swapped in without changing the data pipeline.
-The MLP flattens the spatial grid and appends scalar temporal controls
-(hour_of_day, is_weekend, month) before the linear layers.
+Data is divided into 5-day temporal blocks, shuffled, and split 70/15/15
+across train/val/test to prevent leakage from high hourly autocorrelation.
+Spatial fields are kept as (T, C, H, W) tensors — compatible with MLP
+(flattened), CNN (conv + global pool), and FNO (spectral conv + global pool).
+All architectures share the same (x_spatial, x_scalar) forward interface and
+training loop so results are directly comparable.
 
 Experiments:
+  arch        — MLP vs CNN vs FNO architecture comparison (run first)
   channels    — ablation over which spatial channels to include
   regime      — regime-stratified evaluation and regime-specific training
   saliency    — per-channel gradient saliency maps
   overfitting — diagnostics comparing leaky vs clean splits
+  baseline    — Step 0: log1p transform and cyclic scalar controls
+  infra       — Step 1: infrastructure capacity channels
+  cluster     — Step 2: cluster-level aggregated error features
+  nodal       — Step 3: two-stage nodal LMP auxiliary supervision
+  ar          — Round 2: leakage fix + autoregressive lag features
+  gbm         — Round 2: LightGBM gradient boosting on cluster+AR features
+  gru         — Round 2: GRU recurrent model with 24h sliding window
 
 Usage:
     uv run python -m analysis.nn_analysis --exp all
+    uv run python -m analysis.nn_analysis --exp arch
     uv run python -m analysis.nn_analysis --exp channels
     uv run python -m analysis.nn_analysis --exp regime
     uv run python -m analysis.nn_analysis --exp saliency
     uv run python -m analysis.nn_analysis --exp overfitting
+    uv run python -m analysis.nn_analysis --exp baseline
+    uv run python -m analysis.nn_analysis --exp infra
+    uv run python -m analysis.nn_analysis --exp cluster
+    uv run python -m analysis.nn_analysis --exp nodal
 """
 
 import argparse
@@ -85,6 +99,21 @@ LR = 5e-4
 WEIGHT_DECAY = 1e-4
 MIN_REGIME_SAMPLES = 50
 
+# Infrastructure channels available in pixel_hourly_*.parquet. Used when
+# include_infra=True in load_multi_field_data. Values are time-invariant per
+# pixel, so they are broadcast across T.
+INFRA_FIELDS = [
+    "total_capacity_mw",
+    "nameplate_mw_tech_onshore_wind_turbine",
+    "nameplate_mw_tech_solar_photovoltaic",
+    "nameplate_mw_tech_natural_gas_fired_combined_cycle",
+    "nameplate_mw_tech_natural_gas_fired_combustion_turbine",
+    "nameplate_mw_tech_conventional_steam_coal",
+    "nameplate_mw_tech_nuclear",
+    "has_transmission_line",
+    "load_center",
+]
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
@@ -107,12 +136,14 @@ def load_pixel_data_for_nn(months):
     dirs = setup_directories()
     lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
 
-    keep_cols = (
-        ["pixel_id", "valid_time", "latitude", "longitude", PFA_DEPVAR]
+    keep_cols = list(dict.fromkeys(
+        ["pixel_id", "valid_time", "latitude", "longitude", PFA_DEPVAR, DEPVAR]
         + ERROR_FIELDS
         + REGIME_EXTRA_COLS
         + ["actual_load"]
-    )
+        + ["era5_temp", "era5_wspd"]
+        + INFRA_FIELDS
+    ))
 
     dfs = []
     for year, month in months:
@@ -161,8 +192,8 @@ def make_chunk_splits(hour_idx, chunk_days=CHUNK_DAYS, train_frac=TRAIN_FRAC,
     rng = np.random.default_rng(seed)
     shuffled = rng.permutation(n_chunks)
 
-    n_train = int(np.floor(n_chunks * train_frac))
-    n_val = int(np.floor(n_chunks * val_frac))
+    n_val = max(1, int(np.floor(n_chunks * val_frac))) if n_chunks >= 3 else 0
+    n_train = max(1, min(n_chunks - n_val - 1, int(np.floor(n_chunks * train_frac))))
     train_chunks = set(shuffled[:n_train].tolist())
     val_chunks = set(shuffled[n_train:n_train + n_val].tolist())
 
@@ -178,7 +209,8 @@ def make_chunk_splits(hour_idx, chunk_days=CHUNK_DAYS, train_frac=TRAIN_FRAC,
     return train_rows, val_rows, test_rows
 
 
-def load_multi_field_data(months, spatial_fields=None, df=None):
+def load_multi_field_data(months, spatial_fields=None, df=None,
+                          scalar_mode="raw", include_infra=False):
     """Load pixel-hourly data and build spatial grid tensor plus scalar controls.
 
     Spatial fields are kept as (T, C, H, W) — suitable for MLP (flattened),
@@ -189,17 +221,26 @@ def load_multi_field_data(months, spatial_fields=None, df=None):
     reflects what was actually loaded, so callers must use it (not SPATIAL_FIELDS)
     when mapping channels to names.
 
+    When include_infra=True, static infrastructure channels are appended after
+    the time-varying channels and broadcast across T. The returned grid_spatial
+    will have C_error + n_infra channels. loaded_fields will include infra names.
+
     Parameters
     ----------
     months         : list of (year, month) tuples
     spatial_fields : list of field names for spatial channels;
                      defaults to SPATIAL_FIELDS
     df             : pre-loaded DataFrame (optional); must contain all fields
+    scalar_mode    : 'raw' (default) or 'cyclic'. 'raw' returns
+                     [hour_of_day, is_weekend, month] (3 cols). 'cyclic'
+                     returns [sin(2π·h/24), cos(2π·h/24), sin(2π·m/12),
+                     cos(2π·m/12), is_weekend] (5 cols).
+    include_infra  : bool — whether to concatenate static INFRA_FIELDS channels
 
     Returns
     -------
     grid_spatial    : ndarray (T, C, H, W) float32
-    scalar_controls : ndarray (T, 3) float32 — [hour_of_day, is_weekend, month]
+    scalar_controls : ndarray (T, 3 or 5) float32
     Y               : ndarray (T,)
     pixel_coords    : ndarray (N_pixels, 2)
     hour_idx        : pd.DatetimeIndex
@@ -218,9 +259,22 @@ def load_multi_field_data(months, spatial_fields=None, df=None):
     if missing:
         print(f"  Skipping fields not in dataframe: {sorted(missing)}")
 
-    X_dict, Y_ref, _, pixel_ids_ref, hour_idx_ref = prepare_multi_field_data(
+    X_dict, _, _, pixel_ids_ref, hour_idx_ref = prepare_multi_field_data(
         df, error_fields=available
     )
+
+    # Compute Y from the local DEPVAR (economic_congestion_cost) rather than
+    # PFA_DEPVAR (total_curtailment_mw) used internally by prepare_multi_field_data.
+    hourly_y = df.groupby("valid_time")[DEPVAR].first()
+    Y_ref = hourly_y.reindex(hour_idx_ref).values.astype(np.float32)
+
+    # Drop hours with NaN in the target
+    valid_t = ~np.isnan(Y_ref)
+    if not valid_t.all():
+        print(f"  Dropping {(~valid_t).sum()} hours with NaN {DEPVAR}")
+        hour_idx_ref = hour_idx_ref[valid_t]
+        Y_ref = Y_ref[valid_t]
+        X_dict = {k: v[valid_t] for k, v in X_dict.items()}
 
     # Rebuild pixel_coords directly from df: prepare_multi_field_data's internal
     # coord_map.loc lookup silently returns NaN when the pivot column Index type
@@ -243,11 +297,22 @@ def load_multi_field_data(months, spatial_fields=None, df=None):
     loaded_fields = list(X_dict.keys())
     grid_spatial = build_grid_tensor(X_dict, pixel_coords_ref, resolution=0.25)
 
-    scalar_controls = np.column_stack([
-        hour_idx_ref.hour.values.astype(np.float32),
-        (hour_idx_ref.dayofweek >= 5).astype(np.float32),
-        hour_idx_ref.month.values.astype(np.float32),
-    ])
+    scalar_controls = build_scalar_controls(hour_idx_ref, cyclic=(scalar_mode == "cyclic"))
+
+    # Optionally append static infrastructure channels
+    if include_infra:
+        infra_grid, infra_names = build_infra_channels(
+            df, pixel_coords_ref, resolution=0.25
+        )
+        if infra_grid is not None and infra_grid.shape[0] > 0:
+            T = grid_spatial.shape[0]
+            # Broadcast (n_infra, H, W) → (T, n_infra, H, W)
+            infra_broadcast = np.broadcast_to(
+                infra_grid[np.newaxis], (T,) + infra_grid.shape
+            ).copy().astype(np.float32)
+            grid_spatial = np.concatenate([grid_spatial, infra_broadcast], axis=1)
+            loaded_fields = loaded_fields + infra_names
+            print(f"  Appended {len(infra_names)} infra channels: {infra_names}")
 
     return grid_spatial, scalar_controls, Y_ref, pixel_coords_ref, hour_idx_ref, loaded_fields
 
@@ -378,6 +443,126 @@ def _make_mlp_cls(spatial_dim, n_scalar):
     return MLPScalar
 
 
+def _make_cnn_cls(C, n_scalar, hidden=64):
+    """Return a CNN class with the same (x_spatial, x_scalar) forward interface as MLP.
+
+    Three conv layers with global average pooling extract spatial features,
+    which are concatenated with scalar controls before the MLP head.
+
+    Parameters
+    ----------
+    C        : int — input channels (C in grid tensor)
+    n_scalar : int — number of scalar temporal controls
+    hidden   : int — conv layer channel width
+
+    Returns
+    -------
+    class — instantiates to nn.Module
+    """
+    import torch
+    import torch.nn as nn
+
+    class CNNScalar(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cnn = nn.Sequential(
+                nn.Conv2d(C, hidden, 3, padding=1), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 3, padding=1), nn.GELU(),
+                nn.Conv2d(hidden, hidden // 2, 3, padding=1), nn.GELU(),
+            )
+            self.head = nn.Sequential(
+                nn.Linear(hidden // 2 + n_scalar, 128),
+                nn.LayerNorm(128), nn.GELU(), nn.Dropout(0.2),
+                nn.Linear(128, 64), nn.GELU(),
+                nn.Linear(64, 1),
+            )
+
+        def forward(self, x_spatial, x_scalar):
+            """Forward: conv over spatial grid, pool, concat scalars, MLP head.
+
+            Parameters
+            ----------
+            x_spatial : Tensor (B, C, H, W)
+            x_scalar  : Tensor (B, n_scalar)
+
+            Returns
+            -------
+            Tensor (B,)
+            """
+            feat = self.cnn(x_spatial).mean(dim=(-2, -1))
+            return self.head(torch.cat([feat, x_scalar], dim=1)).squeeze(-1)
+
+    return CNNScalar
+
+
+def _make_fno_cls(C, H, W, n_scalar, modes=8, hidden=32, n_layers=2):
+    """Return an FNO class with the same (x_spatial, x_scalar) forward interface.
+
+    Uses neuralop.models.FNO with domain_padding for non-periodic ERCOT domain.
+    FNO must run on CPU (rfft2 unsupported on MPS); callers should pass
+    device=torch.device('cpu') to train_with_splits for this architecture.
+
+    Parameters
+    ----------
+    C, H, W  : int — spatial grid dimensions
+    n_scalar : int — number of scalar temporal controls
+    modes    : int — Fourier modes per dimension (auto-clamped to Nyquist)
+    hidden   : int — FNO channel width
+    n_layers : int — number of spectral conv layers
+
+    Returns
+    -------
+    class — instantiates to nn.Module, or None if neuralop not installed
+    """
+    try:
+        from neuralop.models import FNO
+    except ImportError:
+        return None
+
+    import torch
+    import torch.nn as nn
+
+    modes_h = min(modes, H // 2)
+    modes_w = min(modes, W // 2)
+
+    class FNOScalar(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fno = FNO(
+                n_modes=(modes_h, modes_w),
+                in_channels=C,
+                out_channels=hidden,
+                hidden_channels=hidden,
+                n_layers=n_layers,
+                domain_padding=0.1,
+                norm="instance_norm",
+                use_channel_mlp=True,
+                channel_mlp_expansion=0.5,
+                fno_skip="linear",
+                channel_mlp_skip="soft-gating",
+            )
+            self.head = nn.Sequential(
+                nn.Linear(hidden + n_scalar, 64), nn.GELU(), nn.Linear(64, 1)
+            )
+
+        def forward(self, x_spatial, x_scalar):
+            """Forward: FNO over spatial grid, pool, concat scalars, MLP head.
+
+            Parameters
+            ----------
+            x_spatial : Tensor (B, C, H, W) — must be on CPU
+            x_scalar  : Tensor (B, n_scalar)
+
+            Returns
+            -------
+            Tensor (B,)
+            """
+            feat = self.fno(x_spatial).mean(dim=(-2, -1))
+            return self.head(torch.cat([feat, x_scalar], dim=1)).squeeze(-1)
+
+    return FNOScalar
+
+
 # ── Training helpers ──────────────────────────────────────────────────────────
 
 def _r2(y_true, y_pred):
@@ -404,26 +589,37 @@ def _count_params(model):
 def train_with_splits(ModelClass, grid_np, scalar_np, Y_np,
                       train_idx, val_idx, test_idx, device,
                       n_epochs=N_EPOCHS, patience=PATIENCE,
-                      batch_size=BATCH_SIZE, lr=LR, weight_decay=WEIGHT_DECAY):
+                      batch_size=BATCH_SIZE, lr=LR, weight_decay=WEIGHT_DECAY,
+                      y_native=None, y_inverse=None):
     """Train on train split, early-stop on val, evaluate on test.
 
     Y and scalar controls are normalized using train-set statistics only
     to prevent any information leakage through normalization.
+
+    When y_native and y_inverse are both provided, also computes native-scale
+    metrics by inverting the transform: native_pred = y_inverse(pred * Y_std + Y_mean).
+    Reports native_test_r2, native_test_rmse, and tail_test_r2 (R² on top-10%
+    of test hours by true native cost).
 
     Parameters
     ----------
     ModelClass                   : callable → nn.Module with forward(x_spatial, x_scalar)
     grid_np                      : ndarray (T, C, H, W)
     scalar_np                    : ndarray (T, n_scalar) — un-normalized
-    Y_np                         : ndarray (T,) — un-normalized target
+    Y_np                         : ndarray (T,) — un-normalized target (possibly transformed)
     train_idx, val_idx, test_idx : ndarray of int
     device                       : torch.device
     n_epochs, patience, batch_size, lr, weight_decay : training hyperparams
+    y_native                     : ndarray (T,) or None — original native-scale target values
+    y_inverse                    : callable or None — invert transform (e.g. np.expm1)
 
     Returns
     -------
-    dict with train_r2, val_r2, test_r2, model (on CPU, best checkpoint)
+    dict with train_r2, val_r2, test_r2, model (on CPU, best checkpoint).
+    If y_native and y_inverse provided, also includes native_test_r2,
+    native_test_rmse, tail_test_r2.
     """
+    import io
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -486,7 +682,10 @@ def train_with_splits(ModelClass, grid_np, scalar_np, Y_np,
 
         if val_loss < best_val - 1e-5:
             best_val = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            # BytesIO roundtrip avoids neuralop's non-standard state_dict entries
+            buf = io.BytesIO()
+            torch.save(model.state_dict(), buf)
+            best_state = buf.getvalue()
             patience_count = 0
         else:
             patience_count += 1
@@ -494,7 +693,10 @@ def train_with_splits(ModelClass, grid_np, scalar_np, Y_np,
                 break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        # strict=False: neuralop FNO stores a non-parameter "_metadata" key
+        model.load_state_dict(
+            torch.load(io.BytesIO(best_state), weights_only=False), strict=False
+        )
 
     model.eval()
     with torch.no_grad():
@@ -503,7 +705,7 @@ def train_with_splits(ModelClass, grid_np, scalar_np, Y_np,
         y_pred_te = model(X_te, S_te).cpu().numpy()
 
     test_r2 = _r2(Y_t[test_idx].numpy(), y_pred_te)
-    return {
+    result = {
         "train_r2": _r2(Y_t[train_idx].numpy(), y_pred_tr),
         "val_r2": _r2(Y_t[val_idx].numpy(), y_pred_val),
         "test_r2": test_r2,
@@ -511,6 +713,33 @@ def train_with_splits(ModelClass, grid_np, scalar_np, Y_np,
         "r2_std": 0.0,
         "model": model.cpu(),
     }
+
+    # Native-scale metrics when an inverse transform is supplied
+    if y_native is not None and y_inverse is not None:
+        # Recover transformed predictions → native scale
+        y_pred_te_tfm = y_pred_te * Y_std + Y_mean
+        y_pred_te_native = y_inverse(y_pred_te_tfm)
+        y_true_te_native = y_native[test_idx]
+
+        native_r2 = _r2(y_true_te_native, y_pred_te_native)
+        native_rmse = float(np.sqrt(np.mean((y_true_te_native - y_pred_te_native) ** 2)))
+
+        # Tail R²: top-10% of test hours by true native cost
+        tail_thresh = np.percentile(y_true_te_native, 90)
+        tail_mask = y_true_te_native >= tail_thresh
+        if tail_mask.sum() >= 5:
+            tail_r2 = _r2(y_true_te_native[tail_mask], y_pred_te_native[tail_mask])
+        else:
+            tail_r2 = float("nan")
+
+        result.update({
+            "native_test_r2": native_r2,
+            "native_test_rmse": native_rmse,
+            "tail_test_r2": tail_r2,
+            "r2": native_r2,   # override bar-chart alias with native R²
+        })
+
+    return result
 
 
 # ── Plotting helpers ───────────────────────────────────────────────────────────
@@ -531,10 +760,13 @@ def plot_bar_comparison(results_dict, title, save_path, baselines=None):
 
     fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.4), 5))
     colors = plt.cm.tab10(np.linspace(0, 0.9, len(labels)))
-    ax.bar(labels, r2s, yerr=stds, capsize=5, color=colors,
+    # Clip displayed R² to [-1, 1] to avoid axis-size explosions from extreme negatives
+    r2s_clipped = [max(-1.0, r) for r in r2s]
+    ax.bar(labels, r2s_clipped, yerr=stds, capsize=5, color=colors,
            alpha=0.85, edgecolor="black", linewidth=0.5)
-    for i, (r2, std) in enumerate(zip(r2s, stds)):
-        ax.text(i, r2 + std + 0.008, f"{r2:.3f}", ha="center", fontsize=9)
+    for i, (r2, std, r2c) in enumerate(zip(r2s, stds, r2s_clipped)):
+        y_text = min(max(r2c + std + 0.02, -0.95), 0.98)
+        ax.text(i, y_text, f"{r2:.3f}", ha="center", fontsize=9)
 
     if baselines:
         for blabel, br2 in baselines.items():
@@ -543,7 +775,9 @@ def plot_bar_comparison(results_dict, title, save_path, baselines=None):
         ax.legend(fontsize=8)
 
     ax.set_ylabel("Test R²")
-    ax.set_ylim(0, min(1.05, max(r2s) + max(stds) + 0.12))
+    y_min = min(-0.05, min(r2s_clipped) - 0.05)
+    y_max = min(1.05, max(r2s_clipped) + max(stds) + 0.15)
+    ax.set_ylim(y_min, max(y_max, y_min + 0.1))
     ax.set_title(title)
     plt.xticks(rotation=20, ha="right")
     fig.tight_layout()
@@ -667,7 +901,213 @@ def plot_saliency_2x2(sal_per_channel, channel_names, pixel_coords,
     print(f"  Saved: {save_path}")
 
 
+# ── New helper functions (Steps 0–3) ──────────────────────────────────────────
+
+def build_scalar_controls(hour_idx, cyclic=False):
+    """Build scalar temporal control features from a DatetimeIndex.
+
+    Parameters
+    ----------
+    hour_idx : pd.DatetimeIndex — timestamps (T,)
+    cyclic   : bool — if True, encode hour and month as sin/cos pairs.
+               Returns shape (T, 5): [sin_h, cos_h, sin_m, cos_m, is_weekend].
+               If False, returns shape (T, 3): [hour_of_day, is_weekend, month].
+
+    Returns
+    -------
+    ndarray (T, 3) or (T, 5) float32
+    """
+    if cyclic:
+        h = hour_idx.hour.values.astype(np.float32)
+        m = hour_idx.month.values.astype(np.float32)
+        return np.column_stack([
+            np.sin(2 * np.pi * h / 24).astype(np.float32),
+            np.cos(2 * np.pi * h / 24).astype(np.float32),
+            np.sin(2 * np.pi * (m - 1) / 12).astype(np.float32),
+            np.cos(2 * np.pi * (m - 1) / 12).astype(np.float32),
+            (hour_idx.dayofweek >= 5).astype(np.float32),
+        ])
+    return np.column_stack([
+        hour_idx.hour.values.astype(np.float32),
+        (hour_idx.dayofweek >= 5).astype(np.float32),
+        hour_idx.month.values.astype(np.float32),
+    ])
+
+
+def y_transform_log1p():
+    """Return forward and inverse functions for log1p target transform.
+
+    The forward transform stabilizes the heavy-tailed economic_congestion_cost
+    distribution. The inverse (expm1) is used to recover native-scale predictions
+    for reporting.
+
+    Returns
+    -------
+    tuple (forward, inverse) — both are callables ndarray → ndarray
+    """
+    return np.log1p, np.expm1
+
+
+def build_infra_channels(df, pixel_coords_ref, resolution=0.25):
+    """Build static infrastructure spatial channels from pixel dataframe.
+
+    Reads INFRA_FIELDS from df, deduplicates by pixel_id, applies log1p to
+    capacity columns (MW), keeps binary columns as-is, and regrids to the
+    coarse H×W grid used by the spatial error channels.
+
+    Parameters
+    ----------
+    df               : pd.DataFrame — pixel-hourly data; must have pixel_id,
+                       latitude, longitude, and any subset of INFRA_FIELDS
+    pixel_coords_ref : ndarray (N_pixels, 2) — (lat, lon) reference grid used
+                       by the error channels (to align infra onto same grid)
+    resolution       : float — coarse grid spacing in degrees (default 0.25)
+
+    Returns
+    -------
+    infra_grid : ndarray (n_infra, H, W) float32 or None if no infra columns found
+    infra_names : list of str — channel names corresponding to axis 0
+    """
+    binary_cols = {"has_transmission_line", "load_center"}
+    available = [f for f in INFRA_FIELDS if f in df.columns]
+    if not available:
+        return None, []
+
+    # One row per pixel_id. Drop NaN coords FIRST — the first row of a pixel
+    # sometimes has NaN lat/lon (missing forecast), so drop_duplicates before
+    # dropna would lose most pixels.
+    pixel_static = (
+        df[["pixel_id", "latitude", "longitude"] + available]
+        .dropna(subset=["latitude", "longitude"])
+        .drop_duplicates("pixel_id")
+        .reset_index(drop=True)
+    )
+    if len(pixel_static) == 0:
+        return None, []
+
+    pc = pixel_static[["latitude", "longitude"]].values
+    lat_idx, lon_idx, H, W = _coarse_grid_indices(pc, resolution)
+
+    # Ensure grid covers pixel_coords_ref extent
+    _, _, H_ref, W_ref = _coarse_grid_indices(pixel_coords_ref, resolution)
+    H = max(H, H_ref)
+    W = max(W, W_ref)
+
+    n_infra = len(available)
+    infra_grid = np.zeros((n_infra, H, W), dtype=np.float32)
+
+    for ch, col in enumerate(available):
+        vals = pixel_static[col].fillna(0).values.astype(np.float32)
+        if col not in binary_cols:
+            vals = np.log1p(vals)
+        infra_grid[ch, lat_idx, lon_idx] = vals
+
+    return infra_grid, available
+
+
+def load_cluster_error_features(months, hour_idx):
+    """Load cluster-level aggregated error features including lmp_std.
+
+    Thin wrapper around load_cluster_features_v2 that preserves the original
+    behaviour (includes lmp_std). Use load_cluster_features_v2 directly when
+    you need to control which fields are included.
+
+    Parameters
+    ----------
+    months   : list of (year, month) tuples
+    hour_idx : pd.DatetimeIndex (T,) — hours to align features to
+
+    Returns
+    -------
+    ndarray (T, n_features) float32 — cluster features aligned to hour_idx
+    """
+    arr, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=True)
+    return arr
+
+
 # ── Experiment implementations ─────────────────────────────────────────────────
+
+def run_exp_arch(months, fig_dir, tables_dir, device, df=None):
+    """Experiment A: Architecture comparison — MLP vs CNN vs FNO.
+
+    All three use the full SPATIAL_FIELDS (errors + ERA5 actuals + actual_load)
+    at 0.25° and the chunk-based 70/15/15 split. FNO runs on CPU (rfft2
+    unsupported on MPS) with N_EPOCHS // 3 epochs — a wall-time constraint,
+    not a capacity limit, so its R² is a lower bound vs MLP/CNN.
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device — for MLP and CNN; FNO always uses CPU
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {arch_name: {train_r2, val_r2, test_r2, r2, r2_std}}
+    """
+    import torch
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENT A: ARCHITECTURE COMPARISON (MLP vs CNN vs FNO, 0.25°)")
+    print("=" * 70)
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    grid_np, scalar_controls, Y, pc, hour_idx, loaded_fields = load_multi_field_data(
+        months, spatial_fields=SPATIAL_FIELDS, df=df
+    )
+    T, C, H, W = grid_np.shape
+    n_scalar = scalar_controls.shape[1]
+    print(f"  Grid: ({T}, {C}, {H}, {W}), channels: {loaded_fields}")
+
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    print(f"  Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+    cpu_device = torch.device("cpu")
+    fno_epochs = max(20, N_EPOCHS // 3)
+
+    FNOClass = _make_fno_cls(C, H, W, n_scalar)
+    arch_configs = [
+        ("MLP", _make_mlp_cls(C * H * W, n_scalar), device, N_EPOCHS),
+        ("CNN", _make_cnn_cls(C, n_scalar), device, N_EPOCHS),
+    ]
+    if FNOClass is None:
+        print("  [FNO] — skipped (neuralop not installed; run: uv add neuralop)")
+    else:
+        arch_configs.append(("FNO", FNOClass, cpu_device, fno_epochs))
+
+    results = {}
+    for name, ModelClass, dev, epochs in arch_configs:
+        label = f"{name} (CPU, {epochs} ep)" if dev == cpu_device else name
+        print(f"\n  [{label}]")
+        res = train_with_splits(
+            ModelClass, grid_np, scalar_controls, Y,
+            train_idx, val_idx, test_idx, device=dev, n_epochs=epochs,
+        )
+        results[name] = res
+        print(f"    train R²={res['train_r2']:.4f}  val R²={res['val_r2']:.4f}"
+              f"  test R²={res['test_r2']:.4f}")
+
+    plot_bar_comparison(
+        results,
+        title=(
+            "Architecture Comparison — MLP vs CNN vs FNO\n"
+            f"All spatial fields at 0.25°, chunk-based 70/15/15 split"
+            f"  (FNO: {fno_epochs} epochs on CPU)"
+        ),
+        save_path=fig_dir / "nn_arch_comparison.png",
+    )
+    rows = [
+        {"architecture": k, "train_r2": v["train_r2"], "val_r2": v["val_r2"],
+         "test_r2": v["test_r2"]}
+        for k, v in results.items()
+    ]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_arch_comparison.csv", index=False)
+    return results
+
 
 def run_exp_channels(months, fig_dir, tables_dir, device, df=None):
     """Experiment C: Channel ablation over spatial field combinations.
@@ -1141,6 +1581,2191 @@ def run_exp_overfitting_checks(months, fig_dir, tables_dir, device):
     return results
 
 
+# ── New experiments (Steps 0–3) ───────────────────────────────────────────────
+
+def run_exp_baseline(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: Baseline diagnostics — log1p transform and cyclic scalar controls.
+
+    Evaluates three configurations of the 4-channel error-only MLP to identify
+    quick wins from target distribution and encoding improvements:
+      (a) raw target, raw scalars (matches current error-only baseline)
+      (b) log1p target, raw scalars
+      (c) log1p target, cyclic scalars (sin/cos hour and month)
+
+    Also saves a diagnostic figure showing the target distribution histogram
+    and scatter vs system_lmp_std.
+
+    All configs use the same chunk-based 70/15/15 split and report both
+    transformed R² and native-scale (inverted) R².
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: {train_r2, val_r2, test_r2, native_test_r2, ...}}
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: BASELINE DIAGNOSTICS (target transform + scalar encoding)")
+    print("=" * 70)
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    # ── Target distribution diagnostic figure ─────────────────────────────────
+    hourly_y_raw = df.groupby("valid_time")[DEPVAR].first().dropna()
+    Y_all_raw = hourly_y_raw.values
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].hist(Y_all_raw[Y_all_raw > 0], bins=80, log=True, color="steelblue",
+                 edgecolor="white", linewidth=0.3)
+    axes[0].set_xlabel("economic_congestion_cost ($)")
+    axes[0].set_ylabel("Count (log scale)")
+    axes[0].set_title("Target Distribution (positive values, log-y)")
+
+    # Scatter vs system_lmp_std (system-wide)
+    if "system_lmp_std" in df.columns:
+        hourly_lmp = df.groupby("valid_time")["system_lmp_std"].first()
+        lmp_aligned = hourly_lmp.reindex(hourly_y_raw.index)
+        valid = ~lmp_aligned.isna()
+        axes[1].scatter(lmp_aligned[valid].values, hourly_y_raw[valid].values,
+                        alpha=0.15, s=4, color="darkorange")
+        axes[1].set_xlabel("system_lmp_std ($/MWh)")
+        axes[1].set_ylabel("economic_congestion_cost ($)")
+        axes[1].set_title("Congestion Cost vs LMP Spread")
+    fig.tight_layout()
+    dist_path = fig_dir / "nn_target_distribution.png"
+    fig.savefig(dist_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved distribution figure: {dist_path}")
+
+    # ── Load data (4-ch errors only, raw scalars as baseline) ─────────────────
+    grid_np, scalar_raw, Y_raw, pc, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="raw"
+    )
+    T, C, H, W = grid_np.shape
+    spatial_dim = C * H * W
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    print(f"  Grid: ({T}, {C}, {H}, {W})  Split: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
+
+    scalar_cyc = build_scalar_controls(hour_idx, cyclic=True)
+    log1p_fwd, log1p_inv = y_transform_log1p()
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+
+    configs = [
+        ("(a) raw_target_raw_scalars",   Y_raw,   scalar_raw, None,        None),
+        ("(b) log1p_target_raw_scalars", Y_log,   scalar_raw, Y_raw, log1p_inv),
+        ("(c) log1p_target_cyc_scalars", Y_log,   scalar_cyc, Y_raw, log1p_inv),
+    ]
+
+    results = {}
+    for name, Y_use, sc_use, y_nat, y_inv in configs:
+        n_sc = sc_use.shape[1]
+        print(f"\n  [{name}]")
+        res = train_with_splits(
+            _make_mlp_cls(spatial_dim, n_sc),
+            grid_np, sc_use, Y_use,
+            train_idx, val_idx, test_idx, device,
+            y_native=y_nat, y_inverse=y_inv,
+        )
+        results[name] = res
+        native_r2 = res.get("native_test_r2", res["test_r2"])
+        print(f"    train R²={res['train_r2']:.4f}  val R²={res['val_r2']:.4f}"
+              f"  test R²(tfm)={res['test_r2']:.4f}  native R²={native_r2:.4f}")
+
+    # Bar chart using native R² for log1p configs, test_r2 for raw config
+    bar_data = {}
+    for name, res in results.items():
+        r2_plot = res.get("native_test_r2", res["test_r2"])
+        bar_data[name] = {"r2": r2_plot, "r2_std": 0.0}
+
+    plot_bar_comparison(
+        bar_data,
+        title="Baseline Diagnostics — 4-ch Error MLP\nNative-scale test R² (log1p inverted)",
+        save_path=fig_dir / "nn_baseline_comparison.png",
+    )
+
+    rows = []
+    for name, res in results.items():
+        rows.append({
+            "config": name,
+            "train_r2": res["train_r2"],
+            "val_r2": res["val_r2"],
+            "test_r2": res["test_r2"],
+            "native_test_r2": res.get("native_test_r2", float("nan")),
+            "native_test_rmse": res.get("native_test_rmse", float("nan")),
+            "tail_test_r2": res.get("tail_test_r2", float("nan")),
+        })
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_baseline_comparison.csv", index=False)
+    return results
+
+
+def run_exp_infra(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: Infrastructure channel ablation.
+
+    Builds on the best config from run_exp_baseline (log1p target, cyclic
+    scalars) and tests three channel configurations:
+      (a) errors only (4 ch) — matches Step 0 best baseline
+      (b) errors + infra channels (4 + n_infra ch)
+      (c) errors + interaction channels (err × wind_cap + err × load_mask)
+
+    Reports native-scale R² for all configs.
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: {train_r2, val_r2, test_r2, native_test_r2, ...}}
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: INFRASTRUCTURE CHANNELS (infra spatial features)")
+    print("=" * 70)
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    # Load with infra channels
+    grid_with_infra, scalar_cyc, Y_raw, pc, hour_idx, loaded_fields_infra = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df,
+        scalar_mode="cyclic", include_infra=True,
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    T, C_all, H, W = grid_with_infra.shape
+    n_sc = scalar_cyc.shape[1]
+
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    print(f"  Grid: ({T}, {C_all}, {H}, {W})  n_infra={C_all - len(ERROR_FIELDS)}")
+
+    # Identify error channel indices vs infra channel indices
+    n_err = len([f for f in loaded_fields_infra if f in ERROR_FIELDS])
+    grid_errors_only = grid_with_infra[:, :n_err, :, :]
+
+    # Build interaction channels: err × wind_cap_normalized, err × load_center
+    wind_col = "nameplate_mw_tech_onshore_wind_turbine"
+    load_col = "load_center"
+
+    def _make_interaction_grid(grid_err, infra_full, fields_all):
+        """Multiply error channels by normalized wind capacity and load masks.
+
+        Parameters
+        ----------
+        grid_err   : ndarray (T, n_err, H, W)
+        infra_full : ndarray (T, n_infra, H, W) — the infra portion (already broadcast)
+        fields_all : list of str — all loaded field names (error + infra)
+
+        Returns
+        -------
+        ndarray (T, n_err + 2*n_err, H, W)
+        """
+        n_err_ch = grid_err.shape[1]
+        n_infra_start = n_err_ch  # infra starts after error channels in grid_with_infra
+
+        # Find wind cap and load center indices within the full grid
+        wind_idx = None
+        load_idx = None
+        for i, f in enumerate(fields_all):
+            if f == wind_col:
+                wind_idx = i
+            if f == load_col:
+                load_idx = i
+
+        interact_parts = [grid_err]
+
+        if wind_idx is not None:
+            wind_mask = infra_full[0, wind_idx - n_infra_start]  # (H, W)
+            wind_norm = wind_mask / (wind_mask.max() + 1e-8)
+            # Broadcast (H, W) → (1, 1, H, W) via newaxis; numpy auto-broadcasts against (T, C, H, W)
+            interact_parts.append(grid_err * wind_norm[np.newaxis, np.newaxis])
+
+        if load_idx is not None:
+            load_mask = infra_full[0, load_idx - n_infra_start]  # (H, W)
+            interact_parts.append(grid_err * load_mask[np.newaxis, np.newaxis])
+
+        return np.concatenate(interact_parts, axis=1).astype(np.float32)
+
+    grid_infra_portion = grid_with_infra[:, n_err:, :, :]
+
+    configs = [
+        ("(a) errors_only_4ch",         grid_errors_only),
+        ("(b) errors_plus_infra",        grid_with_infra),
+        ("(c) errors_plus_interactions", _make_interaction_grid(
+            grid_errors_only, grid_infra_portion, loaded_fields_infra)),
+    ]
+
+    results = {}
+    for name, grid_use in configs:
+        _, C_use, H_use, W_use = grid_use.shape
+        spatial_dim = C_use * H_use * W_use
+        print(f"\n  [{name}] C={C_use}")
+        res = train_with_splits(
+            _make_mlp_cls(spatial_dim, n_sc),
+            grid_use, scalar_cyc, Y_log,
+            train_idx, val_idx, test_idx, device,
+            y_native=Y_raw, y_inverse=log1p_inv,
+        )
+        results[name] = res
+        native_r2 = res.get("native_test_r2", float("nan"))
+        print(f"    train R²={res['train_r2']:.4f}  val R²={res['val_r2']:.4f}"
+              f"  test R²(tfm)={res['test_r2']:.4f}  native R²={native_r2:.4f}")
+
+    bar_data = {n: {"r2": r.get("native_test_r2", r["test_r2"]), "r2_std": 0.0}
+                for n, r in results.items()}
+    plot_bar_comparison(
+        bar_data,
+        title="Infrastructure Channel Ablation — MLP (log1p, cyclic scalars)\nNative-scale test R²",
+        save_path=fig_dir / "nn_infra_comparison.png",
+    )
+
+    rows = [{"config": n, "train_r2": r["train_r2"], "val_r2": r["val_r2"],
+             "test_r2": r["test_r2"],
+             "native_test_r2": r.get("native_test_r2", float("nan")),
+             "native_test_rmse": r.get("native_test_rmse", float("nan")),
+             "tail_test_r2": r.get("tail_test_r2", float("nan"))}
+            for n, r in results.items()]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_infra_comparison.csv", index=False)
+    return results
+
+
+def run_exp_cluster(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: Cluster-level aggregated error features.
+
+    Exploits the strong spatial correlation in forecast errors by summarizing
+    them at the k=7 cluster level. Tests three configurations:
+      (a) cluster features only (no spatial grid) — scalar MLP
+      (b) spatial (error grid) + cluster features concatenated onto scalars
+      (c) spatial only — matches Step 0c best baseline
+
+    All configs use log1p target and cyclic scalar controls.
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: {train_r2, val_r2, test_r2, native_test_r2, ...}}
+    """
+    import torch
+    import torch.nn as nn
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: CLUSTER FEATURES (regional aggregates)")
+    print("=" * 70)
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    grid_np, scalar_cyc, Y_raw, pc, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    T, C, H, W = grid_np.shape
+    n_sc = scalar_cyc.shape[1]
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    print(f"  Grid: ({T}, {C}, {H}, {W})  Split: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
+
+    cluster_feats = load_cluster_error_features(months, hour_idx)
+    n_cluster = cluster_feats.shape[1]
+    print(f"  Cluster features: {n_cluster} columns")
+
+    results = {}
+
+    # ── (c) spatial only — same as Step 0c, gives the reference R² ───────────
+    print(f"\n  [(c) spatial_only]")
+    res_c = train_with_splits(
+        _make_mlp_cls(C * H * W, n_sc),
+        grid_np, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    results["(c) spatial_only"] = res_c
+    print(f"    native R²={res_c.get('native_test_r2', float('nan')):.4f}")
+
+    # ── (a) cluster features only — scalar MLP ────────────────────────────────
+    # Feed cluster features as the "spatial" grid (flatten to 1D, no grid needed)
+    # Build a 1×1×n_cluster pseudo-grid so train_with_splits works unchanged
+    cluster_grid = cluster_feats[:, np.newaxis, np.newaxis, :]  # (T, 1, 1, n_cluster)
+    print(f"\n  [(a) cluster_only]")
+    res_a = train_with_splits(
+        _make_mlp_cls(n_cluster, n_sc),
+        cluster_grid, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    results["(a) cluster_only"] = res_a
+    print(f"    native R²={res_a.get('native_test_r2', float('nan')):.4f}")
+
+    # ── (b) spatial + cluster — concat cluster features onto scalar controls ──
+    scalar_with_cluster = np.concatenate([scalar_cyc, cluster_feats], axis=1)
+    n_sc_ext = scalar_with_cluster.shape[1]
+    print(f"\n  [(b) spatial_plus_cluster]")
+    res_b = train_with_splits(
+        _make_mlp_cls(C * H * W, n_sc_ext),
+        grid_np, scalar_with_cluster, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    results["(b) spatial_plus_cluster"] = res_b
+    print(f"    native R²={res_b.get('native_test_r2', float('nan')):.4f}")
+
+    bar_data = {n: {"r2": r.get("native_test_r2", r["test_r2"]), "r2_std": 0.0}
+                for n, r in results.items()}
+    plot_bar_comparison(
+        bar_data,
+        title="Cluster Feature Ablation — MLP (log1p, cyclic scalars)\nNative-scale test R²",
+        save_path=fig_dir / "nn_cluster_comparison.png",
+    )
+
+    rows = [{"config": n, "train_r2": r["train_r2"], "val_r2": r["val_r2"],
+             "test_r2": r["test_r2"],
+             "native_test_r2": r.get("native_test_r2", float("nan")),
+             "native_test_rmse": r.get("native_test_rmse", float("nan")),
+             "tail_test_r2": r.get("tail_test_r2", float("nan"))}
+            for n, r in results.items()]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_cluster_comparison.csv", index=False)
+    return results
+
+
+def run_exp_nodal(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: Two-stage nodal LMP auxiliary supervision.
+
+    Stage 1: Train an MLP that predicts per-node LMP from the spatial error
+    grid + cyclic scalars. This provides auxiliary supervision from the ~N_nodes
+    nodal LMP signals. Output dim = N_nodes (capped at 200 most-covered nodes).
+
+    Stage 2: Take Stage 1 model predictions on all hours (standardized), feed as
+    scalar features to a small MLP that predicts log1p congestion cost. This
+    tests whether the nodal signal contains information about congestion beyond
+    what the spatial error grid captures directly.
+
+    Reports stage1_nodal_r2, stage2_congestion_native_r2, and a baseline
+    congestion native R² from the 4-ch spatial MLP.
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict with stage1 and stage2 results plus baseline comparison
+    """
+    import torch
+    import torch.nn as nn
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: NODAL TWO-STAGE AUXILIARY SUPERVISION")
+    print("=" * 70)
+
+    dirs = setup_directories()
+    processed = Path(dirs["processed"])
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    # ── Load spatial grid and congestion target ────────────────────────────────
+    grid_np, scalar_cyc, Y_raw, pc, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    T, C, H, W = grid_np.shape
+    n_sc = scalar_cyc.shape[1]
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    print(f"  Grid: ({T}, {C}, {H}, {W})")
+
+    # ── Load nodal LMP data ────────────────────────────────────────────────────
+    years = sorted({y for y, _ in months})
+    month_set = {m for _, m in months}
+    node_dfs = []
+    for year in years:
+        tag = f"{year}01_{year}12"
+        node_path = processed / f"node_hourly_gfs+hrrr_era5_{tag}.csv"
+        if not node_path.exists():
+            print(f"  [WARNING] Node CSV not found: {node_path}")
+            continue
+        ndf = pd.read_csv(node_path, parse_dates=["hour"])
+        if ndf["hour"].dt.tz is not None:
+            ndf["hour"] = ndf["hour"].dt.tz_localize(None)
+        ndf = ndf[ndf["hour"].dt.month.isin(month_set)]
+        if "lmp" in ndf.columns:
+            node_dfs.append(ndf[["hour", "settlement_point", "lmp"]])
+
+    if not node_dfs:
+        print("  [nodal] No node CSV found — skipping nodal experiment")
+        return {}
+
+    node_all = pd.concat(node_dfs, ignore_index=True)
+
+    # Pivot to (hour, settlement_point) matrix
+    node_pivot = node_all.pivot_table(
+        index="hour", columns="settlement_point", values="lmp", aggfunc="first"
+    )
+
+    # Align to hour_idx; keep nodes with ≥90% coverage
+    node_aligned = node_pivot.reindex(hour_idx)
+    coverage = node_aligned.notna().mean(axis=0)
+    good_nodes = coverage[coverage >= 0.90].index.tolist()
+    print(f"  Nodes with ≥90% coverage: {len(good_nodes)}")
+
+    # Cap at 200 most-covered nodes
+    if len(good_nodes) > 200:
+        top_nodes = coverage[good_nodes].nlargest(200).index.tolist()
+        good_nodes = top_nodes
+        print(f"  Capped to 200 nodes")
+
+    if len(good_nodes) < 5:
+        print("  Too few nodes with good coverage — skipping nodal experiment")
+        return {}
+
+    Y_nodal = node_aligned[good_nodes].copy()
+    # Fill residual missing with per-node means computed from train hours
+    train_means = Y_nodal.iloc[train_idx].mean(axis=0)
+    Y_nodal = Y_nodal.fillna(train_means)
+    Y_nodal_np = Y_nodal.values.astype(np.float32)  # (T, N_nodes)
+    N_nodes = Y_nodal_np.shape[1]
+    print(f"  Y_nodal shape: {Y_nodal_np.shape}")
+
+    # ── Stage 1: predict nodal LMP ────────────────────────────────────────────
+    print("\n  [Stage 1] Training nodal LMP predictor...")
+
+    # Per-node standardization using train statistics
+    nodal_train_mean = Y_nodal_np[train_idx].mean(axis=0)
+    nodal_train_std = Y_nodal_np[train_idx].std(axis=0) + 1e-8
+    Y_nodal_norm = ((Y_nodal_np - nodal_train_mean) / nodal_train_std).astype(np.float32)
+
+    import io
+    import torch.nn.functional as F
+    from torch.utils.data import TensorDataset, DataLoader
+
+    spatial_dim = C * H * W
+
+    # Normalize scalars for Stage 1 using train statistics
+    sc_mean_s1 = scalar_cyc[train_idx].mean(axis=0)
+    sc_std_s1 = scalar_cyc[train_idx].std(axis=0) + 1e-8
+    scalar_norm_s1 = ((scalar_cyc - sc_mean_s1) / sc_std_s1).astype(np.float32)
+
+    grid_t = torch.tensor(grid_np, dtype=torch.float32)
+    scalar_t_s1 = torch.tensor(scalar_norm_s1, dtype=torch.float32)
+    Y_nod_t = torch.tensor(Y_nodal_norm, dtype=torch.float32)
+
+    # Multi-output MLP: flattened spatial + scalars → N_nodes
+    hidden = 512
+    nodal_net = nn.Sequential(
+        nn.Linear(spatial_dim + n_sc, hidden),
+        nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.3),
+        nn.Linear(hidden, hidden // 2),
+        nn.LayerNorm(hidden // 2), nn.GELU(), nn.Dropout(0.3),
+        nn.Linear(hidden // 2, N_nodes),
+    ).to(device)
+    print(f"    Nodal MLP parameters: {sum(p.numel() for p in nodal_net.parameters() if p.requires_grad):,}")
+
+    S1_EPOCHS = 60
+    steps_per_epoch = max(1, (len(train_idx) + BATCH_SIZE - 1) // BATCH_SIZE)
+    opt_s1 = torch.optim.AdamW(nodal_net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler_s1 = torch.optim.lr_scheduler.OneCycleLR(
+        opt_s1, max_lr=LR, epochs=S1_EPOCHS, steps_per_epoch=steps_per_epoch,
+        pct_start=0.1, anneal_strategy="cos",
+    )
+    loader_s1 = DataLoader(
+        TensorDataset(
+            grid_t[train_idx].to(device),
+            scalar_t_s1[train_idx].to(device),
+            Y_nod_t[train_idx].to(device),
+        ),
+        batch_size=BATCH_SIZE, shuffle=True,
+    )
+
+    best_val_s1 = float("inf")
+    best_state_s1 = None
+    patience_s1 = 0
+
+    for ep in range(S1_EPOCHS):
+        nodal_net.train()
+        for xb, sb, yb in loader_s1:
+            flat = xb.reshape(xb.shape[0], -1)
+            out = nodal_net(torch.cat([flat, sb], dim=1))
+            loss = F.mse_loss(out, yb)
+            opt_s1.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(nodal_net.parameters(), 1.0)
+            opt_s1.step()
+            scheduler_s1.step()
+
+        nodal_net.eval()
+        with torch.no_grad():
+            flat_val = grid_t[val_idx].to(device).reshape(len(val_idx), -1)
+            val_pred = nodal_net(torch.cat([flat_val, scalar_t_s1[val_idx].to(device)], dim=1))
+            val_loss = F.mse_loss(val_pred, Y_nod_t[val_idx].to(device)).item()
+
+        if val_loss < best_val_s1 - 1e-5:
+            best_val_s1 = val_loss
+            buf = io.BytesIO()
+            torch.save(nodal_net.state_dict(), buf)
+            best_state_s1 = buf.getvalue()
+            patience_s1 = 0
+        else:
+            patience_s1 += 1
+            if patience_s1 >= PATIENCE:
+                print(f"    Early stop at epoch {ep+1}")
+                break
+
+    if best_state_s1 is not None:
+        nodal_net.load_state_dict(torch.load(io.BytesIO(best_state_s1), weights_only=False))
+
+    # Evaluate Stage 1 R² (mean across nodes on test set)
+    nodal_net.eval()
+    with torch.no_grad():
+        flat_te = grid_t[test_idx].to(device).reshape(len(test_idx), -1)
+        pred_nod_te = nodal_net(
+            torch.cat([flat_te, scalar_t_s1[test_idx].to(device)], dim=1)
+        ).cpu().numpy()  # (n_test, N_nodes)
+
+    node_r2s = [
+        _r2(Y_nodal_norm[test_idx, j], pred_nod_te[:, j])
+        for j in range(N_nodes)
+    ]
+    stage1_r2 = float(np.nanmean(node_r2s))
+    print(f"    Stage 1 nodal test R² (mean across {N_nodes} nodes): {stage1_r2:.4f}")
+
+    # ── Stage 2: use nodal predictions to predict congestion cost ─────────────
+    print("\n  [Stage 2] Training congestion cost predictor from nodal features...")
+
+    # Get Stage 1 predictions on all hours
+    nodal_net.eval()
+    with torch.no_grad():
+        flat_all = grid_t.to(device).reshape(T, -1)
+        pred_nod_all = nodal_net(
+            torch.cat([flat_all, scalar_t_s1.to(device)], dim=1)
+        ).cpu().numpy()  # (T, N_nodes)
+
+    # Standardize nodal predictions (using train statistics)
+    nod_pred_mean = pred_nod_all[train_idx].mean(axis=0)
+    nod_pred_std = pred_nod_all[train_idx].std(axis=0) + 1e-8
+    nod_pred_norm = ((pred_nod_all - nod_pred_mean) / nod_pred_std).astype(np.float32)
+
+    # Stage 2 uses nodal predictions as the "spatial" input (pseudo-grid)
+    nod_grid = nod_pred_norm[:, np.newaxis, np.newaxis, :]  # (T, 1, 1, N_nodes)
+
+    res_s2 = train_with_splits(
+        _make_mlp_cls(N_nodes, n_sc),
+        nod_grid, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    stage2_native_r2 = res_s2.get("native_test_r2", float("nan"))
+    print(f"    Stage 2 congestion native R²: {stage2_native_r2:.4f}")
+
+    # ── Baseline congestion (4-ch errors, log1p, cyclic) ─────────────────────
+    print("\n  [Baseline] 4-ch spatial MLP for comparison...")
+    res_base = train_with_splits(
+        _make_mlp_cls(C * H * W, n_sc),
+        grid_np, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    baseline_native_r2 = res_base.get("native_test_r2", float("nan"))
+    print(f"    Baseline congestion native R²: {baseline_native_r2:.4f}")
+
+    bar_data = {
+        "Stage 2 (nodal→congestion)": {"r2": stage2_native_r2, "r2_std": 0.0},
+        "Baseline (spatial errors)":  {"r2": baseline_native_r2, "r2_std": 0.0},
+    }
+    plot_bar_comparison(
+        bar_data,
+        title=f"Nodal Two-Stage vs Baseline\nNative-scale test R² (Stage 1 nodal R²={stage1_r2:.3f})",
+        save_path=fig_dir / "nn_nodal_comparison.png",
+    )
+
+    rows = [
+        {"metric": "stage1_nodal_r2",             "value": stage1_r2},
+        {"metric": "stage2_congestion_native_r2", "value": stage2_native_r2},
+        {"metric": "baseline_congestion_native_r2", "value": baseline_native_r2},
+    ]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_nodal_comparison.csv", index=False)
+
+    return {
+        "stage1_r2": stage1_r2,
+        "stage2": res_s2,
+        "baseline": res_base,
+    }
+
+
+# ── Round-2 helpers ─────────────────────────────────────────────────────────────
+
+def load_cluster_features_v2(months, hour_idx, include_lmp_std=False, extra_fields=None):
+    """Expanded cluster feature loader with optional leakage control.
+
+    Loads cluster_hourly CSV and pivots to (T, n_features). Unlike the original
+    load_cluster_error_features, this version lets the caller explicitly
+    include or exclude lmp_std (which is contemporaneous LMP dispersion —
+    correlated with the congestion cost target and should be excluded for
+    clean evaluation).
+
+    Parameters
+    ----------
+    months          : list of (year, month)
+    hour_idx        : pd.DatetimeIndex (T,)
+    include_lmp_std : bool — whether to include cluster lmp_std (default False)
+    extra_fields    : list of additional cluster-level fields to include, e.g.
+                      ['max_abs_wspd_error_1h', 'observed_wspd', 'nameplate_mw_wind']
+
+    Returns
+    -------
+    ndarray (T, n_features) float32
+    list of str — column names
+    """
+    dirs = setup_directories()
+    processed = Path(dirs["processed"])
+    years = sorted({y for y, _ in months})
+    month_set = {m for _, m in months}
+
+    base_fields = ["temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h",
+                   "load_error_1h"]
+    if include_lmp_std:
+        base_fields.append("lmp_std")
+    if extra_fields:
+        base_fields += [f for f in extra_fields if f not in base_fields]
+
+    dfs = []
+    for year in years:
+        path = processed / f"cluster_hourly_gfs+hrrr_k7_era5_{year}01_{year}12.csv"
+        if not path.exists():
+            continue
+        df_c = pd.read_csv(path, parse_dates=["hour"])
+        if df_c["hour"].dt.tz is not None:
+            df_c["hour"] = df_c["hour"].dt.tz_localize(None)
+        df_c = df_c[df_c["hour"].dt.month.isin(month_set)]
+        dfs.append(df_c)
+
+    if not dfs:
+        print("  [cluster_v2] No cluster CSV found — returning zeros")
+        return np.zeros((len(hour_idx), 1), dtype=np.float32), ["zero"]
+
+    df_all = pd.concat(dfs, ignore_index=True)
+    avail_fields = [f for f in base_fields if f in df_all.columns]
+
+    pivot_parts = []
+    col_names = []
+    for field in avail_fields:
+        piv = df_all.pivot_table(index="hour", columns="cluster", values=field, aggfunc="first")
+        piv.columns = [f"c{int(c)}_{field}" for c in piv.columns]
+        col_names += list(piv.columns)
+        pivot_parts.append(piv)
+
+    # Capacity-weighted error interaction: wspd_error_1h * nameplate_mw_wind per cluster
+    if "wspd_error_1h" in avail_fields and "nameplate_mw_wind" in df_all.columns:
+        df_all["wspd_err_x_wind"] = df_all["wspd_error_1h"] * np.log1p(
+            df_all["nameplate_mw_wind"].fillna(0)
+        )
+        piv = df_all.pivot_table(index="hour", columns="cluster",
+                                 values="wspd_err_x_wind", aggfunc="first")
+        piv.columns = [f"c{int(c)}_wspd_err_x_wind" for c in piv.columns]
+        col_names += list(piv.columns)
+        pivot_parts.append(piv)
+
+    wide = pd.concat(pivot_parts, axis=1).sort_index()
+    col_means = wide.mean()
+    wide = wide.reindex(hour_idx).fillna(col_means).fillna(0)
+
+    return wide.values.astype(np.float32), list(wide.columns)
+
+
+def build_ar_features(Y, hour_idx, lags=(1, 24, 168)):
+    """Build autoregressive lag features from the target time series.
+
+    Uses calendar-aware shifting so that month boundaries naturally produce
+    NaN (forecast errors do not propagate across the inter-month gaps).
+    NaN values are filled with the mean of the non-NaN entries for each lag.
+
+    Parameters
+    ----------
+    Y        : ndarray (T,) — target values (native scale)
+    hour_idx : pd.DatetimeIndex (T,)
+    lags     : tuple of int — lag lengths in hours
+
+    Returns
+    -------
+    ndarray (T, n_lags) float32
+    list of str — column names ['lag_1h', 'lag_24h', ...]
+    """
+    ser = pd.Series(Y.astype(float), index=hour_idx)
+    cols = {}
+    for L in lags:
+        shifted = ser.shift(freq=pd.Timedelta(hours=L))
+        aligned = shifted.reindex(hour_idx)
+        fill = aligned.mean()
+        cols[f"lag_{L}h"] = aligned.fillna(fill).fillna(0).values
+    df = pd.DataFrame(cols, index=hour_idx)
+    return df.values.astype(np.float32), list(df.columns)
+
+
+def _make_flat_cluster_mlp(in_dim):
+    """Return an MLP class that accepts (x_spatial, x_scalar) and ignores spatial input.
+
+    Used in cluster/AR experiments where all features are packed into x_scalar.
+    The (x_spatial, x_scalar) signature keeps it compatible with train_with_splits.
+
+    Parameters
+    ----------
+    in_dim : int — full feature dimension (cluster features + scalars + optional AR)
+
+    Returns
+    -------
+    class — instantiates to nn.Module
+    """
+    import torch.nn as nn
+
+    class FlatClusterMLP(nn.Module):
+        """Flat MLP on cluster + scalar features; spatial input is ignored."""
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.3),
+                nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.2),
+                nn.Linear(128, 1),
+            )
+
+        def forward(self, x_spatial, x_scalar):
+            return self.net(x_scalar).squeeze(-1)
+
+    return FlatClusterMLP
+
+
+def _make_gru_cls(n_cluster_feat, n_scalar, seq_len=24, hidden=128, n_layers=2, dropout=0.25):
+    """Return a GRU class for temporal sequence modeling of cluster features.
+
+    Processes a sliding window of cluster features (seq_len hours) plus current
+    scalar controls, outputs a single congestion cost prediction.
+
+    Parameters
+    ----------
+    n_cluster_feat : int — number of cluster features per timestep
+    n_scalar       : int — scalar temporal controls (appended to GRU output)
+    seq_len        : int — length of input sequence (default 24 hours)
+    hidden         : int — GRU hidden units
+    n_layers       : int — GRU stacked layers
+    dropout        : float
+
+    Returns
+    -------
+    class — instantiates to nn.Module with forward(x_seq, x_scalar) → (batch, 1)
+    """
+    import torch
+    import torch.nn as nn
+
+    class GRUModel(nn.Module):
+        """GRU over hourly cluster features with scalar control head."""
+
+        def __init__(self):
+            super().__init__()
+            self.gru = nn.GRU(
+                n_cluster_feat, hidden, num_layers=n_layers,
+                batch_first=True, dropout=dropout if n_layers > 1 else 0.0,
+            )
+            self.head = nn.Sequential(
+                nn.Linear(hidden + n_scalar, 128),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(128, 1),
+            )
+
+        def forward(self, x_seq, x_scalar):
+            _, h_n = self.gru(x_seq)
+            h_last = h_n[-1]  # (batch, hidden)
+            cat = torch.cat([h_last, x_scalar], dim=1)
+            return self.head(cat).squeeze(-1)
+
+    return GRUModel
+
+
+def _build_gru_dataset(X_cluster, scalar_controls, Y, seq_len=24, hour_idx=None):
+    """Build (X_seq, x_scalar, y) tuples for GRU training.
+
+    For each time step t, the input is a (seq_len, n_features) window ending
+    at t. Hours before the first sample are zero-padded.
+
+    Parameters
+    ----------
+    X_cluster      : ndarray (T, n_feat) — cluster features per hour
+    scalar_controls: ndarray (T, n_sc) — scalar controls
+    Y              : ndarray (T,) — targets
+    seq_len        : int
+    hour_idx       : pd.DatetimeIndex or None — if provided, zero-pads across
+                     month boundaries (gaps > 2h in the index)
+
+    Returns
+    -------
+    tuple of ndarray: X_seq (T, seq_len, n_feat), x_scalar (T, n_sc), Y (T,)
+    """
+    T, n_feat = X_cluster.shape
+    X_seq = np.zeros((T, seq_len, n_feat), dtype=np.float32)
+
+    # Gap positions: indices where the time series restarts (month boundaries).
+    # searchsorted finds the nearest gap >= each t in O(log G) per step.
+    if hour_idx is not None:
+        gap_pos = np.where(
+            np.concatenate([[True], np.diff(hour_idx).astype("timedelta64[h]") > 2])
+        )[0]
+    else:
+        gap_pos = np.array([0])
+
+    for t in range(T):
+        # Latest gap that is <= t gives the start of the current contiguous segment
+        gi = np.searchsorted(gap_pos, t, side="right") - 1
+        segment_start = gap_pos[gi] if gi >= 0 else 0
+        lo = max(segment_start, t - seq_len + 1)
+        window = X_cluster[lo : t + 1]
+        pad_len = seq_len - len(window)
+        if pad_len > 0:
+            window = np.concatenate([np.zeros((pad_len, n_feat), dtype=np.float32), window])
+        X_seq[t] = window
+
+    return X_seq, scalar_controls, Y
+
+
+def train_gru_with_splits(model_cls, X_seq, x_scalar, Y_log,
+                          train_idx, val_idx, test_idx, device,
+                          y_native=None, y_inverse=None):
+    """Train a GRU model using pre-built sequence tensors.
+
+    Mirrors train_with_splits but handles the extra sequence dimension.
+
+    Parameters
+    ----------
+    model_cls  : class — instantiates to nn.Module with forward(x_seq, x_scalar)
+    X_seq      : ndarray (T, seq_len, n_feat)
+    x_scalar   : ndarray (T, n_sc)
+    Y_log      : ndarray (T,) — transformed target
+    train_idx, val_idx, test_idx : ndarray of int
+    device     : torch.device
+    y_native   : ndarray (T,) — native-scale target for R² inversion
+    y_inverse  : callable or None — inverse transform
+
+    Returns
+    -------
+    dict with train_r2, val_r2, test_r2, native_test_r2, native_test_rmse, tail_test_r2
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+
+    X_seq_t   = torch.tensor(X_seq,      dtype=torch.float32)
+    x_sc_t    = torch.tensor(x_scalar,   dtype=torch.float32)
+    Y_t       = torch.tensor(Y_log,      dtype=torch.float32)
+
+    train_ds = TensorDataset(X_seq_t[train_idx], x_sc_t[train_idx], Y_t[train_idx])
+    val_ds   = TensorDataset(X_seq_t[val_idx],   x_sc_t[val_idx],   Y_t[val_idx])
+
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 4)
+
+    model = model_cls().to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=7, factor=0.5)
+    loss_fn = nn.MSELoss()
+
+    best_val = float("inf")
+    best_state = None
+    patience_count = 0
+
+    for epoch in range(N_EPOCHS):
+        model.train()
+        for xs, xc, yb in train_dl:
+            xs, xc, yb = xs.to(device), xc.to(device), yb.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model(xs, xc), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for xs, xc, yb in val_dl:
+                xs, xc, yb = xs.to(device), xc.to(device), yb.to(device)
+                val_losses.append(loss_fn(model(xs, xc), yb).item())
+        val_loss = float(np.mean(val_losses))
+        sched.step(val_loss)
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= PATIENCE:
+                print(f"    Early stop at epoch {epoch + 1}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    def _predict(idx_arr):
+        model.eval()
+        with torch.no_grad():
+            preds = model(
+                X_seq_t[idx_arr].to(device),
+                x_sc_t[idx_arr].to(device),
+            ).cpu().numpy()
+        return preds
+
+    train_r2 = _r2(Y_log[train_idx], _predict(train_idx))
+    val_r2   = _r2(Y_log[val_idx],   _predict(val_idx))
+    test_r2  = _r2(Y_log[test_idx],  _predict(test_idx))
+
+    result = {"train_r2": float(train_r2), "val_r2": float(val_r2), "test_r2": float(test_r2)}
+
+    if y_native is not None and y_inverse is not None:
+        pred_log  = _predict(test_idx)
+        pred_nat  = y_inverse(pred_log)
+        y_nat_tst = y_native[test_idx]
+        result["native_test_r2"]   = float(_r2(pred_nat, y_nat_tst))
+        result["native_test_rmse"] = float(np.sqrt(np.mean((pred_nat - y_nat_tst) ** 2)))
+        q90 = np.quantile(y_nat_tst, 0.9)
+        mask = y_nat_tst >= q90
+        result["tail_test_r2"] = float(_r2(pred_nat[mask], y_nat_tst[mask])) if mask.sum() > 5 else float("nan")
+
+    return result
+
+
+def run_exp_ar(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: Leakage fix and autoregressive features.
+
+    Inspired by Lago et al. (2021) and Ziel & Weron (2018) who show lag features
+    of the target price are the strongest predictors in tabular energy forecasting.
+    Binding grid constraints persist over hours, so lag-1h and lag-24h of
+    economic_congestion_cost should carry real signal.
+
+    Also fixes the lmp_std leakage present in the original cluster experiment:
+    cluster lmp_std is contemporaneous LMP dispersion, directly correlated with
+    the congestion cost target.
+
+    Configs:
+      (a) cluster features, NO lmp_std (clean baseline)
+      (b) clean cluster + lag-1h congestion
+      (c) clean cluster + lag-1h + lag-24h
+      (d) clean cluster + lag-1h + lag-24h + lag-168h (weekly)
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: result_dict}
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: LEAKAGE FIX + AUTOREGRESSIVE FEATURES")
+    print("=" * 70)
+
+    import torch
+    import torch.nn as nn
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    grid_spatial, scalar_cyc, Y_raw, pc, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    n_sc = scalar_cyc.shape[1]
+
+    # Clean cluster features (no lmp_std)
+    X_cluster, cluster_cols = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+    n_cluster = X_cluster.shape[1]
+    print(f"  Clean cluster features: {n_cluster} cols")
+
+    # AR features (computed on Y_raw, filled at boundaries)
+    ar_feats, ar_names = build_ar_features(Y_raw, hour_idx, lags=(1, 24, 168))
+    # Standardise AR features on training set to avoid scale issues
+    ar_mean = ar_feats[train_idx].mean(axis=0, keepdims=True)
+    ar_std  = ar_feats[train_idx].std(axis=0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    def _run(extra_feats=None, label=""):
+        feats = np.concatenate([X_cluster, scalar_cyc]
+                               + ([extra_feats] if extra_feats is not None else []), axis=1)
+        dummy_spatial = np.zeros((len(feats), 1), dtype=np.float32)
+        res = train_with_splits(
+            _make_flat_cluster_mlp(feats.shape[1]),
+            dummy_spatial[:, np.newaxis, np.newaxis, :],  # (T, 1, 1, 1) dummy
+            feats, Y_log,
+            train_idx, val_idx, test_idx, device,
+            y_native=Y_raw, y_inverse=log1p_inv,
+        )
+        print(f"  [{label}] train R²={res['train_r2']:.4f}  val R²={res['val_r2']:.4f}"
+              f"  native R²={res.get('native_test_r2', float('nan')):.4f}")
+        return res
+
+    import torch
+
+    results = {}
+    results["(a) cluster_no_lmp"] = _run(None, "(a) cluster_no_lmp")
+    results["(b) +lag_1h"]        = _run(ar_feats[:, :1], "(b) +lag_1h")
+    results["(c) +lag_1h_24h"]    = _run(ar_feats[:, :2], "(c) +lag_1h_24h")
+    results["(d) +all_ar_lags"]   = _run(ar_feats,        "(d) +all_ar_lags")
+
+    bar_data = {n: {"r2": r.get("native_test_r2", r["test_r2"]), "r2_std": 0.0}
+                for n, r in results.items()}
+    plot_bar_comparison(
+        bar_data,
+        title="AR Features + Leakage Fix — MLP on Clean Cluster Features\nNative-scale test R²",
+        save_path=fig_dir / "nn_ar_comparison.png",
+    )
+
+    rows = [{"config": n, "train_r2": r["train_r2"], "val_r2": r["val_r2"],
+             "test_r2": r["test_r2"],
+             "native_test_r2": r.get("native_test_r2", float("nan")),
+             "native_test_rmse": r.get("native_test_rmse", float("nan")),
+             "tail_test_r2": r.get("tail_test_r2", float("nan"))}
+            for n, r in results.items()]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_ar_comparison.csv", index=False)
+    return results
+
+
+def run_exp_gbm(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: LightGBM gradient boosting on cluster + AR features.
+
+    Inspired by Lago et al. (2021) who demonstrate gradient boosting consistently
+    outperforms neural networks on tabular electricity price forecasting. With
+    T=3,550 training points, tree ensembles avoid the MLP's overfitting pathology
+    while naturally handling non-linear interactions.
+
+    Configs tested:
+      (a) LightGBM, clean cluster features only
+      (b) LightGBM, cluster + AR lags
+      (c) LightGBM, cluster + AR lags + richer cluster features (max abs error,
+          observed wind, capacity-weighted error interaction)
+      (d) MLP, cluster + AR lags (same features as b, for architecture comparison)
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: result_dict}
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: LIGHTGBM GRADIENT BOOSTING")
+    print("=" * 70)
+
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        print("  [skip] lightgbm not installed")
+        return {}
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+
+    X_cluster_base, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+    X_cluster_rich, _ = load_cluster_features_v2(
+        months, hour_idx, include_lmp_std=False,
+        extra_fields=["max_abs_wspd_error_1h", "observed_wspd", "nameplate_mw_wind"],
+    )
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24, 168))
+    ar_mean = ar_feats[train_idx].mean(axis=0, keepdims=True)
+    ar_std  = ar_feats[train_idx].std(axis=0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    print(f"  Base cluster features: {X_cluster_base.shape[1]}")
+    print(f"  Rich cluster features: {X_cluster_rich.shape[1]}")
+
+    def _eval_gbm(X_train, X_val, X_test, y_train, label):
+        model = lgb.LGBMRegressor(
+            n_estimators=1000, learning_rate=0.02, num_leaves=31,
+            min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=0.1, random_state=RANDOM_STATE,
+            verbose=-1,
+        )
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, Y_log[val_idx])],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+        )
+        train_r2 = _r2(y_train,            model.predict(X_train))
+        val_r2   = _r2(Y_log[val_idx],     model.predict(X_val))
+        test_r2  = _r2(Y_log[test_idx],    model.predict(X_test))
+        pred_nat = log1p_inv(model.predict(X_test))
+        y_nat    = Y_raw[test_idx]
+        nat_r2   = _r2(y_nat, pred_nat)
+        nat_rmse = float(np.sqrt(np.mean((pred_nat - y_nat) ** 2)))
+        q90 = np.quantile(y_nat, 0.9)
+        mask = y_nat >= q90
+        tail_r2 = float(_r2(pred_nat[mask], y_nat[mask])) if mask.sum() > 5 else float("nan")
+        print(f"  [{label}] train R²={train_r2:.4f}  val R²={val_r2:.4f}"
+              f"  native R²={nat_r2:.4f}  tail R²={tail_r2:.4f}")
+        return {"train_r2": float(train_r2), "val_r2": float(val_r2),
+                "test_r2": float(test_r2), "native_test_r2": nat_r2,
+                "native_test_rmse": nat_rmse, "tail_test_r2": tail_r2,
+                "model": model}
+
+    def _feats(X, include_ar=False, ar_lags=None):
+        parts = [X, scalar_cyc]
+        if include_ar:
+            parts.append(ar_feats if ar_lags is None else ar_feats[:, :ar_lags])
+        return np.concatenate(parts, axis=1)
+
+    configs = [
+        ("(a) LGB_cluster_only",   _feats(X_cluster_base),             False),
+        ("(b) LGB_cluster_AR",     _feats(X_cluster_base, True),        False),
+        ("(c) LGB_rich_AR",        _feats(X_cluster_rich, True),        False),
+    ]
+    results = {}
+    for name, X_all, _ in configs:
+        res = _eval_gbm(
+            X_all[train_idx], X_all[val_idx], X_all[test_idx],
+            Y_log[train_idx], name,
+        )
+        results[name] = {k: v for k, v in res.items() if k != "model"}
+
+    # Feature importance for the best config
+    best_name = max(results, key=lambda k: results[k].get("native_test_r2", -9))
+    best_idx = [i for i, (n, _, _) in enumerate(configs) if n == best_name][0]
+    best_X = configs[best_idx][1]
+    best_model = _eval_gbm(
+        best_X[train_idx], best_X[val_idx], best_X[test_idx],
+        Y_log[train_idx], f"refitting {best_name}",
+    )["model"]
+    # Feature importance for best config — save as CSV to avoid any figure-size issues
+    imp = pd.Series(best_model.feature_importances_,
+                    index=[f"f{i}" for i in range(best_X.shape[1])]).nlargest(20)
+    imp.to_csv(tables_dir / "nn_gbm_feature_importance.csv", header=["importance"])
+
+    bar_data = {n: {"r2": r.get("native_test_r2", r["test_r2"]), "r2_std": 0.0}
+                for n, r in results.items()}
+    plot_bar_comparison(
+        bar_data,
+        title="LightGBM — Gradient Boosting on Cluster Features\nNative-scale test R²",
+        save_path=fig_dir / "nn_gbm_comparison.png",
+    )
+    rows = [{"config": n, **{k: v for k, v in r.items()}}
+            for n, r in results.items()]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_gbm_comparison.csv", index=False)
+    return results
+
+
+def run_exp_gru(months, fig_dir, tables_dir, device, df=None):
+    """Experiment: GRU recurrent model on cluster feature time series.
+
+    Inspired by Khodayar et al. (2020) and Wei et al. (2019) showing LSTM/GRU
+    with weather covariates captures temporal persistence in grid constraints
+    that MLP misses. Each prediction uses a 24-hour sliding window of cluster
+    features as input, allowing the model to learn that binding constraints
+    persist across hours.
+
+    Configs:
+      (a) MLP on current-hour cluster features (same-hour baseline, no sequence)
+      (b) GRU with 24h window, clean cluster features
+      (c) GRU with 24h window, cluster + AR-1h (GRU + explicit lag)
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict {config_name: result_dict}
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: GRU RECURRENT MODEL (24h sliding window)")
+    print("=" * 70)
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+    n_sc = scalar_cyc.shape[1]
+
+    X_cluster, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+    n_cluster = X_cluster.shape[1]
+    print(f"  Cluster features: {n_cluster}, scalar: {n_sc}")
+
+    import torch
+    import torch.nn as nn
+
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1,))
+    ar_mean = ar_feats[train_idx].mean(axis=0, keepdims=True)
+    ar_std  = ar_feats[train_idx].std(axis=0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    SEQ_LEN = 24
+
+    # Config (a): MLP baseline (no sequence)
+    print("\n  [(a) MLP_cluster_baseline]")
+    feats_base = np.concatenate([X_cluster, scalar_cyc], axis=1)
+    dummy = np.zeros((len(feats_base), 1, 1, 1), dtype=np.float32)
+    res_mlp = train_with_splits(
+        _make_flat_cluster_mlp(feats_base.shape[1]), dummy, feats_base, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    print(f"    train R²={res_mlp['train_r2']:.4f}  val R²={res_mlp['val_r2']:.4f}"
+          f"  native R²={res_mlp.get('native_test_r2', float('nan')):.4f}")
+
+    # Build sliding window sequences
+    print("\n  Building 24h sliding windows...")
+    X_seq_base, _, _ = _build_gru_dataset(X_cluster, scalar_cyc, Y_log,
+                                           seq_len=SEQ_LEN, hour_idx=hour_idx)
+    X_seq_ar, _, _ = _build_gru_dataset(
+        np.concatenate([X_cluster, ar_feats], axis=1), scalar_cyc, Y_log,
+        seq_len=SEQ_LEN, hour_idx=hour_idx,
+    )
+
+    # Config (b): GRU, clean cluster
+    print("\n  [(b) GRU_cluster_24h]")
+    GRUCls_base = _make_gru_cls(n_cluster, n_sc, seq_len=SEQ_LEN)
+    res_gru_base = train_gru_with_splits(
+        GRUCls_base, X_seq_base, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    print(f"    train R²={res_gru_base['train_r2']:.4f}  val R²={res_gru_base['val_r2']:.4f}"
+          f"  native R²={res_gru_base.get('native_test_r2', float('nan')):.4f}")
+
+    # Config (c): GRU, cluster + AR-1h
+    print("\n  [(c) GRU_cluster_AR_24h]")
+    GRUCls_ar = _make_gru_cls(n_cluster + 1, n_sc, seq_len=SEQ_LEN)
+    res_gru_ar = train_gru_with_splits(
+        GRUCls_ar, X_seq_ar, scalar_cyc, Y_log,
+        train_idx, val_idx, test_idx, device,
+        y_native=Y_raw, y_inverse=log1p_inv,
+    )
+    print(f"    train R²={res_gru_ar['train_r2']:.4f}  val R²={res_gru_ar['val_r2']:.4f}"
+          f"  native R²={res_gru_ar.get('native_test_r2', float('nan')):.4f}")
+
+    results = {
+        "(a) MLP_cluster_baseline": res_mlp,
+        "(b) GRU_cluster_24h":      res_gru_base,
+        "(c) GRU_cluster_AR_24h":   res_gru_ar,
+    }
+    bar_data = {n: {"r2": r.get("native_test_r2", r["test_r2"]), "r2_std": 0.0}
+                for n, r in results.items()}
+    plot_bar_comparison(
+        bar_data,
+        title="GRU vs MLP — Temporal Sequence Modeling\nNative-scale test R²",
+        save_path=fig_dir / "nn_gru_comparison.png",
+    )
+    rows = [{"config": n, "train_r2": r["train_r2"], "val_r2": r["val_r2"],
+             "test_r2": r["test_r2"],
+             "native_test_r2": r.get("native_test_r2", float("nan")),
+             "native_test_rmse": r.get("native_test_rmse", float("nan")),
+             "tail_test_r2": r.get("tail_test_r2", float("nan"))}
+            for n, r in results.items()]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_gru_comparison.csv", index=False)
+    return results
+
+
+# ── Round-3 helpers ─────────────────────────────────────────────────────────────
+
+
+def compute_block_bootstrap_ci(
+    y_true, pred_base, pred_full, n_boot=300, block_len=None, alpha=0.05, seed=42
+):
+    """Circular block bootstrap CI for ΔR² = R²(full) − R²(base) (Künsch 1989).
+
+    Resamples the test set in contiguous temporal blocks to preserve hourly
+    autocorrelation, then computes ΔR² on each bootstrap resample.
+
+    Parameters
+    ----------
+    y_true, pred_base, pred_full : ndarray (n_test,) — native-scale values
+    n_boot    : int — bootstrap replicates (300 balances precision and speed)
+    block_len : int or None — block length; defaults to ⌈n^{1/3}⌉
+    alpha     : float — two-sided CI level (0.05 → 95% CI)
+    seed      : int
+
+    Returns
+    -------
+    dict : delta_r2, ci_lo, ci_hi, boots (ndarray n_boot), p_value (frac ≤ 0)
+    """
+    n = len(y_true)
+    if block_len is None:
+        block_len = max(5, int(np.ceil(n ** (1 / 3))))
+    rng = np.random.default_rng(seed)
+    delta_actual = _r2(y_true, pred_full) - _r2(y_true, pred_base)
+
+    n_blocks_needed = int(np.ceil(n / block_len))
+    deltas = []
+    for _ in range(n_boot):
+        starts = rng.integers(0, n, size=n_blocks_needed)
+        idx = np.concatenate([
+            np.arange(s, s + block_len) % n for s in starts
+        ])[:n]
+        d = _r2(y_true[idx], pred_full[idx]) - _r2(y_true[idx], pred_base[idx])
+        deltas.append(d)
+
+    deltas = np.array(deltas)
+    return {
+        "delta_r2": float(delta_actual),
+        "ci_lo": float(np.percentile(deltas, 100 * alpha / 2)),
+        "ci_hi": float(np.percentile(deltas, 100 * (1 - alpha / 2))),
+        "boots": deltas,
+        "p_value": float((deltas <= 0).mean()),
+    }
+
+
+def build_fpc_features(grid_np, train_idx, n_components_per_channel=20):
+    """Project each spatial channel onto its leading FPC/EOF modes.
+
+    Fits PCA on training hours only; projects all hours. This gives a
+    principled basis reduction that avoids the overfitting of raw 9k-dim
+    pixel regression (Ramsay & Silverman 2005; Reiss et al. 2017).
+
+    Parameters
+    ----------
+    grid_np                  : ndarray (T, C, H, W)
+    train_idx                : ndarray int — training hour indices
+    n_components_per_channel : int — EOFs to retain per channel
+
+    Returns
+    -------
+    X_fpc      : ndarray (T, C * K) float32 — per-hour mode scores
+    components : list of ndarray (K, H, W) — one element per channel
+    var_ratios : list of ndarray (K,) — cumulative explained variance
+    """
+    from sklearn.decomposition import PCA
+
+    T, C, H, W = grid_np.shape
+    scores_list, comps_list, var_list = [], [], []
+    for c in range(C):
+        X_c = grid_np[:, c, :, :].reshape(T, H * W)
+        n_comp = min(n_components_per_channel, len(train_idx) - 1, H * W)
+        pca = PCA(n_components=n_comp, random_state=RANDOM_STATE)
+        pca.fit(X_c[train_idx])
+        scores_list.append(pca.transform(X_c))
+        comps_list.append(pca.components_.reshape(n_comp, H, W))
+        var_list.append(pca.explained_variance_ratio_)
+
+    X_fpc = np.concatenate(scores_list, axis=1).astype(np.float32)
+    return X_fpc, comps_list, var_list
+
+
+def build_capacity_scalar_features(df, hour_idx):
+    """Build physics-motivated capacity-weighted error scalars per hour.
+
+    Each scalar is Σ_s weight(s) · error_t(s) over ERA5 pixels, computed both
+    system-wide and per geographic quadrant of Texas (lat≥31° × lon≥−100°).
+    Wind-error scalars weight by log1p(wind_capacity); temp-error scalars weight
+    by load_center.
+
+    Parameters
+    ----------
+    df       : pd.DataFrame — pixel-hourly data with capacity + error columns
+    hour_idx : pd.DatetimeIndex (T,)
+
+    Returns
+    -------
+    features  : ndarray (T, n_scalars) float32
+    col_names : list of str
+    """
+    needed = [
+        "nameplate_mw_tech_onshore_wind_turbine", "load_center",
+        "wspd_error_1h", "wspd_error_0h", "temp_error_1h", "temp_error_0h",
+        "latitude", "longitude", "valid_time",
+    ]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        print(f"  [capacity_scalars] Missing cols: {missing}; returning zeros")
+        return np.zeros((len(hour_idx), 1), dtype=np.float32), ["zero"]
+
+    work = df[needed].copy()
+    work["wind_cap"] = np.log1p(work["nameplate_mw_tech_onshore_wind_turbine"].fillna(0))
+    work["load_c"] = work["load_center"].fillna(0)
+    # Quadrant 0–3: bits = (lat ≥ 31) × 2 + (lon ≥ −100)
+    work["quad"] = (
+        (work["latitude"] >= 31.0).astype(int) * 2
+        + (work["longitude"] >= -100.0).astype(int)
+    )
+
+    out: dict = {}
+    for err_col in ["wspd_error_1h", "wspd_error_0h", "temp_error_1h", "temp_error_0h"]:
+        e = work[err_col].fillna(0)
+        weight = work["wind_cap"] if "wspd" in err_col else work["load_c"]
+        weighted = weight * e
+
+        # System-wide
+        sys_key = f"sys_{err_col}"
+        out[sys_key] = work.assign(_w=weighted).groupby("valid_time")["_w"].sum()
+
+        # Per-quadrant
+        for q in range(4):
+            q_weight = weighted * (work["quad"] == q).astype(float)
+            q_key = f"q{q}_{err_col}"
+            out[q_key] = work.assign(_w=q_weight).groupby("valid_time")["_w"].sum()
+
+    agg = pd.DataFrame(out).reindex(hour_idx).fillna(0)
+    return agg.values.astype(np.float32), list(agg.columns)
+
+
+def _lgb_fit_eval(
+    X_train, X_val, X_test, y_train_log, y_val_log, y_true_test, log1p_inv,
+    label="", n_estimators=1000, learning_rate=0.02,
+):
+    """Shared LightGBM fit/eval helper used across Round-3 experiments.
+
+    Parameters
+    ----------
+    X_train, X_val, X_test : ndarray (n, p) — already standardized
+    y_train_log, y_val_log  : ndarray — log1p-transformed training/val targets
+    y_true_test             : ndarray — native-scale test targets
+    log1p_inv               : callable — inverse transform (np.expm1)
+    label                   : str — printed after fitting
+    n_estimators, learning_rate : LGB hyperparams
+
+    Returns
+    -------
+    dict with train_r2, val_r2, native_test_r2, tail_test_r2, model
+    """
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        print("  [lgb_fit] lightgbm not installed; skipping")
+        return {}
+
+    model = lgb.LGBMRegressor(
+        n_estimators=n_estimators, learning_rate=learning_rate, num_leaves=31,
+        min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.1, reg_lambda=0.1, random_state=RANDOM_STATE, verbose=-1,
+    )
+    model.fit(
+        X_train, y_train_log,
+        eval_set=[(X_val, y_val_log)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+    )
+    train_r2 = _r2(y_train_log, model.predict(X_train))
+    val_r2 = _r2(y_val_log, model.predict(X_val))
+
+    pred_log = model.predict(X_test)
+    pred_nat = log1p_inv(pred_log)
+    nat_r2 = _r2(y_true_test, pred_nat)
+    q90 = np.quantile(y_true_test, 0.9)
+    tail_mask = y_true_test >= q90
+    tail_r2 = float(_r2(y_true_test[tail_mask], pred_nat[tail_mask])) if tail_mask.sum() >= 5 else float("nan")
+    print(f"  [{label}] train R²={train_r2:.4f}  val R²={val_r2:.4f}  native R²={nat_r2:.4f}  tail R²={tail_r2:.4f}")
+    return {
+        "train_r2": float(train_r2), "val_r2": float(val_r2),
+        "native_test_r2": float(nat_r2), "tail_test_r2": float(tail_r2),
+        "pred_native": pred_nat, "model": model,
+    }
+
+
+# ── Round-3 experiments ────────────────────────────────────────────────────────
+
+
+def run_exp_marginal_weather(months, fig_dir, tables_dir, device, df=None):
+    """Step 1: Nested AR models isolating the marginal contribution of weather.
+
+    Fits four nested LightGBM models (M0–M3) to quantify how much each feature
+    set adds over the AR baseline, with block-bootstrap 95% CIs (Künsch 1989)
+    for ΔR² and a permutation test under the null hypothesis that weather features
+    are uninformative.
+
+    Configs
+    -------
+    M0 : cyclic time only (hour sin/cos, month sin/cos, is_weekend)
+    M1 : M0 + lag-1h + lag-24h of congestion cost (AR baseline)
+    M2 : M1 + k=7 cluster weather features (no lmp_std)
+    M3 : M2 + capacity-weighted cluster interactions (rich features)
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device (unused; LGB runs on CPU)
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict with results per config plus bootstrap CI and permutation p-value
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: MARGINAL WEATHER CONTRIBUTION (Steps 1 + 5)")
+    print("=" * 70)
+
+    try:
+        import lightgbm as lgb  # noqa: F401
+    except ImportError:
+        print("  [skip] lightgbm not installed")
+        return {}
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+
+    # AR features (lag-1h + lag-24h), standardised on train
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24))
+    ar_mean = ar_feats[train_idx].mean(0, keepdims=True)
+    ar_std = ar_feats[train_idx].std(0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    # Cluster features (no lmp_std) and rich cluster features
+    X_cl_base, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+    X_cl_rich, _ = load_cluster_features_v2(
+        months, hour_idx, include_lmp_std=False,
+        extra_fields=["max_abs_wspd_error_1h", "observed_wspd", "nameplate_mw_wind"],
+    )
+
+    # Feature matrices for each model
+    def _make_X(include_ar, include_cluster, rich=False):
+        parts = [scalar_cyc]
+        if include_ar:
+            parts.append(ar_feats)
+        if include_cluster:
+            parts.append(X_cl_rich if rich else X_cl_base)
+        return np.concatenate(parts, axis=1)
+
+    configs = {
+        "M0_cyclic_only":        _make_X(False, False),
+        "M1_AR_baseline":        _make_X(True,  False),
+        "M2_cluster_AR":         _make_X(True,  True,  rich=False),
+        "M3_rich_cluster_AR":    _make_X(True,  True,  rich=True),
+    }
+
+    results = {}
+    model_preds = {}
+    for name, X in configs.items():
+        res = _lgb_fit_eval(
+            X[train_idx], X[val_idx], X[test_idx],
+            Y_log[train_idx], Y_log[val_idx], Y_raw[test_idx], log1p_inv,
+            label=name,
+        )
+        results[name] = res
+        model_preds[name] = res.get("pred_native", np.zeros(len(test_idx)))
+
+    y_te = Y_raw[test_idx]
+
+    # Bootstrap CIs for ΔR² (M2 − M1, M3 − M1)
+    boot_m2 = compute_block_bootstrap_ci(
+        y_te, model_preds["M1_AR_baseline"], model_preds["M2_cluster_AR"], n_boot=300
+    )
+    boot_m3 = compute_block_bootstrap_ci(
+        y_te, model_preds["M1_AR_baseline"], model_preds["M3_rich_cluster_AR"], n_boot=300
+    )
+    print(f"\n  ΔR²(M2−M1): {boot_m2['delta_r2']:.4f}  95%CI [{boot_m2['ci_lo']:.4f}, {boot_m2['ci_hi']:.4f}]  p={boot_m2['p_value']:.3f}")
+    print(f"  ΔR²(M3−M1): {boot_m3['delta_r2']:.4f}  95%CI [{boot_m3['ci_lo']:.4f}, {boot_m3['ci_hi']:.4f}]  p={boot_m3['p_value']:.3f}")
+
+    # Permutation test for M2: shuffle cluster features row-wise across hours
+    print("\n  Running permutation test (50 shuffles)...")
+    rng = np.random.default_rng(RANDOM_STATE)
+    null_deltas = []
+    for _ in range(50):
+        perm = rng.permutation(len(hour_idx))
+        X_perm = np.concatenate([scalar_cyc, ar_feats, X_cl_base[perm]], axis=1)
+        res_p = _lgb_fit_eval(
+            X_perm[train_idx], X_perm[val_idx], X_perm[test_idx],
+            Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv, label="",
+        )
+        if "pred_native" in res_p:
+            null_deltas.append(_r2(y_te, res_p["pred_native"]) - _r2(y_te, model_preds["M1_AR_baseline"]))
+    null_deltas = np.array(null_deltas)
+    perm_p_val = float((null_deltas >= boot_m2["delta_r2"]).mean()) if len(null_deltas) else float("nan")
+    print(f"  Permutation p-value (M2 vs M1): {perm_p_val:.3f}  null ΔR² mean={null_deltas.mean():.4f}")
+
+    # Bar chart
+    bar_data = {
+        n: {"r2": r.get("native_test_r2", 0.0), "r2_std": 0.0}
+        for n, r in results.items()
+    }
+    plot_bar_comparison(
+        bar_data,
+        title="Nested AR Models — Marginal Weather Contribution\nNative-scale test R² (LightGBM)",
+        save_path=fig_dir / "nn_marginal_weather.png",
+    )
+
+    # Delta R² plot with bootstrap CIs
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for boot, lab, col in [
+        (boot_m2, "M2−M1 (cluster AR)", "#2196F3"),
+        (boot_m3, "M3−M1 (rich cluster AR)", "#FF5722"),
+    ]:
+        d, lo, hi = boot["delta_r2"], boot["ci_lo"], boot["ci_hi"]
+        ax.barh(lab, d, xerr=[[d - lo], [hi - d]], capsize=6,
+                color=col, alpha=0.8, edgecolor="black", linewidth=0.5)
+        ax.text(d + 0.005, 0.2 if "M2" in lab else -0.2, f"{d:.4f}", va="center", fontsize=9)
+    ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("ΔR² (native scale)")
+    ax.set_title("Weather Features vs AR Baseline\n95% Block Bootstrap CI")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "nn_delta_r2_bootstrap.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {fig_dir / 'nn_delta_r2_bootstrap.png'}")
+
+    # Save tables
+    rows = []
+    for n, r in results.items():
+        rows.append({
+            "config": n,
+            "train_r2": r.get("train_r2", float("nan")),
+            "val_r2": r.get("val_r2", float("nan")),
+            "native_test_r2": r.get("native_test_r2", float("nan")),
+            "tail_test_r2": r.get("tail_test_r2", float("nan")),
+        })
+    rows.append({
+        "config": "delta_M2_M1_ci_lo", "train_r2": float("nan"),
+        "val_r2": float("nan"),
+        "native_test_r2": boot_m2["ci_lo"], "tail_test_r2": float("nan"),
+    })
+    rows.append({
+        "config": "delta_M2_M1_ci_hi", "train_r2": float("nan"),
+        "val_r2": float("nan"),
+        "native_test_r2": boot_m2["ci_hi"], "tail_test_r2": float("nan"),
+    })
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_marginal_weather.csv", index=False)
+    pd.DataFrame({
+        "metric": ["delta_M2_M1", "ci_lo_M2", "ci_hi_M2", "p_boot_M2",
+                   "delta_M3_M1", "ci_lo_M3", "ci_hi_M3", "p_boot_M3",
+                   "perm_p_M2", "null_delta_mean"],
+        "value": [boot_m2["delta_r2"], boot_m2["ci_lo"], boot_m2["ci_hi"], boot_m2["p_value"],
+                  boot_m3["delta_r2"], boot_m3["ci_lo"], boot_m3["ci_hi"], boot_m3["p_value"],
+                  perm_p_val, float(null_deltas.mean()) if len(null_deltas) else float("nan")],
+    }).to_csv(tables_dir / "nn_bootstrap_ci.csv", index=False)
+
+    results["boot_m2"] = boot_m2
+    results["boot_m3"] = boot_m3
+    results["perm_p"] = perm_p_val
+    return results
+
+
+def run_exp_fpc(months, fig_dir, tables_dir, device, df=None):
+    """Step 2: FPC/EOF basis regression for principled spatial dimensionality reduction.
+
+    Projects each forecast error channel onto K leading EOF modes computed from
+    training hours (Ramsay & Silverman 2005; Hannachi et al. 2007). Compares
+    Ridge and LGB across K ∈ {5, 10, 20, 40}, and visualizes the spatial mode
+    patterns as Texas maps.
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device (unused; Ridge and LGB run on CPU)
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict with results per (model, K) configuration
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: FPC/EOF BASIS REGRESSION (Step 2)")
+    print("=" * 70)
+
+    try:
+        import lightgbm as lgb  # noqa: F401
+        from sklearn.linear_model import Ridge, RidgeCV
+    except ImportError:
+        print("  [skip] lightgbm or sklearn not available")
+        return {}
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    grid_np, scalar_cyc, Y_raw, pixel_coords, hour_idx, loaded_fields = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24))
+    ar_mean = ar_feats[train_idx].mean(0, keepdims=True)
+    ar_std = ar_feats[train_idx].std(0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    T, C, H, W = grid_np.shape
+    y_te = Y_raw[test_idx]
+
+    # Reference: cluster + AR (best from Round 2)
+    X_cl, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+    X_ref = np.concatenate([X_cl, ar_feats, scalar_cyc], axis=1)
+    ref_res = _lgb_fit_eval(
+        X_ref[train_idx], X_ref[val_idx], X_ref[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv, label="cluster_AR_ref",
+    )
+
+    K_values = [5, 10, 20, 40]
+    rows = []
+    best_eofs = None  # Save EOFs for K=20 visualization
+
+    for K in K_values:
+        print(f"\n  K={K} modes per channel ({K * C} total FPC features)...")
+        X_fpc, comps, var_ratios = build_fpc_features(grid_np, train_idx, n_components_per_channel=K)
+        if K == 20:
+            best_eofs = (comps, var_ratios)
+
+        cum_var = [float(np.cumsum(v)[-1]) for v in var_ratios]
+        print(f"    Cumulative variance explained per channel: {[f'{v:.2f}' for v in cum_var]}")
+
+        X_full = np.concatenate([X_fpc, ar_feats, scalar_cyc], axis=1)
+
+        # Ridge regression (interpretable, fast)
+        sc_mean_r = X_full[train_idx].mean(0)
+        sc_std_r = X_full[train_idx].std(0) + 1e-8
+        X_n = (X_full - sc_mean_r) / sc_std_r
+        ridge = RidgeCV(alphas=[0.01, 0.1, 1, 10, 100]).fit(X_n[train_idx], Y_log[train_idx])
+        pred_ridge_te = log1p_inv(ridge.predict(X_n[test_idx]))
+        ridge_r2 = float(_r2(y_te, pred_ridge_te))
+        print(f"    Ridge native R² = {ridge_r2:.4f}")
+
+        # LightGBM
+        lgb_res = _lgb_fit_eval(
+            X_full[train_idx], X_full[val_idx], X_full[test_idx],
+            Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv, label=f"LGB_K{K}",
+        )
+        rows.append({
+            "K": K, "model": "ridge",
+            "native_r2": ridge_r2, "train_r2": float("nan"), "val_r2": float("nan"),
+            "tail_r2": float("nan"), "cumvar_mean": float(np.mean(cum_var)),
+        })
+        rows.append({
+            "K": K, "model": "lgb",
+            "native_r2": lgb_res.get("native_test_r2", float("nan")),
+            "train_r2": lgb_res.get("train_r2", float("nan")),
+            "val_r2": lgb_res.get("val_r2", float("nan")),
+            "tail_r2": lgb_res.get("tail_test_r2", float("nan")),
+            "cumvar_mean": float(np.mean(cum_var)),
+        })
+
+    rows.append({
+        "K": -1, "model": "cluster_AR_reference",
+        "native_r2": ref_res.get("native_test_r2", float("nan")),
+        "train_r2": ref_res.get("train_r2", float("nan")),
+        "val_r2": ref_res.get("val_r2", float("nan")),
+        "tail_r2": ref_res.get("tail_test_r2", float("nan")),
+        "cumvar_mean": float("nan"),
+    })
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_fpc_comparison.csv", index=False)
+
+    # Bar chart: LGB native R² vs K
+    lgb_rows = [r for r in rows if r["model"] == "lgb"]
+    bar_data = {
+        (f"FPC K={r['K']}" if r["K"] > 0 else "Cluster AR ref"):
+        {"r2": r["native_r2"], "r2_std": 0.0}
+        for r in lgb_rows
+    }
+    bar_data["Cluster AR ref"] = {"r2": ref_res.get("native_test_r2", 0.0), "r2_std": 0.0}
+    plot_bar_comparison(
+        bar_data,
+        title="FPC/EOF Basis — LGB Native R² vs Number of Modes\n(+ AR lags, cyclic time)",
+        save_path=fig_dir / "nn_fpc_comparison.png",
+        baselines={"Cluster AR": ref_res.get("native_test_r2", 0.0)},
+    )
+
+    # EOF visualization: top 3 modes × 4 channels
+    if best_eofs is not None:
+        comps, var_ratios = best_eofs
+        # Reconstruct grid lat/lon from pixel_coords
+        lat_idx, lon_idx, H_g, W_g = _coarse_grid_indices(pixel_coords, resolution=0.25)
+        lats = np.unique(np.round(pixel_coords[:, 0] / 0.25) * 0.25)
+        lons = np.unique(np.round(pixel_coords[:, 1] / 0.25) * 0.25)
+
+        n_show = min(3, comps[0].shape[0])
+        fig, axes = plt.subplots(C, n_show, figsize=(4 * n_show, 3.5 * C))
+        if C == 1:
+            axes = axes[np.newaxis, :]
+        for c, field_name in enumerate(loaded_fields[:C]):
+            for k in range(n_show):
+                ax = axes[c, k]
+                eof_map = comps[c][k]  # (H, W) on the coarse 0.25° grid
+                # Use lats/lons if they match H/W, else just use imshow
+                if eof_map.shape == (H, W):
+                    extent = [lons.min(), lons.max(), lats.min(), lats.max()]
+                    img = ax.imshow(
+                        eof_map, origin="lower", extent=extent,
+                        cmap="RdBu_r", aspect="auto",
+                        vmax=np.abs(eof_map).max(), vmin=-np.abs(eof_map).max(),
+                    )
+                    plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+                ax.set_title(
+                    f"{ERROR_FIELD_LABELS.get(field_name, field_name)}\n"
+                    f"EOF {k + 1}  ({var_ratios[c][k] * 100:.1f}% var)",
+                    fontsize=8,
+                )
+                ax.set_xlabel("Longitude")
+                ax.set_ylabel("Latitude")
+        fig.suptitle("Leading EOF Modes per Error Channel (K=20, training hours only)", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(fig_dir / "nn_fpc_eofs.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {fig_dir / 'nn_fpc_eofs.png'}")
+
+    return {"rows": rows, "ref": ref_res}
+
+
+def run_exp_capacity_scalars(months, fig_dir, tables_dir, device, df=None):
+    """Step 7: Physics-motivated capacity-weighted scalar features.
+
+    Tests whether a small set of physically grounded scalars — Σ_s cap(s)·error(s)
+    summed system-wide and per geographic quadrant — can match or approach
+    the cluster-feature baseline (Round 2b best: native R² ≈ 0.42).
+
+    Configs
+    -------
+    (a) cap_scalars + AR + cyclic — 20 scalars, Ridge + LGB
+    (b) cap_scalars + cluster + AR + cyclic — combined (both representations)
+    (c) cluster + AR + cyclic — Round-2 reference
+
+    Parameters
+    ----------
+    months     : list of (year, month)
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device (unused)
+    df         : pre-loaded DataFrame (optional)
+
+    Returns
+    -------
+    dict with results per config
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: CAPACITY-WEIGHTED SCALAR FEATURES (Step 7)")
+    print("=" * 70)
+
+    try:
+        from sklearn.linear_model import RidgeCV
+        import lightgbm  # noqa: F401
+    except ImportError:
+        print("  [skip] lightgbm or sklearn not available")
+        return {}
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24))
+    ar_mean = ar_feats[train_idx].mean(0, keepdims=True)
+    ar_std = ar_feats[train_idx].std(0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    X_cap, cap_names = build_capacity_scalar_features(df, hour_idx)
+    print(f"  Capacity scalar features: {len(cap_names)} columns")
+
+    X_cl, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+
+    y_te = Y_raw[test_idx]
+    results = {}
+
+    def _feats(*parts):
+        return np.concatenate(list(parts), axis=1)
+
+    # (c) cluster + AR (reference)
+    X_c = _feats(X_cl, ar_feats, scalar_cyc)
+    res_c = _lgb_fit_eval(
+        X_c[train_idx], X_c[val_idx], X_c[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv,
+        label="(c) cluster_AR",
+    )
+    results["(c) cluster_AR"] = res_c
+
+    # (a) capacity scalars + AR
+    X_a = _feats(X_cap, ar_feats, scalar_cyc)
+    res_a_lgb = _lgb_fit_eval(
+        X_a[train_idx], X_a[val_idx], X_a[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv,
+        label="(a) cap_AR_LGB",
+    )
+    results["(a) cap_AR_LGB"] = res_a_lgb
+
+    # Also Ridge for (a) — interpretable
+    sc_mean_r = X_a[train_idx].mean(0)
+    sc_std_r = X_a[train_idx].std(0) + 1e-8
+    X_an = (X_a - sc_mean_r) / sc_std_r
+    ridge = RidgeCV(alphas=[0.01, 0.1, 1, 10, 100]).fit(X_an[train_idx], Y_log[train_idx])
+    pred_ridge = log1p_inv(ridge.predict(X_an[test_idx]))
+    ridge_r2 = float(_r2(y_te, pred_ridge))
+    print(f"  [(a) cap_AR_Ridge] native R² = {ridge_r2:.4f}")
+    results["(a) cap_AR_Ridge"] = {"native_test_r2": ridge_r2}
+
+    # (b) capacity scalars + cluster + AR
+    X_b = _feats(X_cap, X_cl, ar_feats, scalar_cyc)
+    res_b = _lgb_fit_eval(
+        X_b[train_idx], X_b[val_idx], X_b[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv,
+        label="(b) cap_cluster_AR",
+    )
+    results["(b) cap_cluster_AR"] = res_b
+
+    bar_data = {
+        n: {"r2": r.get("native_test_r2", 0.0), "r2_std": 0.0}
+        for n, r in results.items()
+    }
+    plot_bar_comparison(
+        bar_data,
+        title="Capacity-Weighted Scalar Features vs Cluster Features\nNative-scale test R²",
+        save_path=fig_dir / "nn_capacity_scalars.png",
+        baselines={"Cluster AR (ref)": res_c.get("native_test_r2", 0.0)},
+    )
+
+    rows = [
+        {"config": n, "native_test_r2": r.get("native_test_r2", float("nan")),
+         "train_r2": r.get("train_r2", float("nan")),
+         "val_r2": r.get("val_r2", float("nan")),
+         "tail_test_r2": r.get("tail_test_r2", float("nan"))}
+        for n, r in results.items()
+    ]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_capacity_scalars.csv", index=False)
+    return results
+
+
+def run_exp_seed_sweep(months, fig_dir, tables_dir, device, df=None, n_seeds=10):
+    """Step 5: Monte-Carlo seed sweep for R² variance quantification.
+
+    Runs the best configuration (cluster features + lag-1h + lag-24h, LGB) on
+    n_seeds different chunk-split random seeds. Reports the distribution of
+    native test R² to quantify sampling variance from the temporal splitting.
+
+    Parameters
+    ----------
+    months  : list of (year, month)
+    fig_dir : Path
+    tables_dir : Path
+    device  : torch.device (unused)
+    df      : pre-loaded DataFrame (optional)
+    n_seeds : int — number of random seeds (10 is fast; plan recommends 20)
+
+    Returns
+    -------
+    dict with mean_r2, std_r2, per_seed results
+    """
+    print("\n" + "=" * 70)
+    print(f"EXPERIMENT: SEED SWEEP ({n_seeds} splits) — R² VARIANCE (Step 5)")
+    print("=" * 70)
+
+    try:
+        import lightgbm  # noqa: F401
+    except ImportError:
+        print("  [skip] lightgbm not installed")
+        return {}
+
+    if df is None:
+        df = load_pixel_data_for_nn(months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24))
+    X_cl, _ = load_cluster_features_v2(months, hour_idx, include_lmp_std=False)
+
+    seed_results = []
+    for s in range(n_seeds):
+        train_idx, val_idx, test_idx = make_chunk_splits(hour_idx, seed=s)
+
+        ar_mean = ar_feats[train_idx].mean(0, keepdims=True)
+        ar_std = ar_feats[train_idx].std(0, keepdims=True) + 1e-8
+        ar_s = (ar_feats - ar_mean) / ar_std
+
+        X = np.concatenate([X_cl, ar_s, scalar_cyc], axis=1)
+        y_te = Y_raw[test_idx]
+        res = _lgb_fit_eval(
+            X[train_idx], X[val_idx], X[test_idx],
+            Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv,
+            label=f"seed={s}",
+        )
+        seed_results.append({"seed": s, **{k: v for k, v in res.items() if k not in ("model", "pred_native")}})
+
+    df_seeds = pd.DataFrame(seed_results)
+    df_seeds.to_csv(tables_dir / "nn_seed_sweep.csv", index=False)
+
+    r2s = df_seeds["native_test_r2"].values
+    print(f"\n  Native R² across {n_seeds} seeds: mean={r2s.mean():.4f}  std={r2s.std():.4f}  min={r2s.min():.4f}  max={r2s.max():.4f}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].hist(r2s, bins=min(10, n_seeds), color="#2196F3", edgecolor="black", alpha=0.8)
+    axes[0].axvline(r2s.mean(), color="red", linewidth=1.5, label=f"mean={r2s.mean():.3f}")
+    axes[0].axvline(r2s.mean() - r2s.std(), color="orange", linestyle="--", linewidth=1, label=f"±1 sd")
+    axes[0].axvline(r2s.mean() + r2s.std(), color="orange", linestyle="--", linewidth=1)
+    axes[0].legend(fontsize=8)
+    axes[0].set_xlabel("Native Test R²")
+    axes[0].set_ylabel("Count")
+    axes[0].set_title(f"R² Distribution ({n_seeds} seeds)\nCluster + AR + Cyclic")
+
+    axes[1].plot(range(n_seeds), r2s, "o-", color="#2196F3", markersize=5)
+    axes[1].axhline(r2s.mean(), color="red", linewidth=1.5, linestyle="--")
+    axes[1].fill_between(range(n_seeds), r2s.mean() - r2s.std(), r2s.mean() + r2s.std(),
+                          alpha=0.2, color="red")
+    axes[1].set_xlabel("Seed")
+    axes[1].set_ylabel("Native Test R²")
+    axes[1].set_title("R² per Chunk-Split Seed")
+
+    fig.suptitle("Sampling Variance of Native Test R²\n(LGB: cluster + AR, alt-month 2025)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "nn_seed_sweep.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {fig_dir / 'nn_seed_sweep.png'}")
+
+    return {"mean_r2": float(r2s.mean()), "std_r2": float(r2s.std()), "seed_results": seed_results}
+
+
+def run_exp_full_year(fig_dir, tables_dir, device, df=None):
+    """Step 9: Re-run best model on all 12 months of 2025.
+
+    Compares native R² from the 6-month (alt-month) training sample to the
+    full-year sample to quantify the effect of data expansion on model
+    performance and confidence-interval width.
+
+    Parameters
+    ----------
+    fig_dir    : Path
+    tables_dir : Path
+    device     : torch.device (unused)
+    df         : pre-loaded DataFrame for all 12 months (optional)
+
+    Returns
+    -------
+    dict with 6-month and 12-month results for M1 and M2
+    """
+    print("\n" + "=" * 70)
+    print("EXPERIMENT: FULL-YEAR DATA EXPANSION (Step 9)")
+    print("=" * 70)
+
+    try:
+        import lightgbm  # noqa: F401
+    except ImportError:
+        print("  [skip] lightgbm not installed")
+        return {}
+
+    all_months = [(2025, m) for m in range(1, 13)]
+
+    if df is None:
+        print("  Loading all 12 months...")
+        df = load_pixel_data_for_nn(all_months)
+
+    log1p_fwd, log1p_inv = y_transform_log1p()
+
+    _, scalar_cyc, Y_raw, _, hour_idx, _ = load_multi_field_data(
+        all_months, spatial_fields=ERROR_FIELDS, df=df, scalar_mode="cyclic",
+    )
+    Y_log = log1p_fwd(np.clip(Y_raw, 0, None)).astype(np.float32)
+    train_idx, val_idx, test_idx = make_chunk_splits(hour_idx)
+
+    print(f"  Full year: T={len(hour_idx)} hours  train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
+
+    ar_feats, _ = build_ar_features(Y_raw, hour_idx, lags=(1, 24))
+    ar_mean = ar_feats[train_idx].mean(0, keepdims=True)
+    ar_std = ar_feats[train_idx].std(0, keepdims=True) + 1e-8
+    ar_feats = (ar_feats - ar_mean) / ar_std
+
+    X_cl, _ = load_cluster_features_v2(all_months, hour_idx, include_lmp_std=False)
+
+    y_te = Y_raw[test_idx]
+    results = {}
+
+    X_m1 = np.concatenate([scalar_cyc, ar_feats], axis=1)
+    results["12mo_M1_AR"] = _lgb_fit_eval(
+        X_m1[train_idx], X_m1[val_idx], X_m1[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv, label="12mo_M1",
+    )
+
+    X_m2 = np.concatenate([X_cl, ar_feats, scalar_cyc], axis=1)
+    results["12mo_M2_cluster_AR"] = _lgb_fit_eval(
+        X_m2[train_idx], X_m2[val_idx], X_m2[test_idx],
+        Y_log[train_idx], Y_log[val_idx], y_te, log1p_inv, label="12mo_M2",
+    )
+
+    # Add 6-month reference values from existing tables if available
+    try:
+        ref = pd.read_csv(tables_dir / "nn_marginal_weather.csv")
+        m1_6mo = ref.loc[ref["config"] == "M1_AR_baseline", "native_test_r2"].values
+        m2_6mo = ref.loc[ref["config"] == "M2_cluster_AR", "native_test_r2"].values
+        if len(m1_6mo): results["6mo_M1_AR"] = {"native_test_r2": float(m1_6mo[0])}
+        if len(m2_6mo): results["6mo_M2_cluster_AR"] = {"native_test_r2": float(m2_6mo[0])}
+    except Exception:
+        pass
+
+    bar_data = {
+        n: {"r2": r.get("native_test_r2", 0.0), "r2_std": 0.0}
+        for n, r in results.items()
+    }
+    plot_bar_comparison(
+        bar_data,
+        title="Full-Year (12 months) vs Alt-Month (6 months)\nNative-scale test R² — LGB Cluster + AR",
+        save_path=fig_dir / "nn_full_year.png",
+    )
+    rows = [
+        {"config": n, "native_test_r2": r.get("native_test_r2", float("nan")),
+         "train_r2": r.get("train_r2", float("nan")),
+         "val_r2": r.get("val_r2", float("nan")),
+         "tail_r2": r.get("tail_test_r2", float("nan"))}
+        for n, r in results.items()
+    ]
+    pd.DataFrame(rows).to_csv(tables_dir / "nn_full_year.csv", index=False)
+    return results
+
+
 # ── Main orchestrator ──────────────────────────────────────────────────────────
 
 def run_all(months=None, experiments=None):
@@ -1156,8 +3781,11 @@ def run_all(months=None, experiments=None):
     """
     if months is None:
         months = DEFAULT_MONTHS
+    R3_EXPS = ["marginal", "fpc", "cap_scalars", "seed_sweep", "full_year"]
     if experiments is None:
-        experiments = ["channels", "regime", "saliency", "overfitting"]
+        experiments = ["arch", "channels", "regime", "saliency", "overfitting",
+                       "baseline", "infra", "cluster", "nodal",
+                       "ar", "gbm", "gru"] + R3_EXPS
 
     try:
         import torch  # noqa: F401
@@ -1174,12 +3802,19 @@ def run_all(months=None, experiments=None):
     tables_dir.mkdir(parents=True, exist_ok=True)
 
     df_shared = None
-    if "channels" in experiments or "saliency" in experiments:
+    if any(e in experiments for e in ["arch", "channels", "saliency",
+                                       "baseline", "infra", "cluster", "nodal",
+                                       "ar", "gbm", "gru",
+                                       "marginal", "fpc", "cap_scalars", "seed_sweep"]):
         print("\n  Pre-loading pixel data...")
         df_shared = load_pixel_data_for_nn(months)
 
     all_results = {}
 
+    if "arch" in experiments:
+        all_results["arch"] = run_exp_arch(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
     if "channels" in experiments:
         all_results["channels"] = run_exp_channels(
             months, fig_dir, tables_dir, device, df=df_shared
@@ -1194,6 +3829,52 @@ def run_all(months=None, experiments=None):
         all_results["overfitting"] = run_exp_overfitting_checks(
             months, fig_dir, tables_dir, device
         )
+    if "baseline" in experiments:
+        all_results["baseline"] = run_exp_baseline(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "infra" in experiments:
+        all_results["infra"] = run_exp_infra(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "cluster" in experiments:
+        all_results["cluster"] = run_exp_cluster(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "nodal" in experiments:
+        all_results["nodal"] = run_exp_nodal(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "ar" in experiments:
+        all_results["ar"] = run_exp_ar(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "gbm" in experiments:
+        all_results["gbm"] = run_exp_gbm(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "gru" in experiments:
+        all_results["gru"] = run_exp_gru(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "marginal" in experiments:
+        all_results["marginal"] = run_exp_marginal_weather(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "fpc" in experiments:
+        all_results["fpc"] = run_exp_fpc(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "cap_scalars" in experiments:
+        all_results["cap_scalars"] = run_exp_capacity_scalars(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "seed_sweep" in experiments:
+        all_results["seed_sweep"] = run_exp_seed_sweep(
+            months, fig_dir, tables_dir, device, df=df_shared
+        )
+    if "full_year" in experiments:
+        all_results["full_year"] = run_exp_full_year(fig_dir, tables_dir, device)
 
     print("\n" + "=" * 70)
     print("ANALYSIS COMPLETE")
@@ -1210,13 +3891,15 @@ def run_all(months=None, experiments=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MLP analysis for ERCOT curtailment prediction"
+        description="MLP/CNN/FNO analysis for ERCOT congestion cost prediction"
     )
     parser.add_argument(
         "--exp",
         nargs="+",
         default=["all"],
-        choices=["all", "channels", "regime", "saliency", "overfitting"],
+        choices=["all", "arch", "channels", "regime", "saliency", "overfitting",
+                 "baseline", "infra", "cluster", "nodal", "ar", "gbm", "gru",
+                 "marginal", "fpc", "cap_scalars", "seed_sweep", "full_year"],
         help="Which experiment(s) to run (space-separated)",
     )
     parser.add_argument(

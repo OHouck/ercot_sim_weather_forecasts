@@ -39,4 +39,5 @@ dependencies = [
     "neuraloperator>=0.3.0",
     "captum>=0.7.0",
     "binsreg>=2.1.7",
+    "lightgbm>=4.6.0",
 ]
