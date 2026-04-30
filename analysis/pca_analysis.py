@@ -6,7 +6,7 @@ Fits PCA separately on each of 6 spatial channels — 4 forecast error channels
 weather channels (era5_wspd, era5_temp) — using all 12 months of 2025.
 
 Regresses economic_congestion_cost on the leading K PCA scores per channel,
-plus matched-index interaction terms between paired channels (1h wind×temp,
+plus all K² pairwise interaction terms between paired channels (1h wind×temp,
 day-ahead wind×temp, and realized wind×temp), using OLS with HAC standard
 errors and LASSO cross-validation for robustness.
 
@@ -85,6 +85,23 @@ def _r2(y_true, y_pred):
     return float(1 - ss_res / max(ss_tot, 1e-12))
 
 
+def _normalize_comp(comp):
+    """Scale a PCA loading vector to max absolute value = 1."""
+    m = np.abs(comp).max()
+    return comp / m if m > 1e-10 else comp
+
+
+def _sig_stars(p):
+    """Return significance stars string for a p-value."""
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    return ""
+
+
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 
@@ -148,7 +165,7 @@ def pivot_channel_matrix(df, field, fill_value=0.0):
     pivot = (
         df[["valid_time", "pixel_id", field]]
         .dropna(subset=[field])
-        .pivot(index="valid_time", columns="pixel_id", values=field)
+        .pivot_table(index="valid_time", columns="pixel_id", values=field, aggfunc="first")
         .fillna(fill_value)
     )
     return (
@@ -277,10 +294,10 @@ def build_regression_matrix(scores_dict, error_fields, realized_fields,
     - Cyclic time controls: sin/cos hour-of-day, sin/cos month, is_weekend (5)
     - PCA scores for each error channel: K × 4 = 4K
     - PCA scores for each realized channel: K × 2 = 2K
-    - Interaction terms (matched mode index i = 1..K):
-        PC_i(wspd_1h) × PC_i(temp_1h)       (1h error wind × temp)
-        PC_i(wspd_0h) × PC_i(temp_0h)       (0h error wind × temp)
-        PC_i(era5_wspd) × PC_i(era5_temp)   (realized wind × temp)
+    - Interaction terms (all K² pairwise combinations per time horizon):
+        PC_i(wspd_1h) × PC_j(temp_1h)  for i,j in 1..K  (1h error wind × temp)
+        PC_i(wspd_0h) × PC_j(temp_0h)  for i,j in 1..K  (0h error wind × temp)
+        PC_i(era5_wspd) × PC_j(era5_temp) for i,j in 1..K (realized wind × temp)
 
     AR lags are excluded from the primary specification so coefficients
     measure the total causal effect of forecast errors rather than the
@@ -332,17 +349,20 @@ def build_regression_matrix(scores_dict, error_fields, realized_fields,
     K_0h   = _K("wspd_error_0h", "temp_error_0h")
     K_real = _K("era5_wspd", "era5_temp")
     for i in range(K_1h):
-        int_cols[f"INT1h_PC{i+1}"] = (
-            scores_dict["wspd_error_1h"][:, i] * scores_dict["temp_error_1h"][:, i]
-        )
+        for j in range(K_1h):
+            int_cols[f"INT1h_PC{i+1}xPC{j+1}"] = (
+                scores_dict["wspd_error_1h"][:, i] * scores_dict["temp_error_1h"][:, j]
+            )
     for i in range(K_0h):
-        int_cols[f"INT0h_PC{i+1}"] = (
-            scores_dict["wspd_error_0h"][:, i] * scores_dict["temp_error_0h"][:, i]
-        )
+        for j in range(K_0h):
+            int_cols[f"INT0h_PC{i+1}xPC{j+1}"] = (
+                scores_dict["wspd_error_0h"][:, i] * scores_dict["temp_error_0h"][:, j]
+            )
     for i in range(K_real):
-        int_cols[f"INTreal_PC{i+1}"] = (
-            scores_dict["era5_wspd"][:, i] * scores_dict["era5_temp"][:, i]
-        )
+        for j in range(K_real):
+            int_cols[f"INTreal_PC{i+1}xPC{j+1}"] = (
+                scores_dict["era5_wspd"][:, i] * scores_dict["era5_temp"][:, j]
+            )
     int_df = pd.DataFrame(int_cols, index=hours)
 
     y_series = dep_series.reindex(hours).clip(lower=0)
@@ -362,9 +382,9 @@ def build_regression_matrix(scores_dict, error_fields, realized_fields,
         "temp_error_0h":     [f"PC{i+1}_temp_error_0h" for i in range(K_0h)],
         "era5_wspd":         [f"PC{i+1}_era5_wspd" for i in range(K_real)],
         "era5_temp":         [f"PC{i+1}_era5_temp" for i in range(K_real)],
-        "interactions_1h":   [f"INT1h_PC{i+1}" for i in range(K_1h)],
-        "interactions_0h":   [f"INT0h_PC{i+1}" for i in range(K_0h)],
-        "interactions_real": [f"INTreal_PC{i+1}" for i in range(K_real)],
+        "interactions_1h":   [f"INT1h_PC{i+1}xPC{j+1}" for i in range(K_1h) for j in range(K_1h)],
+        "interactions_0h":   [f"INT0h_PC{i+1}xPC{j+1}" for i in range(K_0h) for j in range(K_0h)],
+        "interactions_real": [f"INTreal_PC{i+1}xPC{j+1}" for i in range(K_real) for j in range(K_real)],
     }
 
     n_dropped = (~valid).sum()
@@ -657,21 +677,24 @@ def _draw_texas(ax):
     ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="0.4")
 
 
-def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=5, sig_levels=None):
+def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=5,
+                  sig_levels=None, coef_levels=None):
     """Spatial heatmaps of the leading PCA mode loadings for each field.
 
     Each panel shows the spatial loading (eigenvector scaled to unit max),
     coloured red/blue. Panels for modes significant in the main OLS regression
-    are outlined: dark blue border = p < 0.01, light blue = p < 0.05.
+    are outlined (dark blue border: p < 0.01, light blue: p < 0.05) and their
+    title includes the OLS coefficient and significance stars.
 
     Parameters
     ----------
-    pca_dict   : dict {field: fitted PCA}
-    lat_dict   : dict {field: ndarray} — pixel latitudes
-    lon_dict   : dict {field: ndarray} — pixel longitudes
-    fig_dir    : Path
-    K_show     : int
-    sig_levels : dict {(field, mode_1based): p_value} or None
+    pca_dict    : dict {field: fitted PCA}
+    lat_dict    : dict {field: ndarray} — pixel latitudes
+    lon_dict    : dict {field: ndarray} — pixel longitudes
+    fig_dir     : Path
+    K_show      : int
+    sig_levels  : dict {(field, mode_1based): p_value} or None
+    coef_levels : dict {(field, mode_1based): coef} or None — OLS coefficients
     """
     import cartopy.crs as ccrs
     from matplotlib.colors import TwoSlopeNorm
@@ -695,16 +718,15 @@ def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=5, sig_levels=No
 
         for k in range(min(K_show, len(vr))):
             ax = axes[r, k]
-            comp = pca.components_[k]
-            m = np.abs(comp).max()
-            comp_n = comp / m if m > 1e-10 else comp
+            comp_n = _normalize_comp(pca.components_[k])
             norm = TwoSlopeNorm(vmin=-1.0, vcenter=0, vmax=1.0)
             ax.scatter(lons, lats, c=comp_n, cmap="RdBu_r", norm=norm,
                        s=3, transform=ccrs.PlateCarree(), rasterized=True)
             _draw_texas(ax)
 
-            # Significance border
             p_val = (sig_levels or {}).get((field, k + 1), 1.0)
+            coef  = (coef_levels or {}).get((field, k + 1))
+
             if p_val < 0.01:
                 bc, blw = COLOR_P001, 3.0
             elif p_val < 0.05:
@@ -716,8 +738,12 @@ def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=5, sig_levels=No
                 spine.set_linewidth(blw)
                 spine.set_visible(True)
 
-            # Mode title (field label only in first column)
-            mode_title = f"PC{k+1}  ({vr[k]*100:.1f}%)"
+            var_str = f"var={vr[k]*100:.1f}%"
+            if p_val < 0.05 and coef is not None:
+                coef_line = f"\nβ={coef:+.2f}{_sig_stars(p_val)}"
+            else:
+                coef_line = ""
+            mode_title = f"PC{k+1} ({var_str}){coef_line}"
             if k == 0:
                 ax.set_title(f"{label}\n{mode_title}", fontsize=6.5, pad=3)
             else:
@@ -807,7 +833,12 @@ def plot_coefficient_forest(result, col_names, feature_groups, fig_dir, title_su
         group_spans.append((pos, pos + len(present), g_label))
         for c in present:
             ordered_cols.append(c)
-            ordered_labels.append(c.split("_")[0])   # e.g. "PC1" or "INT1h"
+            if c.startswith("INT") and "xPC" in c:
+                # e.g. INT1h_PC2xPC3 -> "2×3"
+                suffix = c.split("_", 1)[1]   # "PC2xPC3"
+                ordered_labels.append(suffix.replace("PC", "").replace("x", "×"))
+            else:
+                ordered_labels.append(c.split("_")[0])   # e.g. "PC1"
             pos += 1
 
     n = len(ordered_cols)
@@ -933,7 +964,11 @@ def plot_lasso_results(lasso_coef, ols_result, col_names, feature_groups, fig_di
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, max(5, len(weather_cols) * 0.32)),
                                     sharey=True)
     y_pos = np.arange(len(weather_cols))
-    labels = [c.split("_")[0] for c in weather_cols]
+    labels = [
+        c.split("_", 1)[1].replace("PC", "").replace("x", "×") if c.startswith("INT") and "xPC" in c
+        else c.split("_")[0]
+        for c in weather_cols
+    ]
 
     # OLS
     ols_colors = [COLOR_P001 if ols_pvals.get(c, 1) < 0.01
@@ -1055,6 +1090,89 @@ def plot_k_sweep(k_df, fig_dir):
     fig.suptitle("K-Sweep: PCA Modes per Channel", fontsize=10)
     plt.tight_layout()
     out = fig_dir / "pca_k_sweep.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+def plot_interaction_maps(pca_dict, lat_dict, lon_dict,
+                          ols_result, col_names, feature_groups, fig_dir,
+                          sig_threshold=0.05):
+    """Paired loading maps for significant HRRR-1h wind×temperature interaction terms.
+
+    For each significant INT1h_PC{i}xPC{j} term shows a narrow header row with
+    the interaction label and β coefficient, then wind and temperature loading
+    maps side by side.
+
+    Parameters
+    ----------
+    pca_dict       : dict {field: fitted PCA}
+    lat_dict       : dict {field: ndarray} — pixel latitudes
+    lon_dict       : dict {field: ndarray} — pixel longitudes
+    ols_result     : statsmodels OLS result
+    col_names      : list of str (includes const)
+    feature_groups : dict
+    fig_dir        : Path
+    sig_threshold  : float
+    """
+    import cartopy.crs as ccrs
+    from matplotlib.colors import TwoSlopeNorm
+
+    pval_ser = pd.Series(ols_result.pvalues[1:], index=col_names[1:])
+    coef_ser = pd.Series(ols_result.params[1:],  index=col_names[1:])
+    int_cols = feature_groups.get("interactions_1h", [])
+    sig_terms = [
+        (c, coef_ser[c], pval_ser.get(c, 1.0))
+        for c in int_cols
+        if pval_ser.get(c, 1.0) < sig_threshold
+    ][:20]
+    if not sig_terms:
+        print("  No significant INT1h terms to plot.")
+        return
+
+    n_sig  = len(sig_terms)
+    n_cols = 2   # pairs per row
+    n_rows = (n_sig + n_cols - 1) // n_cols
+
+    crs_pc = ccrs.PlateCarree()
+    norm   = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
+
+    fig     = plt.figure(figsize=(10, n_rows * 2.55))
+    fig.subplots_adjust(top=0.94, left=0.03, right=0.97, bottom=0.02)
+    subfigs = np.atleast_2d(fig.subfigures(n_rows, n_cols, hspace=0.08, wspace=0.02))
+
+    for p, (col_name, coef, pval) in enumerate(sig_terms):
+        suffix = col_name.split("_", 1)[1]
+        i_str, j_str = suffix.split("x")
+        i = int(i_str[2:]) - 1
+        j = int(j_str[2:]) - 1
+
+        sf = subfigs[p // n_cols, p % n_cols]
+
+        ax_w, ax_t = sf.subplots(1, 2, subplot_kw={"projection": crs_pc})
+
+        ax_w.scatter(lon_dict["wspd_error_1h"], lat_dict["wspd_error_1h"],
+                     c=_normalize_comp(pca_dict["wspd_error_1h"].components_[i]),
+                     cmap="RdBu_r", norm=norm, s=3, transform=crs_pc, rasterized=True)
+        _draw_texas(ax_w)
+        ax_w.set_title(f"Wind PC{i+1}", fontsize=8)
+        ax_w.text(0.5, -0.22, f"PC{i+1}×PC{j+1}  β={coef:+.3f}{_sig_stars(pval)}",
+                  transform=ax_w.transAxes, ha="center", va="top", fontsize=8.5,
+                  fontweight="bold", color=COLOR_P001 if pval < 0.01 else COLOR_P005)
+
+        ax_t.scatter(lon_dict["temp_error_1h"], lat_dict["temp_error_1h"],
+                     c=_normalize_comp(pca_dict["temp_error_1h"].components_[j]),
+                     cmap="RdBu_r", norm=norm, s=3, transform=crs_pc, rasterized=True)
+        _draw_texas(ax_t)
+        ax_t.set_title(f"Temp PC{j+1}", fontsize=8)
+
+    # Hide unused subfigures when n_sig is not a multiple of n_cols
+    for p in range(n_sig, n_rows * n_cols):
+        subfigs[p // n_cols, p % n_cols].set_visible(False)
+
+    fig.text(0.5, 0.99, "Significant HRRR-1h Wind × Temperature Interaction Terms",
+             ha="center", va="top", fontsize=10, fontweight="bold")
+    out = fig_dir / "pca_interaction_maps.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -1193,9 +1311,9 @@ def run_pca_analysis(months=None, K=N_COMPONENTS):
     # 10. Figures
     print("\n=== Step 10: Generating figures ===")
 
-    # Build sig_levels dict from primary OLS pvalues
-    sig_levels = {}
-    for col, pv in zip(col_names[1:], ols_result.pvalues[1:]):
+    # Build sig_levels and coef_levels dicts from primary OLS pvalues/coefficients
+    sig_levels, coef_levels = {}, {}
+    for col, pv, coef in zip(col_names[1:], ols_result.pvalues[1:], ols_result.params[1:]):
         if col.startswith("PC") and "_" in col:
             parts = col.split("_", 1)
             try:
@@ -1204,16 +1322,19 @@ def run_pca_analysis(months=None, K=N_COMPONENTS):
                 continue
             field = parts[1]
             if field in ALL_FIELDS:
-                sig_levels[(field, mode)] = float(pv)
+                sig_levels[(field, mode)]  = float(pv)
+                coef_levels[(field, mode)] = float(coef)
 
     plot_variance_explained(var_df, fig_dir)
     plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir,
-                  K_show=min(K, 5), sig_levels=sig_levels)
+                  K_show=min(K, 5), sig_levels=sig_levels, coef_levels=coef_levels)
     plot_coefficient_forest(ols_result, col_names, feature_groups, fig_dir)
     plot_joint_ftest(f_tests, fig_dir)
     plot_lasso_results(lasso_coef, ols_result, col_names, feature_groups, fig_dir)
     plot_regime_comparison(regime_results, col_names, feature_groups, fig_dir)
     plot_k_sweep(k_df, fig_dir)
+    plot_interaction_maps(pca_dict, lat_dict, lon_dict,
+                          ols_result, col_names, feature_groups, fig_dir)
 
     # Console summary
     n01 = (ols_result.pvalues[1:] < 0.01).sum()
@@ -1228,8 +1349,7 @@ def run_pca_analysis(months=None, K=N_COMPONENTS):
     print(eof_rows.to_string(index=False))
     print("\n  --- Joint F-tests ---")
     for g, (f, p) in f_tests.items():
-        star = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else ""))
-        print(f"    {g:<25}  F={f:.3f}  p={p:.4f}  {star}")
+        print(f"    {g:<25}  F={f:.3f}  p={p:.4f}  {_sig_stars(p)}")
     print("\n  --- K sweep ---")
     print(k_df.to_string(index=False))
 

@@ -1,17 +1,21 @@
 """pull_ercot.py — Download ERCOT market and demand data.
 
 Downloads day-ahead and real-time settlement point prices, actual system load,
-and demand forecasts from the ERCOT Public API. Requires API credentials in ~/keys/.
+demand forecasts, and SCED system lambda from the ERCOT Public API.
+Requires API credentials in ~/keys/.
 
 Authentication flow:
 1. Get OAuth2 Bearer token via Azure B2C ROPC flow using username/password
 2. Use Bearer token + subscription key for API requests
 """
 
+import io
 import os
 import sys
 import time
 import json
+import calendar
+import zipfile
 import requests
 import pandas as pd
 from pathlib import Path
@@ -276,7 +280,6 @@ def download_actual_load(start_date, end_date, output_dir, api_key, bearer_token
     end = datetime.strptime(end_date, '%Y-%m-%d')
 
     while current <= end:
-        import calendar
         month_end_day = calendar.monthrange(current.year, current.month)[1]
         month_start = current.replace(day=1)
         month_end = min(current.replace(day=month_end_day), end)
@@ -362,6 +365,252 @@ def download_demand_forecasts(start_date, end_date, output_dir, api_key, bearer_
         time.sleep(2)
 
 
+def _list_sced_lambda_archive(start_date, end_date, api_key, bearer_token=None):
+    """List SCED System Lambda archive document metadata for a date range.
+
+    The archive endpoint returns one entry per SCED run (~every 5 min). Each
+    entry contains a docId and download link for a zipped CSV.
+
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        api_key: ERCOT API subscription key
+        bearer_token: OAuth2 bearer token
+
+    Returns:
+        List of dicts with keys: docId, friendlyName, postDatetime, download_href
+    """
+    headers = {'Ocp-Apim-Subscription-Key': api_key}
+    if bearer_token:
+        headers['Authorization'] = f'Bearer {bearer_token}'
+
+    url = f"{ERCOT_API_BASE}/archive/np6-322-cd"
+    all_docs = []
+    page = 1
+
+    while True:
+        params = {
+            'postDatetimeFrom': f"{start_date}T00:00:00",
+            'postDatetimeTo': f"{end_date}T23:59:59",
+            'size': 1000,
+            'page': page,
+        }
+
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+
+        if resp.status_code == 429:
+            print(f"    Rate limited, waiting 60s...")
+            time.sleep(60)
+            continue
+
+        if resp.status_code != 200:
+            print(f"    HTTP {resp.status_code}: {resp.text[:200]}")
+            break
+
+        data = resp.json()
+        meta = data.get('_meta', {})
+        total_pages = meta.get('totalPages', 1)
+        total_records = meta.get('totalRecords', 0)
+
+        if page == 1:
+            print(f"    Found {total_records} archive docs ({total_pages} pages)")
+
+        for doc in data.get('archives', []):
+            all_docs.append({
+                'docId': doc['docId'],
+                'friendlyName': doc['friendlyName'],
+                'postDatetime': doc['postDatetime'],
+                'download_href': doc['_links']['endpoint']['href'],
+            })
+
+        if page >= total_pages:
+            break
+        page += 1
+        time.sleep(0.5)
+
+    return all_docs
+
+
+def _parse_sced_lambda_zip(content, friendly_name):
+    """Parse a zipped SCED lambda CSV into a DataFrame.
+
+    Handles historical column name variations (e.g. 'SCEDTimestamp' vs
+    'SCED Time Stamp'). Timestamp is stored as a naive string exactly as
+    ERCOT provides it (US/Central prevailing time); no timezone conversion
+    is done here.
+
+    Args:
+        content: Raw bytes of the zip file
+        friendly_name: Filename string used in error messages
+
+    Returns:
+        DataFrame with columns sced_timestamp (str), system_lambda (float),
+        and optionally repeated_hour_flag; or None if parsing fails
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            csv_names = [n for n in zf.namelist() if n.endswith('.csv')]
+            if not csv_names:
+                return None
+            with zf.open(csv_names[0]) as f:
+                df = pd.read_csv(f)
+    except Exception as e:
+        print(f"    Zip error in {friendly_name}: {e}")
+        return None
+
+    df.columns = [c.strip() for c in df.columns]
+    col_lower = {c: c.lower().replace(' ', '').replace('_', '') for c in df.columns}
+
+    ts_col = next((c for c, l in col_lower.items() if 'timestamp' in l), None)
+    lam_col = next((c for c, l in col_lower.items() if 'lambda' in l), None)
+    rep_col = next((c for c, l in col_lower.items() if 'repeated' in l), None)
+
+    if ts_col is None or lam_col is None:
+        print(f"    Unexpected columns in {friendly_name}: {list(df.columns)}")
+        return None
+
+    result = pd.DataFrame({
+        'sced_timestamp': df[ts_col].astype(str),
+        'system_lambda': pd.to_numeric(df[lam_col], errors='coerce'),
+    })
+    if rep_col is not None:
+        result['repeated_hour_flag'] = df[rep_col].values
+
+    return result.dropna(subset=['system_lambda'])
+
+
+def download_sced_lambda(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download SCED System Lambda data (NP6-322-CD) for a date range.
+
+    System lambda is the system-wide energy component of LMP — the shadow price
+    on the power balance constraint before nodal congestion adjustments. Published
+    per SCED run (~every 5 minutes, ~288 runs/day).
+
+    Uses the ERCOT archive endpoint, which returns one zipped CSV per SCED run.
+    Aggregates all runs for each calendar month and saves a single parquet file.
+    Months that already have a parquet file are skipped.
+
+    Bearer tokens expire after ~1 hour. This function automatically refreshes
+    the token from ~/keys/ when a 401 is received mid-download.
+
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        output_dir: Directory to save monthly parquet files
+        api_key: ERCOT API subscription key
+        bearer_token: OAuth2 bearer token (refreshed automatically on expiry)
+
+    Saves sced_lambda_{YYYY-MM}.parquet per month. Columns: sced_timestamp
+    (str, US/Central prevailing time), system_lambda (float, $/MWh), and
+    repeated_hour_flag (str, present when ERCOT includes it).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Pre-load credentials so we can silently refresh the bearer token on 401.
+    # Bearer tokens expire in ~1 hour; a full month takes ~5 hours to download.
+    try:
+        _creds = load_credentials()
+        _username, _password = _creds['username'], _creds['password']
+    except Exception:
+        _username = _password = None
+
+    def _make_headers():
+        h = {'Ocp-Apim-Subscription-Key': api_key}
+        if bearer_token:
+            h['Authorization'] = f'Bearer {bearer_token}'
+        return h
+
+    headers = _make_headers()
+
+    current = datetime.strptime(start_date, '%Y-%m-%d').replace(day=1)
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+
+    while current <= end:
+        month_end_day = calendar.monthrange(current.year, current.month)[1]
+        month_end = min(current.replace(day=month_end_day), end)
+        month_str = current.strftime('%Y-%m')
+        output_file = os.path.join(output_dir, f"sced_lambda_{month_str}.parquet")
+
+        if os.path.exists(output_file):
+            print(f"  Skipping {month_str} (already exists)")
+            current = month_end + timedelta(days=1)
+            continue
+
+        # Refresh token at the start of each month — each month takes ~5h to
+        # download but tokens only last ~1h, so we always need a fresh one here.
+        if _username:
+            new_token = get_bearer_token(_username, _password)
+            if new_token:
+                bearer_token = new_token
+                headers = _make_headers()
+            else:
+                print(f"  WARNING: Token refresh failed for {month_str}, trying with existing token")
+
+        print(f"  Downloading SCED lambda for {month_str}...")
+
+        docs = _list_sced_lambda_archive(
+            current.strftime('%Y-%m-%d'),
+            month_end.strftime('%Y-%m-%d'),
+            api_key, bearer_token,
+        )
+
+        if not docs:
+            print(f"    No archive docs found for {month_str}")
+            current = month_end + timedelta(days=1)
+            continue
+
+        frames = []
+        for i, doc in enumerate(docs):
+            if i % 500 == 0:
+                print(f"    Downloading file {i + 1}/{len(docs)}...")
+
+            for attempt in range(6):
+                resp = requests.get(doc['download_href'], headers=headers, timeout=60)
+                if resp.status_code == 429:
+                    wait = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80, 160s
+                    print(f"    Rate limited, waiting {wait}s...")
+                    time.sleep(wait)
+                elif resp.status_code == 401 and _username:
+                    print(f"    Token expired, refreshing...")
+                    bearer_token = get_bearer_token(_username, _password)
+                    headers = _make_headers()
+                else:
+                    break
+            else:
+                print(f"    Exhausted retries for {doc['friendlyName']}, skipping")
+                time.sleep(2)
+                continue
+
+            if resp.status_code != 200:
+                print(f"    HTTP {resp.status_code} for {doc['friendlyName']}, skipping")
+                time.sleep(2)
+                continue
+
+            df = _parse_sced_lambda_zip(resp.content, doc['friendlyName'])
+            if df is not None:
+                frames.append(df)
+            time.sleep(2)  # ~30 req/min to stay within ERCOT API rate limit
+
+        if not frames:
+            print(f"    No data parsed for {month_str}")
+            current = month_end + timedelta(days=1)
+            continue
+
+        month_df = (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset=['sced_timestamp'])
+            .sort_values('sced_timestamp')
+            .reset_index(drop=True)
+        )
+
+        month_df.to_parquet(output_file, index=False)
+        lam = month_df['system_lambda']
+        print(f"    Saved {len(month_df)} SCED intervals for {month_str}")
+        print(f"    Lambda range: [{lam.min():.2f}, {lam.max():.2f}] $/MWh")
+
+        current = month_end + timedelta(days=1)
+
+
 def download_month(year, month):
     """Download all ERCOT data for a given month.
 
@@ -369,8 +618,6 @@ def download_month(year, month):
         year: Integer year (e.g. 2025)
         month: Integer month (e.g. 7)
     """
-    import calendar
-
     dirs = setup_directories()
     base_dir = os.path.join(dirs['raw'], 'ercot')
     creds = load_credentials()
@@ -428,5 +675,40 @@ def download_year(year):
         download_month(year, month)
 
 
+def download_sced_lambda_year(year):
+    """Download SCED System Lambda for all months of a full year.
+
+    Authenticates once and calls download_sced_lambda month-by-month.
+    Each month takes 30-60 minutes due to ~8,900 archive file downloads.
+
+    Args:
+        year: Integer year (e.g. 2025)
+    """
+    dirs = setup_directories()
+    output_dir = os.path.join(dirs['raw'], 'ercot', 'sced_lambda', str(year))
+    creds = load_credentials()
+
+    print(f"=== SCED System Lambda Download: {year} ===\n")
+
+    print("Authenticating with ERCOT API...")
+    bearer_token = get_bearer_token(creds['username'], creds['password'])
+    if bearer_token:
+        print("Bearer token obtained successfully.\n")
+    else:
+        print("WARNING: Could not get bearer token, proceeding with subscription key only.\n")
+
+    api_key = creds['api_key']
+
+    for month in range(1, 13):
+        num_days = calendar.monthrange(year, month)[1]
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{num_days:02d}"
+        month_dir = os.path.join(output_dir, f"{month:02d}")
+        print(f"\n--- SCED Lambda {year}-{month:02d} ---")
+        download_sced_lambda(start_date, end_date, month_dir, api_key, bearer_token)
+
+    print(f"\n=== SCED Lambda Download Complete: {year} ===")
+
+
 if __name__ == "__main__":
-    download_month(2025, 7)
+    download_sced_lambda_year(2025)
