@@ -164,8 +164,56 @@ def ercot_request(endpoint, params, api_key, bearer_token=None, max_pages=100):
     return all_records
 
 
+def _download_daily_endpoint(
+    start_date, end_date, output_dir, api_key, bearer_token,
+    endpoint, file_prefix, label, extra_params=None,
+):
+    """Download a day-iterated ERCOT API endpoint, saving one CSV per day.
+
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        output_dir: Directory to save CSV files
+        api_key: ERCOT API key
+        bearer_token: OAuth2 bearer token
+        endpoint: API endpoint path (e.g. '/np4-190-cd/dam_stlmnt_pnt_prices')
+        file_prefix: Output filename prefix (e.g. 'dam_spp' → 'dam_spp_{date}.csv')
+        label: Human-readable label for log messages
+        extra_params: Additional query parameters merged into the date range params
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    current = datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        output_file = os.path.join(output_dir, f"{file_prefix}_{date_str}.csv")
+
+        if os.path.exists(output_file):
+            print(f"  Skipping {date_str} (already exists)")
+            current += timedelta(days=1)
+            continue
+
+        print(f"  Downloading {label} for {date_str}...")
+        params = {'deliveryDateFrom': date_str, 'deliveryDateTo': date_str}
+        if extra_params:
+            params.update(extra_params)
+
+        records = ercot_request(endpoint, params, api_key, bearer_token)
+
+        if records:
+            pd.DataFrame(records).to_csv(output_file, index=False)
+            print(f"    Saved {len(records)} records")
+        else:
+            print(f"    No data for {date_str}")
+
+        current += timedelta(days=1)
+        time.sleep(2)
+
+
 def download_dam_spp(start_date, end_date, output_dir, api_key, bearer_token=None):
-    """Download day-ahead settlement point prices.
+    """Download day-ahead settlement point prices (NP4-190-CD).
 
     Uses NP4-190-CD endpoint which provides prices at the settlement point
     level (resource nodes, load zones, hubs) rather than bus level.
@@ -179,43 +227,16 @@ def download_dam_spp(start_date, end_date, output_dir, api_key, bearer_token=Non
 
     Saves one CSV per day to output_dir.
     """
-    os.makedirs(output_dir, exist_ok=True)
-
-    current = datetime.strptime(start_date, '%Y-%m-%d')
-    end = datetime.strptime(end_date, '%Y-%m-%d')
-
-    while current <= end:
-        date_str = current.strftime('%Y-%m-%d')
-        output_file = os.path.join(output_dir, f"dam_spp_{date_str}.csv")
-
-        if os.path.exists(output_file):
-            print(f"  Skipping {date_str} (already exists)")
-            current += timedelta(days=1)
-            continue
-
-        print(f"  Downloading DAM SPP for {date_str}...")
-        params = {
-            'deliveryDateFrom': date_str,
-            'deliveryDateTo': date_str,
-        }
-
-        records = ercot_request(
-            '/np4-190-cd/dam_stlmnt_pnt_prices', params, api_key, bearer_token
-        )
-
-        if records:
-            df = pd.DataFrame(records)
-            df.to_csv(output_file, index=False)
-            print(f"    Saved {len(df)} records")
-        else:
-            print(f"    No data for {date_str}")
-
-        current += timedelta(days=1)
-        time.sleep(2)
+    _download_daily_endpoint(
+        start_date, end_date, output_dir, api_key, bearer_token,
+        endpoint='/np4-190-cd/dam_stlmnt_pnt_prices',
+        file_prefix='dam_spp',
+        label='DAM SPP',
+    )
 
 
 def download_rt_spp(start_date, end_date, output_dir, api_key, bearer_token=None):
-    """Download real-time settlement point prices (15-min intervals).
+    """Download real-time settlement point prices (NP6-905-CD, 15-min intervals).
 
     Args:
         start_date: 'YYYY-MM-DD' start
@@ -226,39 +247,12 @@ def download_rt_spp(start_date, end_date, output_dir, api_key, bearer_token=None
 
     Saves one CSV per day to output_dir.
     """
-    os.makedirs(output_dir, exist_ok=True)
-
-    current = datetime.strptime(start_date, '%Y-%m-%d')
-    end = datetime.strptime(end_date, '%Y-%m-%d')
-
-    while current <= end:
-        date_str = current.strftime('%Y-%m-%d')
-        output_file = os.path.join(output_dir, f"rt_spp_{date_str}.csv")
-
-        if os.path.exists(output_file):
-            print(f"  Skipping {date_str} (already exists)")
-            current += timedelta(days=1)
-            continue
-
-        print(f"  Downloading RT SPP for {date_str}...")
-        params = {
-            'deliveryDateFrom': date_str,
-            'deliveryDateTo': date_str,
-        }
-
-        records = ercot_request(
-            '/np6-905-cd/spp_node_zone_hub', params, api_key, bearer_token
-        )
-
-        if records:
-            df = pd.DataFrame(records)
-            df.to_csv(output_file, index=False)
-            print(f"    Saved {len(df)} records")
-        else:
-            print(f"    No data for {date_str}")
-
-        current += timedelta(days=1)
-        time.sleep(2)
+    _download_daily_endpoint(
+        start_date, end_date, output_dir, api_key, bearer_token,
+        endpoint='/np6-905-cd/spp_node_zone_hub',
+        file_prefix='rt_spp',
+        label='RT SPP',
+    )
 
 
 def download_actual_load(start_date, end_date, output_dir, api_key, bearer_token=None):
@@ -329,40 +323,43 @@ def download_demand_forecasts(start_date, end_date, output_dir, api_key, bearer_
         api_key: ERCOT API key
         bearer_token: OAuth2 bearer token
     """
-    os.makedirs(output_dir, exist_ok=True)
+    _download_daily_endpoint(
+        start_date, end_date, output_dir, api_key, bearer_token,
+        endpoint='/np3-565-cd/lf_by_model_weather_zone',
+        file_prefix='demand_forecast',
+        label='demand forecasts',
+        extra_params={'inUseFlag': 'true'},
+    )
 
-    current = datetime.strptime(start_date, '%Y-%m-%d')
-    end = datetime.strptime(end_date, '%Y-%m-%d')
 
-    while current <= end:
-        date_str = current.strftime('%Y-%m-%d')
-        output_file = os.path.join(output_dir, f"demand_forecast_{date_str}.csv")
+def download_wind_power_forecast(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download hourly wind power forecasts by geographic region (NP4-742-CD).
 
-        if os.path.exists(output_file):
-            print(f"  Skipping {date_str} (already exists)")
-            current += timedelta(days=1)
-            continue
+    Uses the STWPF (Short-Term Wind Power Forecast), the primary operational
+    wind forecast used by Qualified Scheduling Entities (QSEs) to submit Current
+    Operating Plans. WGRPP (Wind Generation Resource Production Potential), used
+    for Reliability Unit Commitment charge responsibility, is also included since
+    both come from the same endpoint.
 
-        print(f"  Downloading demand forecasts for {date_str}...")
-        params = {
-            'deliveryDateFrom': date_str,
-            'deliveryDateTo': date_str,
-            'inUseFlag': 'true',
-        }
+    Both are 50% probability-of-exceedance hourly forecasts. Regions: Panhandle,
+    Coastal, South, West, North, and system-wide.
 
-        records = ercot_request(
-            '/np3-565-cd/lf_by_model_weather_zone', params, api_key, bearer_token
-        )
+    Args:
+        start_date: 'YYYY-MM-DD' start
+        end_date: 'YYYY-MM-DD' end
+        output_dir: Directory to save daily CSV files
+        api_key: ERCOT API key
+        bearer_token: OAuth2 bearer token
 
-        if records:
-            df = pd.DataFrame(records)
-            df.to_csv(output_file, index=False)
-            print(f"    Saved {len(df)} records")
-        else:
-            print(f"    No data for {date_str}")
-
-        current += timedelta(days=1)
-        time.sleep(2)
+    Saves one CSV per day. Expected columns (API-dependent): deliveryDate,
+    hourEnding, region, genMw, copHsl, stwpf, wgrpp, hsl.
+    """
+    _download_daily_endpoint(
+        start_date, end_date, output_dir, api_key, bearer_token,
+        endpoint='/np4-742-cd/wpp_hrly_actual_fcast_geo',
+        file_prefix='wind_forecast',
+        label='wind power forecast',
+    )
 
 
 def _list_sced_lambda_archive(start_date, end_date, api_key, bearer_token=None):
@@ -662,6 +659,10 @@ def download_month(year, month):
     forecast_dir = os.path.join(base_dir, 'demand_forecast', str(year), f"{month:02d}")
     download_demand_forecasts(start_date, end_date, forecast_dir, api_key, bearer_token)
 
+    print("\n--- Wind Power Forecasts ---")
+    wind_dir = os.path.join(base_dir, 'wind_forecast', str(year), f"{month:02d}")
+    download_wind_power_forecast(start_date, end_date, wind_dir, api_key, bearer_token)
+
     print("\n=== ERCOT Download Complete ===")
 
 
@@ -712,3 +713,5 @@ def download_sced_lambda_year(year):
 
 if __name__ == "__main__":
     download_sced_lambda_year(2025)
+
+    # download_year(2025)

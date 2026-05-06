@@ -1,9 +1,10 @@
 """pull_hrrr.py — Download HRRR 3km weather forecasts from AWS S3 and extract Texas.
 
 Downloads HRRR surface (wrfsfcf) GRIB2 files from the NOAA HRRR archive on S3,
-using byte-range requests to download only TMP:2m, UGRD:10m, VGRD:10m fields
-(~6 MB vs ~150 MB per file). Extracts the Texas bounding box, computes wind
-speed/direction from U/V components, and saves as compressed NetCDF.
+using byte-range requests to download only TMP:2m, UGRD:10m, VGRD:10m,
+UGRD:80m, VGRD:80m fields (~8 MB vs ~150 MB per file). Extracts the Texas
+bounding box, computes wind speed/direction from U/V components, and saves as
+compressed NetCDF.
 
 All times are in UTC. HRRR runs 24 initializations per day (00z–23z).
 Standard cycles (all 24) produce forecasts to 18h lead time.
@@ -11,12 +12,20 @@ Extended cycles (00z, 06z, 12z, 18z) produce forecasts to 48h lead time.
 Currently downloads f01 and f18 from all 24 cycles; extend to f24+ by
 changing LEAD_TIMES and adding EXTENDED_CYCLES logic.
 
+100m wind speed is not available in HRRR wrfsfcf files. It is estimated using
+the wind profile power law from 10m and 80m wind speeds:
+    alpha = ln(si80 / si10) / ln(80 / 10)
+    si100 = si80 * (100 / 80) ** alpha
+where alpha is the Hellmann exponent. When either speed is < 0.1 m/s,
+alpha falls back to 1/7 (neutral-stability open terrain default).
+Wind direction at 100m equals direction at 80m (power law preserves direction).
+
 Output format (combined — space-efficient):
   {base_dir}/{year}/{month:02d}/hrrr_{HH}z_{YYYYMMDD}.nc
   Each file covers both lead times for one (cycle, day), storing t2m, si10,
-  wdir10 in a single NetCDF with dims (lead_hour, y, x). lat/lon coordinates
-  are stored once instead of being duplicated across 6 per-element files.
-  This reduces storage from ~4,464 files/month to 744 files/month.
+  wdir10, si80, wdir80, si100, wdir100, alpha in a single NetCDF with dims
+  (lead_hour, y, x). lat/lon coordinates are stored once instead of being
+  duplicated across per-element files.
 
 This data is very large, so after processing forecast errors, delete the raw files.
 
@@ -24,6 +33,10 @@ Usage:
     # Single month
     from download_data.pull_hrrr import download_hrrr_month
     download_hrrr_month(2025, 7)
+
+    # Backfill 100m wind on existing files (adds si80/alpha/si100/wdir100)
+    from download_data.pull_hrrr import patch_hrrr_100m_wind_month
+    patch_hrrr_100m_wind_month(2025, 7)
 
     # CLI
     uv run python -m download_data.pull_hrrr
@@ -65,7 +78,16 @@ TARGET_VARIABLES = [
     "TMP:2 m above ground",
     "UGRD:10 m above ground",
     "VGRD:10 m above ground",
+    "UGRD:80 m above ground",
+    "VGRD:80 m above ground",
 ]
+
+# Wind profile power law heights (metres)
+_Z_LOW = 10.0
+_Z_HIGH = 80.0
+_Z_TARGET = 100.0
+_ALPHA_DEFAULT = 1.0 / 7.0  # neutral stability over open terrain
+_MIN_SPEED = 0.1  # m/s — use default alpha below this
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +133,10 @@ def _parse_idx(idx_text):
 
 def _compute_byte_ranges(idx_records, target_vars):
     """Find byte ranges for target variables in parsed idx records.
+
+    Args:
+        idx_records: Output of _parse_idx().
+        target_vars: List of var_level strings to match.
 
     Raises:
         ValueError: If any target variable is not found.
@@ -158,11 +184,23 @@ def _download_byte_range(url, byte_start, byte_end, max_retries=3):
     return None
 
 
-def _download_variable_gribs(date_str, cycle_hour, lead_hour, tmp_dir):
-    """Download the 3 target variable GRIB messages for one forecast file.
+def _download_variable_gribs(date_str, cycle_hour, lead_hour, tmp_dir,
+                              target_vars=None):
+    """Download target variable GRIB messages for one forecast file.
 
-    Returns path to the combined partial GRIB2 file, or None on failure.
+    Args:
+        date_str: 'YYYYMMDD'
+        cycle_hour: UTC initialization hour (0–23).
+        lead_hour: Forecast lead time in hours.
+        tmp_dir: Temporary directory for the intermediate GRIB2 file.
+        target_vars: Variables to download; defaults to TARGET_VARIABLES.
+
+    Returns:
+        Path to the combined partial GRIB2 file, or None on failure.
     """
+    if target_vars is None:
+        target_vars = TARGET_VARIABLES
+
     idx_url = _build_s3_url(date_str, cycle_hour, lead_hour, ext=".grib2.idx")
     try:
         resp = requests.get(idx_url, timeout=30)
@@ -175,7 +213,7 @@ def _download_variable_gribs(date_str, cycle_hour, lead_hour, tmp_dir):
 
     idx_records = _parse_idx(resp.text)
     try:
-        ranges = _compute_byte_ranges(idx_records, TARGET_VARIABLES)
+        ranges = _compute_byte_ranges(idx_records, target_vars)
     except ValueError as e:
         print(f"    {e}")
         return None
@@ -197,6 +235,103 @@ def _download_variable_gribs(date_str, cycle_hour, lead_hour, tmp_dir):
 
 
 # ---------------------------------------------------------------------------
+# GRIB / grid helpers
+# ---------------------------------------------------------------------------
+
+def _get_var(ds, candidates):
+    """Return first name from candidates found in ds.data_vars, else first var."""
+    return next((n for n in candidates if n in ds.data_vars), list(ds.data_vars)[0])
+
+
+def _texas_slices(lat, lon):
+    """Return (y_slice, x_slice) for Texas bounding box on a 2D HRRR grid.
+
+    Args:
+        lat: 2D latitude array.
+        lon: 2D longitude array in -180/180 convention.
+
+    Returns:
+        (y_slice, x_slice), or (None, None) if no grid points found.
+    """
+    mask = (
+        (lat >= TEXAS_LAT_MIN) & (lat <= TEXAS_LAT_MAX)
+        & (lon >= TEXAS_LON_MIN) & (lon <= TEXAS_LON_MAX)
+    )
+    y_idx, x_idx = np.where(mask)
+    if len(y_idx) == 0:
+        return None, None
+    return slice(y_idx.min(), y_idx.max() + 1), slice(x_idx.min(), x_idx.max() + 1)
+
+
+def _open_wind_at_height(grib_path, level):
+    """Open cfgrib datasets for U and V wind at a specific height above ground.
+
+    Args:
+        grib_path: Path to a (partial) GRIB2 file.
+        level: Height above ground in metres (e.g. 10 or 80).
+
+    Returns:
+        Tuple (ds_u, ds_v).
+    """
+    filt = {"typeOfLevel": "heightAboveGround", "level": level}
+    ds_u = xr.open_dataset(
+        grib_path, engine="cfgrib",
+        backend_kwargs={"filter_by_keys": {**filt, "shortName": "u"}},
+    )
+    ds_v = xr.open_dataset(
+        grib_path, engine="cfgrib",
+        backend_kwargs={"filter_by_keys": {**filt, "shortName": "v"}},
+    )
+    return ds_u, ds_v
+
+
+# ---------------------------------------------------------------------------
+# Power law helpers
+# ---------------------------------------------------------------------------
+
+def _compute_power_law_alpha(si_low, si_high, z_low=_Z_LOW, z_high=_Z_HIGH):
+    """Compute per-pixel Hellmann exponent from two wind speed measurements.
+
+    alpha = ln(si_high / si_low) / ln(z_high / z_low)
+
+    Falls back to _ALPHA_DEFAULT (1/7) where either speed is below _MIN_SPEED.
+
+    Args:
+        si_low: Wind speed array at z_low [m/s].
+        si_high: Wind speed array at z_high [m/s].
+        z_low: Height of lower measurement [m].
+        z_high: Height of upper measurement [m].
+
+    Returns:
+        alpha array (float32), same shape as inputs.
+    """
+    valid = (si_low >= _MIN_SPEED) & (si_high >= _MIN_SPEED)
+    ratio = np.where(valid, si_high / si_low, 1.0)
+    return np.where(
+        valid,
+        np.log(ratio) / np.log(z_high / z_low),
+        _ALPHA_DEFAULT,
+    ).astype(np.float32)
+
+
+def _extrapolate_wind_speed(si_ref, alpha, z_ref=_Z_HIGH, z_target=_Z_TARGET):
+    """Extrapolate wind speed to z_target using the power law.
+
+    si_target = si_ref * (z_target / z_ref) ** alpha
+
+    Args:
+        si_ref: Wind speed at z_ref [m/s].
+        alpha: Hellmann exponent array.
+        z_ref: Reference height [m].
+        z_target: Target height [m].
+
+    Returns:
+        Wind speed at z_target (float32).
+    """
+    return (si_ref * (z_target / z_ref) ** alpha).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Texas extraction (returns field arrays, does not save)
 # ---------------------------------------------------------------------------
 
@@ -204,10 +339,18 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
     """Extract Texas bounding box from a partial HRRR GRIB2.
 
     Opens the GRIB2 file with cfgrib, subsets the 2D Lambert Conformal grid
-    to the Texas bounding box, computes wind speed/direction from U/V.
+    to the Texas bounding box, computes wind speed/direction at 10m and 80m,
+    and extrapolates to 100m via the wind profile power law.
+
+    Args:
+        grib_path: Path to the combined partial GRIB2 file.
+        date_str: 'YYYYMMDD'.
+        cycle_hour: UTC initialization hour.
+        lead_hour: Forecast lead time in hours.
 
     Returns:
-        Dict with keys: lat2d, lon2d, t2m, si10, wdir10, init_time, valid_time
+        Dict with keys: lat2d, lon2d, t2m, si10, wdir10, si80, wdir80,
+        si100, wdir100, alpha, init_time, valid_time.
         All spatial arrays are float32, shape (ny, nx).
         Returns None on any error.
     """
@@ -216,14 +359,16 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "2t"}},
         )
-        ds_u = xr.open_dataset(
+        ds_u10 = xr.open_dataset(
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "10u"}},
         )
-        ds_v = xr.open_dataset(
+        ds_v10 = xr.open_dataset(
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "10v"}},
         )
+        # cfgrib shortName for 80m wind is 'u'/'v' (no height prefix like '10u')
+        ds_u80, ds_v80 = _open_wind_at_height(grib_path, level=80)
     except Exception as e:
         print(f"    Error opening GRIB: {e}")
         return None
@@ -237,19 +382,10 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
             return None
 
         lon_180 = np.where(lon > 180, lon - 360, lon)
-
-        texas_mask = (
-            (lat >= TEXAS_LAT_MIN) & (lat <= TEXAS_LAT_MAX)
-            & (lon_180 >= TEXAS_LON_MIN) & (lon_180 <= TEXAS_LON_MAX)
-        )
-        y_idx, x_idx = np.where(texas_mask)
-
-        if len(y_idx) == 0:
+        y_slice, x_slice = _texas_slices(lat, lon_180)
+        if y_slice is None:
             print("    No grid points in Texas bounding box")
             return None
-
-        y_slice = slice(y_idx.min(), y_idx.max() + 1)
-        x_slice = slice(x_idx.min(), x_idx.max() + 1)
 
         init_time = np.datetime64(
             f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T{cycle_hour:02d}:00"
@@ -259,27 +395,20 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
         lat2d = lat[y_slice, x_slice]
         lon2d = lon_180[y_slice, x_slice]
 
-        # Temperature
-        temp_var = next(
-            (n for n in ["t2m", "t", "tmp"] if n in ds_tmp.data_vars),
-            list(ds_tmp.data_vars)[0],
-        )
-        t2m = ds_tmp[temp_var].values[y_slice, x_slice].astype(np.float32)
+        t2m = ds_tmp[_get_var(ds_tmp, ["t2m", "t", "tmp"])].values[y_slice, x_slice].astype(np.float32)
 
-        # Wind components → speed and direction
-        u_var = next(
-            (n for n in ["u10", "10u", "ugrd"] if n in ds_u.data_vars),
-            list(ds_u.data_vars)[0],
-        )
-        v_var = next(
-            (n for n in ["v10", "10v", "vgrd"] if n in ds_v.data_vars),
-            list(ds_v.data_vars)[0],
-        )
-        u = ds_u[u_var].values[y_slice, x_slice]
-        v = ds_v[v_var].values[y_slice, x_slice]
+        u10 = ds_u10[_get_var(ds_u10, ["u10", "10u", "ugrd"])].values[y_slice, x_slice]
+        v10 = ds_v10[_get_var(ds_v10, ["v10", "10v", "vgrd"])].values[y_slice, x_slice]
+        si10 = np.sqrt(u10**2 + v10**2).astype(np.float32)
+        wdir10 = ((270 - np.degrees(np.arctan2(v10, u10))) % 360).astype(np.float32)
 
-        si10 = np.sqrt(u**2 + v**2).astype(np.float32)
-        wdir10 = ((270 - np.degrees(np.arctan2(v, u))) % 360).astype(np.float32)
+        u80 = ds_u80[_get_var(ds_u80, ["u", "u80", "ugrd"])].values[y_slice, x_slice]
+        v80 = ds_v80[_get_var(ds_v80, ["v", "v80", "vgrd"])].values[y_slice, x_slice]
+        si80 = np.sqrt(u80**2 + v80**2).astype(np.float32)
+        wdir80 = ((270 - np.degrees(np.arctan2(v80, u80))) % 360).astype(np.float32)
+
+        alpha = _compute_power_law_alpha(si10, si80)
+        si100 = _extrapolate_wind_speed(si80, alpha)
 
         return {
             "lat2d": lat2d,
@@ -287,6 +416,11 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
             "t2m": t2m,
             "si10": si10,
             "wdir10": wdir10,
+            "si80": si80,
+            "wdir80": wdir80,
+            "si100": si100,
+            "wdir100": wdir80,  # power law scales magnitude only; direction unchanged
+            "alpha": alpha,
             "init_time": init_time,
             "valid_time": valid_time,
         }
@@ -297,8 +431,10 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
 
     finally:
         ds_tmp.close()
-        ds_u.close()
-        ds_v.close()
+        ds_u10.close()
+        ds_v10.close()
+        ds_u80.close()
+        ds_v80.close()
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +444,9 @@ def _extract_texas_fields(grib_path, date_str, cycle_hour, lead_hour):
 def _save_combined_nc(output_path, all_lead_data):
     """Save a combined NetCDF with all variables and lead times for one (day, cycle).
 
-    All variables (t2m, si10, wdir10) and all lead times are packed into a
-    single file with dims (lead_hour, y, x). lat/lon coordinates are stored
-    once, eliminating the redundancy of the old per-element file format.
+    All variables (t2m, si10, wdir10, si80, wdir80, si100, wdir100, alpha) and
+    all lead times are packed into a single file with dims (lead_hour, y, x).
+    lat/lon coordinates are stored once.
 
     Args:
         output_path: Full path to the output .nc file.
@@ -320,9 +456,8 @@ def _save_combined_nc(output_path, all_lead_data):
     leads_sorted = sorted(all_lead_data.keys())
     first = all_lead_data[leads_sorted[0]]
 
-    t2m = np.stack([all_lead_data[lh]["t2m"] for lh in leads_sorted], axis=0)
-    si10 = np.stack([all_lead_data[lh]["si10"] for lh in leads_sorted], axis=0)
-    wdir10 = np.stack([all_lead_data[lh]["wdir10"] for lh in leads_sorted], axis=0)
+    def _stack(key):
+        return np.stack([all_lead_data[lh][key] for lh in leads_sorted], axis=0)
 
     valid_times = np.array(
         [all_lead_data[lh]["valid_time"] for lh in leads_sorted],
@@ -331,9 +466,14 @@ def _save_combined_nc(output_path, all_lead_data):
 
     ds = xr.Dataset(
         {
-            "t2m":    (["lead_hour", "y", "x"], t2m),
-            "si10":   (["lead_hour", "y", "x"], si10),
-            "wdir10": (["lead_hour", "y", "x"], wdir10),
+            "t2m":    (["lead_hour", "y", "x"], _stack("t2m")),
+            "si10":   (["lead_hour", "y", "x"], _stack("si10")),
+            "wdir10": (["lead_hour", "y", "x"], _stack("wdir10")),
+            "si80":   (["lead_hour", "y", "x"], _stack("si80")),
+            "wdir80": (["lead_hour", "y", "x"], _stack("wdir80")),
+            "si100":  (["lead_hour", "y", "x"], _stack("si100")),
+            "wdir100":(["lead_hour", "y", "x"], _stack("wdir100")),
+            "alpha":  (["lead_hour", "y", "x"], _stack("alpha")),
         },
         coords={
             "latitude":   (["y", "x"], first["lat2d"]),
@@ -346,13 +486,25 @@ def _save_combined_nc(output_path, all_lead_data):
             "source": "NOAA HRRR (3km)",
             "product": "wrfsfcf",
             "time_zone": "UTC",
-            "variables": "t2m [K], si10 [m/s], wdir10 [degrees meteorological]",
+            "variables": (
+                "t2m [K], si10 [m/s], wdir10 [deg], "
+                "si80 [m/s], wdir80 [deg], "
+                "si100 [m/s] (power-law from 10m+80m), wdir100 [deg], "
+                "alpha [dimensionless Hellmann exponent]"
+            ),
             "lead_hours": str(leads_sorted),
+            "power_law": (
+                f"alpha = ln(si80/si10) / ln({_Z_HIGH}/{_Z_LOW}); "
+                f"si100 = si80 * ({_Z_TARGET}/{_Z_HIGH})^alpha; "
+                f"default alpha = {_ALPHA_DEFAULT:.4f} when si < {_MIN_SPEED} m/s"
+            ),
         },
     )
 
-    encoding = {v: {"zlib": True, "complevel": 5, "dtype": "float32"}
-                for v in ["t2m", "si10", "wdir10"]}
+    encoding = {
+        v: {"zlib": True, "complevel": 5, "dtype": "float32"}
+        for v in ["t2m", "si10", "wdir10", "si80", "wdir80", "si100", "wdir100", "alpha"]
+    }
     ds.to_netcdf(output_path, encoding=encoding)
 
 
@@ -366,13 +518,14 @@ def download_hrrr_month(year, month, base_dir=None):
     For each day × 24 cycles:
         1. Check if combined output NetCDF already exists (skip if so)
         2. For each lead time: download partial GRIB via byte-range
-        3. Extract Texas and compute wind speed/direction from each lead GRIB
+           (TMP:2m, UGRD/VGRD:10m, UGRD/VGRD:80m)
+        3. Extract Texas; compute wind speed/direction at 10m, 80m, and 100m
+           (100m via wind profile power law)
         4. Write one combined NetCDF with all variables and lead times
         5. Clean up temp files
 
     Output files:
         {base_dir}/{year}/{month:02d}/hrrr_{HH}z_{YYYYMMDD}.nc
-        ~744 files/month (vs 4,464 in the old per-element format)
 
     Args:
         year: Calendar year.
@@ -449,6 +602,155 @@ def download_hrrr_month(year, month, base_dir=None):
 
 
 # ---------------------------------------------------------------------------
+# Backfill patch for existing files (adds 80m / 100m wind)
+# ---------------------------------------------------------------------------
+
+_80M_VARS = ["UGRD:80 m above ground", "VGRD:80 m above ground"]
+
+
+def patch_hrrr_100m_wind_month(year, month, base_dir=None):
+    """Add 80m and 100m wind variables to existing HRRR combined NetCDF files.
+
+    Used to backfill months that were downloaded before 100m wind support was
+    added. For each existing hrrr_HHz_YYYYMMDD.nc that lacks si80:
+        1. Downloads only UGRD/VGRD:80m byte ranges from S3
+        2. Computes si80, wdir80 for Texas; derives alpha and si100 using si10
+           already stored in the file
+        3. Patches the file in-place with si80, wdir80, si100, wdir100, alpha
+
+    Args:
+        year: Calendar year.
+        month: Calendar month (1–12).
+        base_dir: Root output directory. Defaults to {raw}/hrrr_data.
+    """
+    if base_dir is None:
+        dirs = setup_directories()
+        base_dir = os.path.join(dirs["raw"], "hrrr_data")
+
+    output_dir = os.path.join(base_dir, str(year), f"{month:02d}")
+    if not os.path.isdir(output_dir):
+        print(f"  Directory not found: {output_dir}")
+        return
+
+    num_days = calendar.monthrange(year, month)[1]
+    n_patched = n_skipped = n_failed = 0
+
+    for day in range(1, num_days + 1):
+        date_str = f"{year}{month:02d}{day:02d}"
+
+        for cycle in ALL_CYCLES:
+            output_path = os.path.join(output_dir, f"hrrr_{cycle:02d}z_{date_str}.nc")
+            if not os.path.exists(output_path):
+                continue
+
+            try:
+                with xr.open_dataset(output_path) as ds_orig:
+                    if "si80" in ds_orig.data_vars:
+                        n_skipped += 1
+                        continue
+                    ds_orig.load()
+            except Exception as e:
+                print(f"  Cannot open hrrr_{cycle:02d}z_{date_str}.nc: {e}")
+                n_failed += 1
+                continue
+
+            with tempfile.TemporaryDirectory() as tmp:
+                all_80m = {}
+                failed = False
+
+                for lead in LEAD_TIMES:
+                    grib_path = _download_variable_gribs(
+                        date_str, cycle, lead, tmp, target_vars=_80M_VARS
+                    )
+                    if grib_path is None:
+                        print(f"  {date_str} {cycle:02d}z f{lead:02d}: 80m download failed")
+                        failed = True
+                        break
+
+                    try:
+                        ds_u80, ds_v80 = _open_wind_at_height(grib_path, level=80)
+                    except Exception as e:
+                        print(f"  {date_str} {cycle:02d}z f{lead:02d}: GRIB open failed — {e}")
+                        failed = True
+                        break
+
+                    try:
+                        lat = ds_u80.latitude.values
+                        lon_180 = np.where(ds_u80.longitude.values > 180,
+                                           ds_u80.longitude.values - 360,
+                                           ds_u80.longitude.values)
+                        y_slice, x_slice = _texas_slices(lat, lon_180)
+                        if y_slice is None:
+                            print(f"  {date_str} {cycle:02d}z: no Texas points in 80m GRIB")
+                            failed = True
+                        else:
+                            u80 = ds_u80[_get_var(ds_u80, ["u", "u80"])].values[y_slice, x_slice]
+                            v80 = ds_v80[_get_var(ds_v80, ["v", "v80"])].values[y_slice, x_slice]
+                            wdir80 = ((270 - np.degrees(np.arctan2(v80, u80))) % 360).astype(np.float32)
+                            all_80m[lead] = {
+                                "si80": np.sqrt(u80**2 + v80**2).astype(np.float32),
+                                "wdir80": wdir80,
+                            }
+                    except Exception as e:
+                        print(f"  {date_str} {cycle:02d}z f{lead:02d}: extract failed — {e}")
+                        failed = True
+                    finally:
+                        ds_u80.close()
+                        ds_v80.close()
+
+                    if failed:
+                        break
+
+                if failed or len(all_80m) != len(LEAD_TIMES):
+                    n_failed += 1
+                    continue
+
+                try:
+                    leads_sorted = sorted(all_80m.keys())
+                    si80 = np.stack([all_80m[lh]["si80"] for lh in leads_sorted], axis=0)
+                    wdir80 = np.stack([all_80m[lh]["wdir80"] for lh in leads_sorted], axis=0)
+                    alpha = _compute_power_law_alpha(ds_orig["si10"].values, si80)
+                    si100 = _extrapolate_wind_speed(si80, alpha)
+
+                    dims = ["lead_hour", "y", "x"]
+                    ds_new = ds_orig.assign({
+                        "si80":   (dims, si80),
+                        "wdir80": (dims, wdir80),
+                        "si100":  (dims, si100),
+                        "wdir100":(dims, wdir80),
+                        "alpha":  (dims, alpha),
+                    })
+                    ds_new.attrs["power_law"] = (
+                        f"alpha = ln(si80/si10) / ln({_Z_HIGH}/{_Z_LOW}); "
+                        f"si100 = si80 * ({_Z_TARGET}/{_Z_HIGH})^alpha; "
+                        f"default alpha = {_ALPHA_DEFAULT:.4f} when si < {_MIN_SPEED} m/s"
+                    )
+
+                    tmp_out = output_path + ".tmp"
+                    enc_new = {
+                        v: {"zlib": True, "complevel": 5, "dtype": "float32"}
+                        for v in ["si80", "wdir80", "si100", "wdir100", "alpha"]
+                    }
+                    ds_new.to_netcdf(tmp_out, encoding=enc_new)
+                    os.replace(tmp_out, output_path)
+                    n_patched += 1
+
+                except Exception as e:
+                    print(f"  {date_str} {cycle:02d}z: patch save failed — {e}")
+                    tmp_out = output_path + ".tmp"
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                    n_failed += 1
+
+            time.sleep(0.05)
+
+        print(f"  {year}-{month:02d}-{day:02d}: patch cycle done")
+
+    print(f"\n  HRRR {year}-{month:02d} patch: "
+          f"{n_patched} patched, {n_skipped} already done, {n_failed} failed")
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -467,8 +769,9 @@ def main():
     print(f"  Period: {year}-{month:02d} ({num_days} days)")
     print(f"  Cycles: All 24 hourly (00z–23z)")
     print(f"  Lead times: {LEAD_TIMES} hours")
-    print(f"  Variables: TMP:2m, UGRD:10m, VGRD:10m → t2m, si10, wdir10")
-    print(f"  Method: Byte-range download (~6 MB per GRIB vs ~150 MB full)")
+    print(f"  Variables: TMP:2m, UGRD/VGRD:10m, UGRD/VGRD:80m → t2m, si10, wdir10, si80, wdir80, si100, wdir100, alpha")
+    print(f"  100m wind: power-law extrapolation (alpha from 10m+80m)")
+    print(f"  Method: Byte-range download (~8 MB per GRIB vs ~150 MB full)")
     print(f"  Output format: 1 combined NetCDF per (day, cycle) — all vars + leads")
     print(f"  Output files: {total_files} (vs {total_files * 6} in old per-element format)")
     print(f"  Output: {base_dir}/{year}/{month:02d}/")

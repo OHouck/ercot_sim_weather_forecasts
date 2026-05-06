@@ -2,9 +2,9 @@
 
 Downloads GFS global forecast GRIB2 files from the NOAA GFS archive on S3
 (bucket: noaa-gfs-bdp-pds), using byte-range requests to download only
-TMP:2m, UGRD:10m, VGRD:10m fields (~3 MB vs ~300 MB per file). Extracts the
-Texas bounding box, computes wind speed/direction from U/V components, and
-saves as compressed NetCDF.
+TMP:2m, UGRD:10m, VGRD:10m, UGRD:100m, VGRD:100m fields (~4 MB vs ~300 MB
+per file). Extracts the Texas bounding box, computes wind speed/direction from
+U/V components, and saves as compressed NetCDF.
 
 GFS runs 4 initializations per day (00z, 06z, 12z, 18z). This script downloads
 only the 12z cycle with lead times f018–f041 (24 steps per day). One NetCDF
@@ -17,7 +17,8 @@ S3 path pattern:
 
 Output:
     {base_dir}/{element}/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
-    Elements: temp (t2m [K]), wspd (si10 [m/s]), wdir (wdir10 [degrees])
+    Elements: temp (t2m [K]), wspd (si10 [m/s]), wdir (wdir10 [degrees]),
+              wspd100 (si100 [m/s]), wdir100 (wdir100 [degrees])
 
 Usage:
     # Single month
@@ -69,10 +70,12 @@ TARGET_VARIABLES = [
     "TMP:2 m above ground",
     "UGRD:10 m above ground",
     "VGRD:10 m above ground",
+    "UGRD:100 m above ground",
+    "VGRD:100 m above ground",
 ]
 
 # Output element names (consistent with NDFD/HRRR convention)
-ELEMENTS = ["temp", "wspd", "wdir"]
+ELEMENTS = ["temp", "wspd", "wdir", "wspd100", "wdir100"]
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +207,11 @@ def _download_byte_range(url, byte_start, byte_end, max_retries=3):
 
 
 def _download_variable_gribs(date_str, lead_hour, tmp_dir):
-    """Download the 3 target variable GRIB messages for one GFS forecast step.
+    """Download the target variable GRIB messages for one GFS forecast step.
 
     Steps:
         1. Fetch the .idx file to find byte offsets
-        2. Parse byte ranges for TMP:2m, UGRD:10m, VGRD:10m
+        2. Parse byte ranges for TMP:2m, UGRD/VGRD:10m, UGRD/VGRD:100m
         3. Download each byte range and concatenate into one .grib2 file
 
     Args:
@@ -256,6 +259,11 @@ def _download_variable_gribs(date_str, lead_hour, tmp_dir):
 # Texas extraction and NetCDF saving
 # ---------------------------------------------------------------------------
 
+def _get_var(ds, candidates):
+    """Return first name from candidates found in ds.data_vars, else first var."""
+    return next((n for n in candidates if n in ds.data_vars), list(ds.data_vars)[0])
+
+
 def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
     """Extract Texas bounding box from a partial GFS GRIB2 and save as NetCDF.
 
@@ -273,7 +281,7 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
         lead_hour: Forecast lead time in hours.
 
     Returns:
-        Number of elements successfully saved (0–3).
+        Number of elements successfully saved (0–5).
     """
     output_filename = f"gfs_{CYCLE:02d}z_{date_str}_f{lead_hour:03d}.nc"
 
@@ -282,24 +290,31 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "2t"}},
         )
-        ds_u = xr.open_dataset(
+        ds_u10 = xr.open_dataset(
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "10u"}},
         )
-        ds_v = xr.open_dataset(
+        ds_v10 = xr.open_dataset(
             grib_path, engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "10v"}},
+        )
+        # GFS 100m wind: filter by typeOfLevel + level (shortName filtering is
+        # unreliable for 100m because cfgrib conflicts with other heights).
+        # level=100 returns a single dataset with both u100 and v100.
+        ds_wind100 = xr.open_dataset(
+            grib_path, engine="cfgrib",
+            backend_kwargs={"filter_by_keys": {
+                "typeOfLevel": "heightAboveGround", "level": 100
+            }},
         )
     except Exception as e:
         print(f"    Error opening GRIB: {e}")
         return 0
 
     try:
-        # --- Subset to Texas (GFS lat/lon are 1D regular arrays) --------------
-        # latitude:  1D, values ~90.0 → ~-90.0 (decreasing)
-        # longitude: 1D, values 0.0 → 359.75  (0-360)
+        # GFS lat/lon are 1D regular arrays
         lat = ds_tmp.latitude.values   # shape: (721,)
-        lon = ds_tmp.longitude.values  # shape: (1440,)
+        lon = ds_tmp.longitude.values  # shape: (1440,), 0–360
 
         lat_mask = (lat >= TEXAS_LAT_MIN) & (lat <= TEXAS_LAT_MAX)
         lon_mask = (lon >= TEXAS_LON_MIN_360) & (lon <= TEXAS_LON_MAX_360)
@@ -308,26 +323,20 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
         lon_texas = lon[lon_mask]
 
         if len(lat_texas) == 0 or len(lon_texas) == 0:
-            print(f"    No grid points found in Texas bounding box")
+            print("    No grid points found in Texas bounding box")
             return 0
 
-        # Convert output longitude to -180/180 for consistency with other datasets
         lon_texas_180 = lon_texas - 360.0
 
-        # --- Time coordinates -------------------------------------------------
         init_time = np.datetime64(
             f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T{CYCLE:02d}:00"
         )
         step = np.timedelta64(lead_hour, "h")
         valid_time = init_time + step
 
-        # --- Temperature (t2m) ------------------------------------------------
-        temp_var = next(
-            (name for name in ["t2m", "t"] if name in ds_tmp.data_vars),
-            list(ds_tmp.data_vars)[0],
-        )
-        temp_vals = ds_tmp[temp_var].values  # shape: (721, 1440)
-        temp_texas = temp_vals[lat_mask, :][:, lon_mask]  # (n_lat_TX, n_lon_TX)
+        # Temperature
+        temp_vals = ds_tmp[_get_var(ds_tmp, ["t2m", "t"])].values
+        temp_texas = temp_vals[lat_mask, :][:, lon_mask]
 
         ds_temp_out = xr.Dataset(
             {"t2m": (["latitude", "longitude"], temp_texas.astype(np.float32))},
@@ -347,22 +356,12 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
             },
         )
 
-        # --- Wind components (u10, v10) → speed and direction -----------------
-        u_var = next(
-            (name for name in ["u10", "10u", "ugrd"] if name in ds_u.data_vars),
-            list(ds_u.data_vars)[0],
-        )
-        v_var = next(
-            (name for name in ["v10", "10v", "vgrd"] if name in ds_v.data_vars),
-            list(ds_v.data_vars)[0],
-        )
+        # 10m wind
+        u10 = ds_u10[_get_var(ds_u10, ["u10", "10u", "ugrd"])].values[lat_mask, :][:, lon_mask]
+        v10 = ds_v10[_get_var(ds_v10, ["v10", "10v", "vgrd"])].values[lat_mask, :][:, lon_mask]
 
-        u_texas = ds_u[u_var].values[lat_mask, :][:, lon_mask]
-        v_texas = ds_v[v_var].values[lat_mask, :][:, lon_mask]
-
-        wspd = np.sqrt(u_texas**2 + v_texas**2).astype(np.float32)
-        # Meteorological convention: direction wind is coming FROM
-        wdir = ((270 - np.degrees(np.arctan2(v_texas, u_texas))) % 360).astype(np.float32)
+        wspd10 = np.sqrt(u10**2 + v10**2).astype(np.float32)
+        wdir10 = ((270 - np.degrees(np.arctan2(v10, u10))) % 360).astype(np.float32)
 
         wind_coords = {
             "latitude": lat_texas,
@@ -378,26 +377,48 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
         }
 
         ds_wspd_out = xr.Dataset(
-            {"si10": (["latitude", "longitude"], wspd)},
+            {"si10": (["latitude", "longitude"], wspd10)},
             coords=wind_coords,
             attrs={**wind_attrs_base, "units": "m/s",
                    "description": "10m wind speed (computed from U/V)"},
         )
         ds_wdir_out = xr.Dataset(
-            {"wdir10": (["latitude", "longitude"], wdir)},
+            {"wdir10": (["latitude", "longitude"], wdir10)},
             coords=wind_coords,
             attrs={**wind_attrs_base, "units": "degrees",
                    "description": "10m wind direction (meteorological convention)"},
         )
 
-        # --- Write compressed NetCDF ------------------------------------------
+        # 100m wind (native GFS output — no extrapolation needed)
+        u100 = ds_wind100[_get_var(ds_wind100, ["u100", "u"])].values[lat_mask, :][:, lon_mask]
+        v100 = ds_wind100[_get_var(ds_wind100, ["v100", "v"])].values[lat_mask, :][:, lon_mask]
+
+        wspd100 = np.sqrt(u100**2 + v100**2).astype(np.float32)
+        wdir100 = ((270 - np.degrees(np.arctan2(v100, u100))) % 360).astype(np.float32)
+
+        ds_wspd100_out = xr.Dataset(
+            {"si100": (["latitude", "longitude"], wspd100)},
+            coords=wind_coords,
+            attrs={**wind_attrs_base, "units": "m/s",
+                   "description": "100m wind speed (computed from U/V)"},
+        )
+        ds_wdir100_out = xr.Dataset(
+            {"wdir100": (["latitude", "longitude"], wdir100)},
+            coords=wind_coords,
+            attrs={**wind_attrs_base, "units": "degrees",
+                   "description": "100m wind direction (meteorological convention)"},
+        )
+
+        # Write compressed NetCDF per element
         encoding_f32 = {"zlib": True, "complevel": 5, "dtype": "float32"}
         saved = 0
 
         for element, ds_out, var_name in [
-            ("temp", ds_temp_out, "t2m"),
-            ("wspd", ds_wspd_out, "si10"),
-            ("wdir", ds_wdir_out, "wdir10"),
+            ("temp",    ds_temp_out,    "t2m"),
+            ("wspd",    ds_wspd_out,    "si10"),
+            ("wdir",    ds_wdir_out,    "wdir10"),
+            ("wspd100", ds_wspd100_out, "si100"),
+            ("wdir100", ds_wdir100_out, "wdir100"),
         ]:
             out_path = os.path.join(output_dirs[element], output_filename)
             ds_out.to_netcdf(out_path, encoding={var_name: encoding_f32})
@@ -411,8 +432,9 @@ def _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead_hour):
 
     finally:
         ds_tmp.close()
-        ds_u.close()
-        ds_v.close()
+        ds_u10.close()
+        ds_v10.close()
+        ds_wind100.close()
 
 
 # ---------------------------------------------------------------------------
@@ -423,10 +445,10 @@ def download_gfs_month(year, month, base_dir=None):
     """Download GFS 12z forecasts for one month and extract Texas.
 
     For each day × 25 lead times (f018–f041):
-        1. Check if all 3 output NetCDFs already exist (skip if so)
-        2. Fetch .idx to find byte offsets for TMP:2m, UGRD:10m, VGRD:10m
+        1. Check if all 5 output NetCDFs already exist (skip if so)
+        2. Fetch .idx to find byte offsets for TMP:2m, UGRD/VGRD:10m, UGRD/VGRD:100m
         3. Download byte ranges and concatenate into a partial GRIB2 file
-        4. Extract Texas, compute wind speed/direction, save 3 NetCDFs
+        4. Extract Texas, compute wind speed/direction at 10m and 100m, save 5 NetCDFs
         5. Clean up temp files
 
     Args:
@@ -438,6 +460,8 @@ def download_gfs_month(year, month, base_dir=None):
         {base_dir}/temp/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
         {base_dir}/wspd/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
         {base_dir}/wdir/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
+        {base_dir}/wspd100/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
+        {base_dir}/wdir100/{year}/{month:02d}/gfs_12z_{YYYYMMDD}_f{FFF:03d}.nc
     """
     if base_dir is None:
         dirs = setup_directories()
@@ -463,7 +487,6 @@ def download_gfs_month(year, month, base_dir=None):
         for lead in LEAD_TIMES:
             output_filename = f"gfs_{CYCLE:02d}z_{date_str}_f{lead:03d}.nc"
 
-            # Skip if all 3 element files already exist
             all_exist = all(
                 os.path.exists(os.path.join(output_dirs[el], output_filename))
                 for el in ELEMENTS
@@ -484,15 +507,15 @@ def download_gfs_month(year, month, base_dir=None):
 
                 saved = _extract_texas_from_gfs(grib_path, output_dirs, date_str, lead)
 
-                if saved == 3:
+                if saved == len(ELEMENTS):
                     day_success += 1
                     total_success += 1
                 else:
-                    print(f"  {date_str} f{lead:03d}: only {saved}/3 elements saved")
+                    print(f"  {date_str} f{lead:03d}: only {saved}/{len(ELEMENTS)} elements saved")
                     day_failed += 1
                     total_failed += 1
 
-            time.sleep(0.1)  # brief pause to avoid S3 throttling
+            time.sleep(0.1)
 
         status_parts = [f"{day_success} ok"]
         if day_skipped:
@@ -532,12 +555,12 @@ def main():
     print(f"  Cycle:         {CYCLE:02d}z (12 UTC only)")
     print(f"  Lead times:    f{LEAD_TIMES[0]:03d}–f{LEAD_TIMES[-1]:03d} "
           f"({len(LEAD_TIMES)} steps per day)")
-    print(f"  Variables:     TMP:2m, UGRD:10m, VGRD:10m → temp, wspd, wdir")
+    print(f"  Variables:     TMP:2m, UGRD/VGRD:10m, UGRD/VGRD:100m → temp, wspd, wdir, wspd100, wdir100")
     print(f"  Grid:          0.25-degree global lat/lon (GFS pgrb2.0p25)")
-    print(f"  Method:        Byte-range download (~3 MB per file vs ~300 MB full)")
+    print(f"  Method:        Byte-range download (~4 MB per file vs ~300 MB full)")
     print(f"  S3 bucket:     {S3_BUCKET}")
-    print(f"  Downloads:     {total_files} GRIB files × 3 byte-ranges each")
-    print(f"  Output files:  {total_files} per element × 3 elements = {total_files * 3}")
+    print(f"  Downloads:     {total_files} GRIB files × 5 byte-ranges each")
+    print(f"  Output files:  {total_files} per element × {len(ELEMENTS)} elements = {total_files * len(ELEMENTS)}")
     print(f"  Output dir:    {base_dir}")
     print(f"  Texas grid:    ~44 lat × 53 lon points at 0.25°")
 

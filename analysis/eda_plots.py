@@ -12,6 +12,9 @@ plot_forecast_error_distributions    — overlaid PDFs of HRRR 1h and GFS day-ah
 plot_eda_combined                    — single 3-panel figure combining both plots
 plot_forecast_error_correlation_grid — 4×4 pairplot of cross-model error correlations
 plot_mean_forecast_error_maps        — 2×2 cartopy maps of per-pixel mean error
+plot_forecast_error_vs_realized      — 2×2 panels of error vs ERA5 realized value for
+                                       temp and wind, HRRR 1h and GFS day-ahead;
+                                       shows whether errors grow at observed extremes
 
 Usage
 -----
@@ -134,21 +137,22 @@ def _load_era5_errors(months, dirs, model, lead):
     return {"temp": np.concatenate(temp_chunks), "wspd": np.concatenate(wspd_chunks)}
 
 
-def _load_pixel_hourly_errors(months, dirs):
-    """Load error columns from pixel_hourly parquet files for given months.
+def _load_pixel_hourly_errors(months, dirs, columns=None):
+    """Load columns from pixel_hourly parquet files for given months.
 
-    Returns a DataFrame with columns: latitude, longitude, and the four error
-    variables defined in _ERROR_VARS.
+    Returns a DataFrame with the requested columns (defaults to latitude,
+    longitude, and the four error variables defined in _ERROR_VARS).
     """
     lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
-    error_cols = ["latitude", "longitude"] + [col for col, _ in _ERROR_VARS]
+    if columns is None:
+        columns = ["latitude", "longitude"] + [col for col, _ in _ERROR_VARS]
     chunks = []
     for year, month in months:
         path = lmp_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
         if not path.exists():
             print(f"  [WARNING] Missing parquet: {path.name}")
             continue
-        df = pd.read_parquet(path, columns=error_cols)
+        df = pd.read_parquet(path, columns=columns)
         chunks.append(df)
         print(f"  Loaded {year}-{month:02d}: {len(df):,} rows")
     if not chunks:
@@ -242,25 +246,20 @@ def _draw_curtailment_panel(ax, wind_vals, solar_vals):
 def _draw_error_panel(ax, hrrr_vals, gfs_vals, xlabel, xlim, bin_width):
     """Draw overlaid error histograms + KDE with mean annotations onto ax."""
     rng = np.random.default_rng(42)
-    def _sub(arr, n=500_000):
-        return rng.choice(arr, size=n, replace=False) if len(arr) > n else arr
-
     bins = np.arange(xlim[0], xlim[1] + bin_width, bin_width)
 
     for vals_full, color, label in [
         (hrrr_vals, C_HRRR, "HRRR 1h"),
         (gfs_vals,  C_GFS,  "GFS day-ahead"),
     ]:
-        vals = _sub(vals_full)
+        vals = rng.choice(vals_full, size=500_000, replace=False) if len(vals_full) > 500_000 else vals_full
         ax.hist(vals, bins=bins, density=True,
                 color=color, alpha=0.25, edgecolor="none")
         kde = gaussian_kde(vals, bw_method=0.15)
         x_grid = np.linspace(xlim[0], xlim[1], 800)
         ax.plot(x_grid, kde(x_grid), color=color, linewidth=2.0, label=label)
 
-        # Mean vertical line + label
         mean_val = np.mean(vals_full)
-        ymax = ax.get_ylim()[1]
         ax.axvline(mean_val, color=color, linestyle="--", linewidth=1.2, alpha=0.85)
 
     ax.axvline(0, color="black", linewidth=0.8, linestyle="-", alpha=0.4)
@@ -488,8 +487,8 @@ def plot_shadow_station_geolocation(months=None, save_dir=None):
         ax.set_extent([-106.8, -93.0, 25.5, 36.8], crs=ccrs.PlateCarree())
         ax.gridlines(draw_labels=True, linewidth=0.4, color="gray", alpha=0.4)
 
-        n_matched = int(len(matched))
-        n_unmatched = int(len(unmatched))
+        n_matched = len(matched)
+        n_unmatched = len(unmatched)
         ax.set_title(
             f"Shadow Substation Geolocation ({year}-{month:02d})\n"
             f"Matched: {n_matched} | Unmatched: {n_unmatched}",
@@ -576,8 +575,8 @@ def plot_shadow_station_geolocation(months=None, save_dir=None):
         ax.set_extent([-106.8, -93.0, 25.5, 36.8], crs=ccrs.PlateCarree())
         ax.gridlines(draw_labels=True, linewidth=0.4, color="gray", alpha=0.4)
 
-        n_matched = int(len(matched_combined))
-        n_unmatched = int(len(unmatched_combined))
+        n_matched = len(matched_combined)
+        n_unmatched = len(unmatched_combined)
         ax.set_title(
             f"Shadow Substation Geolocation ({year}) — All Months Combined\n"
             f"Matched: {n_matched} | Unmatched: {n_unmatched}",
@@ -809,6 +808,109 @@ def plot_mean_forecast_error_maps(months=None, save_dir=None):
     return out_path
 
 
+def _draw_error_vs_realized_panel(ax, realized, error, xlabel, color, n_bins=50):
+    """Draw scatter + binned mean error ± 1σ band vs ERA5 realized value onto ax.
+
+    Args:
+        ax: Matplotlib Axes.
+        realized: 1-D numpy array of ERA5 observed values.
+        error: 1-D numpy array of forecast errors aligned with realized.
+        xlabel: X-axis label string.
+        color: Line/band colour for the binned summary.
+        n_bins: Number of equal-width bins across the [0.5, 99.5] percentile range.
+    """
+    mask = ~(np.isnan(realized) | np.isnan(error))
+    realized_c = realized[mask]
+    error_c = error[mask]
+
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(realized_c), size=200_000, replace=False) if len(realized_c) > 200_000 else np.arange(len(realized_c))
+    ax.scatter(
+        realized_c[idx], error_c[idx],
+        alpha=0.04, s=1, color="gray", rasterized=True,
+    )
+
+    lo, hi = np.percentile(realized_c, [0.5, 99.5])
+    edges = np.linspace(lo, hi, n_bins + 1)
+    mids = (edges[:-1] + edges[1:]) / 2
+    means = np.full(n_bins, np.nan)
+    stds = np.full(n_bins, np.nan)
+    bin_idx = np.clip(np.digitize(realized_c, edges) - 1, 0, n_bins - 1)
+    agg = pd.DataFrame({"b": bin_idx, "e": error_c}).groupby("b")["e"].agg(["mean", "std", "count"])
+    enough = agg[agg["count"] >= 20]
+    means[enough.index] = enough["mean"].values
+    stds[enough.index] = enough["std"].values
+
+    valid = ~np.isnan(means)
+    ax.plot(mids[valid], means[valid], color=color, linewidth=2.0, label="Mean error")
+    ax.fill_between(
+        mids[valid], means[valid] - stds[valid], means[valid] + stds[valid],
+        alpha=0.20, color=color, label="±1σ",
+    )
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="-", alpha=0.4)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel("Forecast error [forecast − ERA5]", fontsize=9)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="both", alpha=0.25, linewidth=0.5)
+
+
+def plot_forecast_error_vs_realized(months=None, save_dir=None):
+    """2×2 figure: forecast error vs ERA5 realized value for temp/wind × 1h/day-ahead.
+
+    Shows whether forecast skill degrades at extreme observed values
+    (heteroscedasticity or non-linearity). X-axis is the ERA5 realized value;
+    Y-axis is forecast − ERA5. Each panel shows a subsampled scatter overlaid
+    with the binned mean error and a ±1σ band.
+
+    Layout:
+        Row 0: temperature — HRRR 1h (left), GFS day-ahead (right)
+        Row 1: wind speed  — HRRR 1h (left), GFS day-ahead (right)
+
+    Args:
+        months: List of (year, month) tuples. Defaults to DEFAULT_MONTHS.
+        save_dir: Optional figure output directory.
+
+    Returns:
+        Path to saved figure.
+    """
+    if months is None:
+        months = DEFAULT_MONTHS
+    dirs = setup_directories()
+    if save_dir is None:
+        save_dir = Path(dirs["figures"]) / "eda"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    print("Loading error-vs-realized data...")
+    _cols = ["era5_temp", "era5_wspd", "temp_error_1h", "wspd_error_1h", "temp_error_0h", "wspd_error_0h"]
+    df = _load_pixel_hourly_errors(months, dirs, columns=_cols)
+
+    panels = [
+        ("era5_temp", "temp_error_1h",  C_HRRR, "ERA5 realized temperature (°C)",  "HRRR 1h — Temperature Error"),
+        ("era5_temp", "temp_error_0h",  C_GFS,  "ERA5 realized temperature (°C)",  "GFS Day-Ahead — Temperature Error"),
+        ("era5_wspd", "wspd_error_1h",  C_HRRR, "ERA5 realized wind speed (m/s)",  "HRRR 1h — Wind Speed Error"),
+        ("era5_wspd", "wspd_error_0h",  C_GFS,  "ERA5 realized wind speed (m/s)",  "GFS Day-Ahead — Wind Speed Error"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    fig.suptitle(
+        "Forecast Error vs Realized Value — ERA5 Grid, Texas (2025)",
+        fontsize=11, fontweight="bold",
+    )
+
+    for ax, (realized_col, error_col, color, xlabel, title) in zip(axes.flat, panels):
+        _draw_error_vs_realized_panel(
+            ax, df[realized_col].values, df[error_col].values, xlabel, color
+        )
+        ax.set_title(title, fontsize=9, fontweight="bold")
+
+    fig.tight_layout()
+    out_path = Path(save_dir) / "forecast_error_vs_realized.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+    return out_path
+
+
 def plot_std_forecast_error_maps(months=None, save_dir=None):
     """2×2 cartopy maps showing per-pixel forecast error standard deviation.
 
@@ -919,11 +1021,12 @@ def run_eda_plots(months=None):
     return {
         # "shadow_cost":     plot_shadow_cost_distribution(months=months),
         # "forecast_errors": plot_forecast_error_distributions(months=months),
-        "combined":        plot_eda_combined(months=months),
+        # "combined":        plot_eda_combined(months=months),
         # "shadow_geolocation": plot_shadow_station_geolocation(months=months),
-        "error_correlation_grid": plot_forecast_error_correlation_grid(months=months),
-        "mean_error_maps":        plot_mean_forecast_error_maps(months=months),
-        "std_error_maps":         plot_std_forecast_error_maps(months=months),
+        # "error_correlation_grid":  plot_forecast_error_correlation_grid(months=months),
+        # "mean_error_maps":         plot_mean_forecast_error_maps(months=months),
+        # "std_error_maps":          plot_std_forecast_error_maps(months=months),
+        "error_vs_realized":       plot_forecast_error_vs_realized(months=months),
     }
 
 
