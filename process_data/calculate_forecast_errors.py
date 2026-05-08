@@ -113,6 +113,33 @@ def _to_central(timestamps):
     return result.iloc[0] if scalar else result.reset_index(drop=True)
 
 
+def _era5_central_times(ds):
+    """Convert an ERA5 xarray Dataset's valid_time to US/Central, deduplicating DST fold.
+
+    ERA5 datasets use UTC valid_time. This converts to tz-naive US/Central and
+    removes the duplicate hour produced during the DST fall-back (e.g. Nov clocks-back
+    maps two consecutive UTC hours to the same local time; keep the first occurrence).
+
+    Args:
+        ds: xarray Dataset with a valid_time coordinate (UTC, tz-naive).
+
+    Returns:
+        Tuple (central_dt64, keep_idx):
+            central_dt64: 1D numpy datetime64[ns] array of deduplicated Central times.
+            keep_idx:     1D int array of indices into ds.valid_time that were kept.
+    """
+    utc_times = pd.to_datetime(ds.valid_time.values)
+    central = _to_central(pd.Series(utc_times))
+    dt64 = pd.DatetimeIndex(central).values
+    _, keep_idx = np.unique(dt64, return_index=True)
+    keep_idx = np.sort(keep_idx)
+    if len(keep_idx) < len(dt64):
+        n_dup = len(dt64) - len(keep_idx)
+        print(f"  WARNING: {n_dup} duplicate Central timestamp(s) from DST fall-back; "
+              f"keeping first occurrence")
+    return dt64[keep_idx], keep_idx
+
+
 # ── Forecast lead-time filtering ──────────────────────────────────────────────
 
 def _filter_forecasts(forecasts, lead_hours=None, collapse_leads=False):
@@ -897,6 +924,8 @@ def _compute_era5_gridded_errors(
     fc_lats, fc_lons,
     regrid_method='bin',
     bin_map_cache_path=None, force_rebuild_bin_map=False,
+    wspd100_forecasts=None, wdir100_forecasts=None,
+    era5_wind100m_ds=None,
 ):
     """Compute forecast errors vs ERA5 using regridding and xarray merge.
 
@@ -911,10 +940,15 @@ def _compute_era5_gridded_errors(
     After regridding, forecast and ERA5 datasets are merged using xr.merge() on
     shared coordinates, and errors are computed via xarray subtraction.
 
+    100m wind errors are computed when wspd100_forecasts, wdir100_forecasts, and
+    era5_wind100m_ds are all provided. ERA5 100m wind (0.25° single-levels) is
+    interpolated to the ERA5-Land 0.1° grid via U/V decomposition + bilinear
+    interpolation. If any 100m source is missing, 100m errors are silently skipped.
+
     Args:
         temp_forecasts: List of forecast record dicts from load_forecasts() for temperature.
-        wspd_forecasts: Same for wind speed.
-        wdir_forecasts: Same for wind direction.
+        wspd_forecasts: Same for 10m wind speed.
+        wdir_forecasts: Same for 10m wind direction.
         era5_ds: xarray Dataset opened from ERA5-Land NetCDF (t2m in K, wspd, wdir).
         out_dir: Output directory.
         year, month: For output filename.
@@ -927,9 +961,15 @@ def _compute_era5_gridded_errors(
                             when regrid_method='bin'). None disables caching.
         force_rebuild_bin_map: Passed through to _build_hrrr_to_era5_bin_map (only used
                                when regrid_method='bin'). Defaults to False.
+        wspd100_forecasts: Optional list of forecast record dicts for 100m wind speed
+                           (HRRR: si100 variable; GFS: si100 from wspd100/ dir).
+        wdir100_forecasts: Optional list of forecast record dicts for 100m wind direction.
+        era5_wind100m_ds: Optional ERA5 100m wind xarray Dataset from era5_wind100m_*.nc
+                          (reanalysis-era5-single-levels, 0.25°, with u100/v100 vars).
 
     Returns:
-        Summary DataFrame with per-cell, per-lead-time error statistics.
+        Summary DataFrame with per-cell, per-lead-time error statistics. Includes
+        wspd100_mae, wspd100_bias, wdir100_mae columns when 100m data is available.
     """
     # ── Step 1: Index forecasts by (valid_time, lead_hours) ──────────────
     temp_index = {(r['valid_time'], r['lead_hours']): r['data'] for r in temp_forecasts}
@@ -1009,6 +1049,39 @@ def _compute_era5_gridded_errors(
 
     print(f"    Regridded {n_regridded} forecast fields total")
 
+    # ── Step 3.5: Regrid 100m wind forecast fields ────────────────────────────
+    has_100m = (
+        wspd100_forecasts is not None and len(wspd100_forecasts) > 0
+        and wdir100_forecasts is not None and len(wdir100_forecasts) > 0
+        and era5_wind100m_ds is not None
+    )
+    fc_wspd100_arr = fc_wdir100_arr = None
+
+    if has_100m:
+        wspd100_index = {(r['valid_time'], r['lead_hours']): r['data'] for r in wspd100_forecasts}
+        wdir100_index = {(r['valid_time'], r['lead_hours']): r['data'] for r in wdir100_forecasts}
+        keys_100m = sorted(set(wspd100_index.keys()) & set(wdir100_index.keys()))
+        print(f"  Regridding {len(keys_100m)} 100m wind forecast fields...")
+
+        fc_wspd100_arr = np.full(shape, np.nan, dtype=np.float32)
+        fc_wdir100_arr = np.full(shape, np.nan, dtype=np.float32)
+
+        for vt, lh in keys_100m:
+            if vt not in time_to_idx or lh not in lead_to_idx:
+                continue
+            ti, li = time_to_idx[vt], lead_to_idx[lh]
+            if use_interp:
+                fc_wspd100_arr[ti, li], fc_wdir100_arr[ti, li] = _regrid_regular_wind_to_era5(
+                    wspd100_index[(vt, lh)], wdir100_index[(vt, lh)],
+                    fc_lats, fc_lons, era5_lats, era5_lons,
+                )
+            else:
+                fc_wspd100_arr[ti, li], fc_wdir100_arr[ti, li] = _regrid_wind_to_era5(
+                    wspd100_index[(vt, lh)], wdir100_index[(vt, lh)],
+                    bin_lat_idx, bin_lon_idx, valid_mask, n_lat, n_lon,
+                )
+        print(f"    Regridded {len(keys_100m)} 100m wind fields")
+
     # Convert forecast temp from K to °C
     fc_temp_arr -= 273.15
 
@@ -1028,23 +1101,15 @@ def _compute_era5_gridded_errors(
             'longitude':  ('longitude', era5_lons),
         },
     )
+    if has_100m:
+        fc_ds['forecast_wspd100'] = (['valid_time', 'lead_hours', 'latitude', 'longitude'],
+                                      fc_wspd100_arr)
+        fc_ds['forecast_wdir100'] = (['valid_time', 'lead_hours', 'latitude', 'longitude'],
+                                      fc_wdir100_arr)
 
     # ── Step 5: Build ERA5 observations xarray Dataset ───────────────────
-    # Convert ERA5 times (UTC) to US/Central to match forecast valid_times
-    era5_times_utc = pd.to_datetime(era5_ds.valid_time.values)
-    era5_times_central = _to_central(pd.Series(era5_times_utc))
-    era5_central_dt64 = pd.DatetimeIndex(era5_times_central).values
-
-    # Deduplicate Central timestamps: DST fall-back (e.g. Nov clocks-back) maps
-    # two consecutive UTC hours to the same tz-naive local time.  np.unique returns
-    # sorted unique values and the index of their first occurrence.
-    _, keep_idx = np.unique(era5_central_dt64, return_index=True)
-    keep_idx = np.sort(keep_idx)  # restore chronological order
-    if len(keep_idx) < len(era5_central_dt64):
-        n_dup = len(era5_central_dt64) - len(keep_idx)
-        print(f"  WARNING: {n_dup} duplicate ERA5 Central timestamp(s) from DST "
-              f"fall-back; keeping first occurrence")
-        era5_central_dt64 = era5_central_dt64[keep_idx]
+    # Convert ERA5-Land times to US/Central; deduplicate DST fall-back fold hour.
+    era5_central_dt64, keep_idx = _era5_central_times(era5_ds)
 
     # Land mask: cells where ERA5 t2m is all NaN across time are ocean
     era5_t2m_vals = era5_ds['t2m'].values[keep_idx]  # (n_era5_times, n_lat, n_lon)
@@ -1067,12 +1132,46 @@ def _compute_era5_gridded_errors(
         },
     )
 
+    # ── Step 5.5: Build ERA5 100m wind observations ───────────────────────────
+    # ERA5 100m wind (reanalysis-era5-single-levels, 0.25°) is interpolated to
+    # the ERA5-Land 0.1° grid via U/V decomposition + bilinear interpolation.
+    era5_100m_obs = None
+    if has_100m:
+        era5_100m_dt64, keep_100m = _era5_central_times(era5_wind100m_ds)
+
+        # Interpolate U/V from ERA5 0.25° to ERA5-Land 0.1° (all times at once)
+        u100_rg = era5_wind100m_ds['u100'].isel(valid_time=keep_100m).interp(
+            latitude=era5_lats, longitude=era5_lons, method='linear',
+        ).values.astype(np.float32)
+        v100_rg = era5_wind100m_ds['v100'].isel(valid_time=keep_100m).interp(
+            latitude=era5_lats, longitude=era5_lons, method='linear',
+        ).values.astype(np.float32)
+
+        era5_wspd100 = np.sqrt(u100_rg**2 + v100_rg**2)
+        era5_wdir100 = (np.degrees(np.arctan2(-u100_rg, -v100_rg)) % 360).astype(np.float32)
+
+        era5_100m_obs = xr.Dataset(
+            {
+                'era5_wspd100': (['valid_time', 'latitude', 'longitude'], era5_wspd100),
+                'era5_wdir100': (['valid_time', 'latitude', 'longitude'], era5_wdir100),
+            },
+            coords={
+                'valid_time': ('valid_time', era5_100m_dt64),
+                'latitude':   ('latitude', era5_lats),
+                'longitude':  ('longitude', era5_lons),
+            },
+        )
+        print(f"  ERA5 100m wind interpolated to ERA5-Land grid: {len(era5_100m_dt64)} steps")
+
     # ── Step 6: Merge forecast and ERA5 on shared coordinates ────────────
     # ERA5 has dims (valid_time, lat, lon); forecast has (valid_time, lead_hours, lat, lon).
     # xr.merge with join='inner' keeps only shared valid_times and auto-broadcasts
     # ERA5 across the lead_hours dimension.
     print(f"  Merging forecast and ERA5 datasets...")
-    merged = xr.merge([fc_ds, era5_obs], join='inner')
+    datasets_to_merge = [fc_ds, era5_obs]
+    if era5_100m_obs is not None:
+        datasets_to_merge.append(era5_100m_obs)
+    merged = xr.merge(datasets_to_merge, join='inner')
     print(f"  Merged dataset: {dict(merged.sizes)}")
 
     # ── Step 7: Compute errors via xarray operations ─────────────────────
@@ -1092,6 +1191,15 @@ def _compute_era5_gridded_errors(
         if 'lead_hours' not in merged[era5_var].dims:
             merged[era5_var] = merged[era5_var].broadcast_like(merged['forecast_temp'])
 
+    # 100m wind errors (when 100m data was available and survived the inner merge)
+    if 'forecast_wspd100' in merged and 'era5_wspd100' in merged:
+        merged['wspd100_error'] = merged['forecast_wspd100'] - merged['era5_wspd100']
+        wdir100_diff = abs(merged['forecast_wdir100'] - merged['era5_wdir100'])
+        merged['wdir100_error'] = xr.where(wdir100_diff > 180, 360 - wdir100_diff, wdir100_diff)
+        for era5_var in ['era5_wspd100', 'era5_wdir100']:
+            if 'lead_hours' not in merged[era5_var].dims:
+                merged[era5_var] = merged[era5_var].broadcast_like(merged['forecast_wspd100'])
+
     # Apply land mask: set ocean cells to NaN
     # Use xr.where (not direct numpy assignment) because broadcast_like
     # may produce read-only views.
@@ -1100,10 +1208,15 @@ def _compute_era5_gridded_errors(
         merged[var] = merged[var].where(land_da)
 
     # ── Step 8: Save output NetCDF ───────────────────────────────────────
-    ds_out = merged[['temp_error', 'wspd_error', 'wdir_error',
-                      'forecast_temp', 'era5_temp',
-                      'forecast_wspd', 'era5_wspd',
-                      'forecast_wdir', 'era5_wdir']]
+    out_vars = ['temp_error', 'wspd_error', 'wdir_error',
+                'forecast_temp', 'era5_temp',
+                'forecast_wspd', 'era5_wspd',
+                'forecast_wdir', 'era5_wdir']
+    if 'wspd100_error' in merged:
+        out_vars += ['wspd100_error', 'wdir100_error',
+                     'forecast_wspd100', 'era5_wspd100',
+                     'forecast_wdir100', 'era5_wdir100']
+    ds_out = merged[out_vars]
 
     # Metadata
     ds_out['valid_time'].attrs.update({
@@ -1118,6 +1231,11 @@ def _compute_era5_gridded_errors(
         ds_out[v].attrs['units'] = 'm/s'
     for v in ['wdir_error', 'forecast_wdir', 'era5_wdir']:
         ds_out[v].attrs['units'] = 'degrees (0-360)'
+    if 'wspd100_error' in ds_out:
+        for v in ['wspd100_error', 'forecast_wspd100', 'era5_wspd100']:
+            ds_out[v].attrs['units'] = 'm/s'
+        for v in ['wdir100_error', 'forecast_wdir100', 'era5_wdir100']:
+            ds_out[v].attrs['units'] = 'degrees (0-360)'
     ds_out.attrs['forecast_model'] = model_name
     if use_interp:
         ds_out.attrs['description'] = (
@@ -1144,9 +1262,13 @@ def _compute_era5_gridded_errors(
 
     # ── Step 9: Compute summary statistics ───────────────────────────────
     # Extract error arrays from the merged dataset for summary computation
-    temp_err = merged['temp_error'].values   # (n_times_merged, n_leads, n_lat, n_lon)
-    wspd_err = merged['wspd_error'].values
-    wdir_err = merged['wdir_error'].values
+    temp_err  = merged['temp_error'].values   # (n_times_merged, n_leads, n_lat, n_lon)
+    wspd_err  = merged['wspd_error'].values
+    wdir_err  = merged['wdir_error'].values
+    has_100m_err = 'wspd100_error' in merged
+    if has_100m_err:
+        wspd100_err = merged['wspd100_error'].values
+        wdir100_err = merged['wdir100_error'].values
 
     import warnings
     station_summaries = []
@@ -1159,18 +1281,24 @@ def _compute_era5_gridded_errors(
         # that have all-NaN time series; those cells are skipped below.
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
-            temp_mae = np.nanmean(np.abs(te), axis=0)   # (n_lat, n_lon)
+            temp_mae  = np.nanmean(np.abs(te), axis=0)   # (n_lat, n_lon)
             temp_bias = np.nanmean(te, axis=0)
-            wspd_mae = np.nanmean(np.abs(we), axis=0)
+            wspd_mae  = np.nanmean(np.abs(we), axis=0)
             wspd_bias = np.nanmean(we, axis=0)
-            wdir_mae = np.nanmean(np.abs(de), axis=0)
+            wdir_mae  = np.nanmean(np.abs(de), axis=0)
+            if has_100m_err:
+                we100 = wspd100_err[:, li]
+                de100 = wdir100_err[:, li]
+                wspd100_mae  = np.nanmean(np.abs(we100), axis=0)
+                wspd100_bias = np.nanmean(we100, axis=0)
+                wdir100_mae  = np.nanmean(np.abs(de100), axis=0)
         n_obs = np.sum(~np.isnan(te), axis=0)
 
         for yi in range(n_lat):
             for xi in range(n_lon):
                 if not land_mask[yi, xi] or n_obs[yi, xi] == 0:
                     continue
-                station_summaries.append({
+                row = {
                     'cell_id': f'era5_{yi}_{xi}',
                     'lat': float(era5_lats[yi]),
                     'lon': float(era5_lons[xi]),
@@ -1181,7 +1309,14 @@ def _compute_era5_gridded_errors(
                     'wspd_mae': float(wspd_mae[yi, xi]),
                     'wspd_bias': float(wspd_bias[yi, xi]),
                     'wdir_mae': float(wdir_mae[yi, xi]),
-                })
+                }
+                if has_100m_err:
+                    row.update({
+                        'wspd100_mae':  float(wspd100_mae[yi, xi]),
+                        'wspd100_bias': float(wspd100_bias[yi, xi]),
+                        'wdir100_mae':  float(wdir100_mae[yi, xi]),
+                    })
+                station_summaries.append(row)
 
     summary_df = pd.DataFrame(station_summaries)
     summary_path = os.path.join(out_dir, 'error_summary.csv')
@@ -1192,9 +1327,12 @@ def _compute_era5_gridded_errors(
     for lead in sorted(summary_df['lead_hours'].unique()):
         s = summary_df[summary_df['lead_hours'] == lead]
         print(f"\n  {model_name} vs ERA5 — Lead {lead}h ({len(s)} cells):")
-        print(f"    Temp MAE:  {s['temp_mae'].mean():.2f} °C  (bias: {s['temp_bias'].mean():+.2f})")
-        print(f"    Wspd MAE:  {s['wspd_mae'].mean():.2f} m/s (bias: {s['wspd_bias'].mean():+.2f})")
-        print(f"    Wdir MAE:  {s['wdir_mae'].mean():.2f}°")
+        print(f"    Temp MAE:   {s['temp_mae'].mean():.2f} °C  (bias: {s['temp_bias'].mean():+.2f})")
+        print(f"    Wspd MAE:   {s['wspd_mae'].mean():.2f} m/s (bias: {s['wspd_bias'].mean():+.2f})")
+        print(f"    Wdir MAE:   {s['wdir_mae'].mean():.2f}°")
+        if 'wspd100_mae' in s.columns:
+            print(f"    Wspd100 MAE:{s['wspd100_mae'].mean():.2f} m/s (bias: {s['wspd100_bias'].mean():+.2f})")
+            print(f"    Wdir100 MAE:{s['wdir100_mae'].mean():.2f}°")
 
     return summary_df
 
@@ -1266,6 +1404,18 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
     print(f"Loading ERA5-Land data from {era5_nc}...")
     era5_ds = xr.open_dataset(era5_nc)
 
+    # ── Load ERA5 100m wind (optional, same directory as ERA5-Land) ──────────
+    era5_wind100m_nc = os.path.join(
+        raw_dir, 'era5_land', str(year), f'{month:02d}',
+        f'era5_wind100m_{year}{month:02d}.nc',
+    )
+    if os.path.exists(era5_wind100m_nc):
+        print(f"Loading ERA5 100m wind from {era5_wind100m_nc}...")
+        era5_wind100m_ds = xr.open_dataset(era5_wind100m_nc)
+    else:
+        print(f"  ERA5 100m wind not found; skipping 100m errors")
+        era5_wind100m_ds = None
+
     # ── Get forecast grid lat/lon from a sample file ──
     if model_lower == 'hrrr':
         fc_month_dir = os.path.join(fc_base, str(year), f'{month:02d}')
@@ -1302,6 +1452,29 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
     print(f"  Loaded {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
           f"{len(wdir_forecasts)} wdir forecast fields")
 
+    # ── Load 100m forecast wind ───────────────────────────────────────────────
+    wspd100_forecasts = wdir100_forecasts = None
+    try:
+        if model_lower == 'hrrr':
+            # 100m wind is in the same combined files as 10m; variable names si100/wdir100
+            wspd100_forecasts = load_hrrr_forecasts(fc_base, 'si100', year, month)
+            wdir100_forecasts = load_hrrr_forecasts(fc_base, 'wdir100', year, month)
+        else:
+            # GFS stores 100m wind in separate wspd100/ and wdir100/ element directories
+            wspd100_dir = os.path.join(fc_base, 'wspd100')
+            wdir100_dir = os.path.join(fc_base, 'wdir100')
+            wspd100_forecasts = load_forecasts(wspd100_dir, 'si100', year, month)
+            wdir100_forecasts = load_forecasts(wdir100_dir, 'wdir100', year, month)
+    except Exception as e:
+        print(f"  WARNING: Could not load 100m wind forecasts ({e}); skipping 100m errors")
+        wspd100_forecasts = wdir100_forecasts = None
+
+    if wspd100_forecasts:
+        print(f"  Loaded {len(wspd100_forecasts)} wspd100, "
+              f"{len(wdir100_forecasts)} wdir100 forecast fields")
+    else:
+        wspd100_forecasts = wdir100_forecasts = None  # ensure None not []
+
     # Apply lead-time filtering and optional collapse
     effective_leads = lead_hours if lead_hours is not None else cfg.get('default_lead_hours')
     collapse = cfg.get('collapse_leads', False)
@@ -1309,10 +1482,16 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
     temp_forecasts = _filter_forecasts(temp_forecasts, effective_leads, collapse)
     wspd_forecasts = _filter_forecasts(wspd_forecasts, effective_leads, collapse)
     wdir_forecasts = _filter_forecasts(wdir_forecasts, effective_leads, collapse)
+    if wspd100_forecasts is not None:
+        wspd100_forecasts = _filter_forecasts(wspd100_forecasts, effective_leads, collapse)
+        wdir100_forecasts = _filter_forecasts(wdir100_forecasts, effective_leads, collapse)
 
     if effective_leads is not None or collapse:
         print(f"  After filtering: {len(temp_forecasts)} temp, {len(wspd_forecasts)} wspd, "
               f"{len(wdir_forecasts)} wdir fields (leads={effective_leads}, collapse={collapse})")
+        if wspd100_forecasts is not None:
+            print(f"  After filtering: {len(wspd100_forecasts)} wspd100, "
+                  f"{len(wdir100_forecasts)} wdir100 fields")
 
     # ── Regrid forecasts, merge with ERA5, compute errors ──────────────────
     regrid_method = cfg['regrid_method']
@@ -1332,8 +1511,13 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
         regrid_method=regrid_method,
         bin_map_cache_path=bin_map_cache_path,
         force_rebuild_bin_map=force_rebuild_bin_map,
+        wspd100_forecasts=wspd100_forecasts,
+        wdir100_forecasts=wdir100_forecasts,
+        era5_wind100m_ds=era5_wind100m_ds,
     )
     era5_ds.close()
+    if era5_wind100m_ds is not None:
+        era5_wind100m_ds.close()
     return summary
 
 
