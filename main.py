@@ -29,17 +29,6 @@ dirs = setup_directories()
 # slow (hours) but idempotent — existing files are skipped.  Uncomment
 # individual blocks only when you need to (re-)download specific datasets.
 
-# =============================================================================
-# STEP 1a: Download NDFD weather forecasts from NOAA S3
-# Downloads GRIB2 files, extracts Texas bounding box, saves as NetCDF.
-# ~30-60 min per element per month. Skips files that already exist.
-# (Not used in the main HRRR+GFS pipeline — kept for reference.)
-# =============================================================================
-# from download_data.pull_ndfd import download_12z_forecasts_month
-# ndfd_base = os.path.join(dirs['raw'], 'ndfd_data')
-# for year, month in MONTHS:
-#     for element in ['temp', 'wspd', 'wdir']:
-#         download_12z_forecasts_month(element, year, month, ndfd_base)
 
 # =============================================================================
 # STEP 1b-i: Download HRRR weather forecasts from NOAA S3
@@ -72,16 +61,6 @@ dirs = setup_directories()
 #     download_era5_month(year, month, base_dir=dirs['raw'])
 
 # =============================================================================
-# STEP 2: Download realized weather observations from NOAA ISD
-# Pulls hourly temperature and wind data for ~200 Texas weather stations.
-# ~1 min per month. Skips stations already downloaded.
-# =============================================================================
-# from download_data.pull_weatherstation import download_month as download_weather
-# for year, month in MONTHS:
-#     print(f"\n=== Downloading ISD weather station data for {year}-{month:02d} ===")
-#     download_weather(year, month)
-
-# =============================================================================
 # STEP 3: Download ERCOT market data (DAM SPP + RT SPP + load + forecasts)
 # Day-ahead and real-time settlement point prices. Requires ERCOT API
 # credentials in ~/keys/. ~30 min per month. Skips days already downloaded.
@@ -89,13 +68,6 @@ dirs = setup_directories()
 # from download_data.pull_ercot import download_month as download_ercot
 # for year, month in MONTHS:
 #     download_ercot(year, month)
-
-# =============================================================================
-# STEP 3b: Download SCED shadow prices from ERCOT API
-# Transmission congestion data (NP6-86-CD). ~2-4 hours for all 12 months.
-# =============================================================================
-# from download_data.pull_sced_shadow import download_shadow_year
-# download_shadow_year(2025)
 
 # =============================================================================
 # STEP 4a: Download NP4-160 settlement point mapping from ERCOT MIS
@@ -127,16 +99,6 @@ dirs = setup_directories()
 #                     DATA PROCESSING (Steps 5–7)
 # #############################################################################
 
-# =============================================================================
-# STEP 5a: Calculate forecast errors at weather station locations
-# Interpolates gridded forecasts to station lat/lon (nearest neighbor),
-# compares to ISD hourly observations, and saves per-station error CSVs.
-# Requires Steps 1 and 2. ~2 min per month per model.
-# =============================================================================
-# from process_data.calculate_forecast_errors import calculate_station_errors_for_month
-# for year, month in MONTHS:
-#     calculate_station_errors_for_month(year, month, model='hrrr')
-#     calculate_station_errors_for_month(year, month, model='gfs')
 
 # =============================================================================
 # STEP 5b: Calculate ERA5-based gridded forecast errors
@@ -164,35 +126,10 @@ dirs = setup_directories()
 # congestion metrics, and curtailment into one parquet per month.
 # Requires Steps 5b, 5c, 3, 3b.
 # =============================================================================
-# from process_data.create_pixel_level_data import build_pixel_hourly_dataset
-# for year, month in MONTHS:
-#     build_pixel_hourly_dataset(year, month, force_rebuild=True)
-
-# =============================================================================
-# STEP 5e: Build node x hour dataset
-# Links each ERCOT resource node's LMP to weather forecast errors.
-# Requires Steps 4c, 5b, 3.
-# =============================================================================
-# from process_data.prepare_node_level_data import prepare_node_level_data
-# prepare_node_level_data(
-#     months=MONTHS,
-#     error_source='era5',
-#     force_rebuild=True,
-# )
-
-# =============================================================================
-# STEP 6: Build cluster x hour dataset
-# Clusters ERCOT nodes geographically + by LMP, aggregates to cluster level.
-# Requires Step 5e.
-# =============================================================================
-# from process_data.prepare_cluster_level_data import build_cluster_hourly_data
-# build_cluster_hourly_data(
-#     months=MONTHS,
-#     n_clusters=7,
-#     geo_weight=2.0,
-#     n_neighbors=8,
-#     force_rebuild=True,
-# )
+from process_data.create_pixel_level_data import build_pixel_hourly_dataset
+for year, month in MONTHS:
+    build_pixel_hourly_dataset(year, month, force_rebuild=True)
+exit()
 
 
 # #############################################################################

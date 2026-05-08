@@ -387,21 +387,15 @@ def build_pixel_hourly_dataset(year, month, models=None, force_rebuild=False):
         how='left',
     )
 
-    # ── Step 5: Merge congestion metrics (if shadow data exists) ──
+    # ── Step 5: Merge congestion metrics ──
     try:
-        from process_data.process_congestion import (
-            merge_congestion_system, merge_congestion_local,
-        )
+        from process_data.process_congestion import merge_congestion_system
         print("Step 5: Merging congestion metrics...")
         pixel_hourly = merge_congestion_system(pixel_hourly, year, month)
-        print(f"  Added system congestion columns: "
-              f"n_binding_constraints, total_shadow_cost, etc.")
-        pixel_hourly = merge_congestion_local(pixel_hourly, year, month)
-        n_local = (pixel_hourly['local_shadow_cost'] > 0).sum()
-        print(f"  Added local congestion columns: "
-              f"{n_local:,} pixel-hours with local_shadow_cost > 0")
+        print(f"  Added congestion columns: "
+              f"economic_congestion_cost, zone_lmp_spread_mw, system_lambda")
     except FileNotFoundError:
-        print("Step 5: Shadow price data not found — skipping congestion merge.")
+        print("Step 5: Congestion data not found — skipping congestion merge.")
 
     # ── Step 6: Merge curtailment metrics (if SCED disclosure data exists) ──
     try:

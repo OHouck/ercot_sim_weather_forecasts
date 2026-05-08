@@ -1522,5 +1522,4 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
 
 
 if __name__ == '__main__':
-    calculate_station_errors_for_month(2025, 7, model='hrrr')
-    # calculate_station_errors_for_month(2025, 7, model='gfs')
+    calculate_era5_errors_for_month(2025, 1, model='hrrr', force_rebuild_bin_map=False)
