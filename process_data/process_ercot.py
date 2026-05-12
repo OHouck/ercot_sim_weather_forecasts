@@ -3,6 +3,7 @@
 import os
 import re
 import glob
+import calendar
 import difflib
 import xml.etree.ElementTree as ET
 import numpy as np
@@ -983,6 +984,148 @@ def compute_hourly_load_by_lz(year, month):
         )
 
     return result.reset_index(drop=True)
+
+_FUEL_RENAME = {
+    'Biomass': 'biomass',
+    'Coal':    'coal',
+    'Gas':     'gas',
+    'Gas-CC':  'gas_cc',
+    'Hydro':   'hydro',
+    'Nuclear': 'nuclear',
+    'Other':   'other',
+    'Solar':   'solar',
+    'WSL':     'storage',
+    'Wind':    'wind',
+}
+
+
+def process_generation_mix(year, month):
+    """Read ERCOT generation mix data for a single month.
+
+    Reads from dirs['raw']/ercot/generation_mix/IntGenbyFuel{year}.xlsx.
+    Each sheet has one row per (date × fuel type) and 96 columns for
+    15-minute intervals (0:15 … 23:45, then 0:00 = midnight of the next day).
+
+    Args:
+        year: Integer year.
+        month: Integer month.
+
+    Returns:
+        DataFrame with columns: time (15-min resolution), biomass, coal, gas,
+        gas_cc, hydro, nuclear, other, solar, wind, storage [MW].
+    """
+    dirs = setup_directories()
+    xl_path = os.path.join(dirs['raw'], 'ercot', 'generation_mix', f'IntGenbyFuel{year}.xlsx')
+    if not os.path.exists(xl_path):
+        raise FileNotFoundError(
+            f"Generation mix file not found: {xl_path}\n"
+            "Download from https://www.ercot.com/gridinfo/generation"
+        )
+
+    sheet = calendar.month_abbr[month]
+    raw = pd.read_excel(xl_path, sheet_name=sheet, header=None)
+
+    time_cols = raw.iloc[0, 4:].tolist()   # 96 interval labels: '0:15' … '23:45', '0:00'
+    df = raw.iloc[1:]
+    df.columns = ['date', 'fuel', 'settlement_type', 'total'] + time_cols
+    df = df[df['fuel'].isin(_FUEL_RENAME)].copy()
+
+    df_long = df.melt(
+        id_vars=['date', 'fuel'],
+        value_vars=time_cols,
+        var_name='interval_label',
+        value_name='mw',
+    )
+
+    # "0:00" is the last column and means midnight of the following day, not current day.
+    # DST clock-change rows carry annotations like "1:15 (DST)" — strip before parsing.
+    clean = df_long['interval_label'].str.replace(r'\s*\(.*\)', '', regex=True).str.strip()
+    hm = clean.str.split(':', expand=True).astype(int)
+    offset = pd.to_timedelta(hm[0] * 60 + hm[1], unit='min')
+    df_long['time'] = (
+        pd.to_datetime(df_long['date'])
+        + offset
+        + pd.to_timedelta(((hm[0] == 0) & (hm[1] == 0)).astype(int), unit='D')
+    )
+    df_long['fuel'] = df_long['fuel'].map(_FUEL_RENAME)
+
+    # pivot_table (not pivot) because DST fall-back creates duplicate timestamps
+    # for the repeated 1 AM hour; aggfunc='first' keeps the CDT reading.
+    result = (
+        df_long
+        .pivot_table(index='time', columns='fuel', values='mw', aggfunc='first')
+        .reset_index()
+    )
+    result.columns.name = None
+
+    fuel_cols = [c for c in _FUEL_RENAME.values() if c in result.columns]
+    result = result[['time'] + fuel_cols]
+
+    # Drop next-month midnight row (last "0:00" of the final day belongs to month+1)
+    result = result[result['time'].dt.month == month].reset_index(drop=True)
+
+    print(f"Loaded generation mix: {len(result)} 15-min intervals for {year}-{month:02d}")
+    return result
+
+
+# CO2 intensity by fuel type in kg CO2 per MWh of electricity generated.
+# = EIA emission coefficients (kg CO2/MMBtu) × heat rates (MMBtu/MWh)
+#
+# Emission coefficients (2022):
+#   https://www.eia.gov/environment/emissions/co2_vol_mass.php
+# Heat rates by prime mover (2024), Table 8.2 — 
+#   https://www.eia.gov/electricity/annual/table.php?t=epa_08_02.html
+
+_CO2_INTENSITY_KG_PER_MWH = {
+    'coal':    934.26,   # bituminous: 93.24 kg/MMBtu × 10.02 MMBtu/MWh
+    'gas':     582.01,   # simple-cycle CT: 52.91 kg/MMBtu × 11.00 MMBtu/MWh
+    'gas_cc':  399.47,   # combined cycle: 52.91 kg/MMBtu × 7.55 MMBtu/MWh
+    'other':   1054.90,  # petroleum coke: 102.12 kg/MMBtu × 10.33 MMBtu/MWh
+    'biomass':   0,
+    'hydro':     0,
+    'nuclear':   0,
+    'solar':     0,
+    'wind':      0,
+    'storage':   0,
+}
+
+
+def compute_generation_emissions(gen_mix_df):
+    """Compute emissions metrics from a generation mix DataFrame.
+
+    Applies per-fuel CO2 intensity factors to produce a hourly or 15-minute
+    time series of total generation, instantaneous CO2 emission rate, and
+    generation-weighted average grid intensity.
+
+    Storage (WSL) values can be negative when charging; these are clipped to
+    zero so charging load does not reduce measured generation or emissions.
+
+    Args:
+        gen_mix_df: DataFrame with a 'time' column and one column per fuel
+            (biomass, coal, gas, gas_cc, hydro, nuclear, other, solar, wind,
+            storage) in MW. Typically the output of process_generation_mix()
+            or its hourly aggregation.
+
+    Returns:
+        DataFrame with columns:
+            time: timestamp (same as input)
+            total_generation_mw: sum of positive generation across all fuels [MW]
+            total_co2_rate_kg_per_h: instantaneous CO2 emission rate [kg CO2/h];
+                equals total CO2 emitted if generation is sustained for one hour
+            avg_intensity_kg_per_mwh: generation-weighted average CO2 intensity
+                [kg CO2/MWh]; NaN when total generation is zero
+    """
+    fuel_cols = [c for c in _CO2_INTENSITY_KG_PER_MWH if c in gen_mix_df.columns]
+    gen = gen_mix_df[fuel_cols].clip(lower=0)
+
+    total_gen = gen.sum(axis=1)
+    total_co2 = sum(gen[f] * _CO2_INTENSITY_KG_PER_MWH[f] for f in fuel_cols)
+
+    result = gen_mix_df[['time']].copy()
+    result['total_generation_mw'] = total_gen
+    result['total_co2_rate_kg_per_h'] = total_co2
+    result['avg_intensity_kg_per_mwh'] = total_co2 / total_gen.replace(0, float('nan'))
+    return result
 
 
 if __name__ == '__main__':

@@ -34,7 +34,6 @@ import cartopy.io.shapereader as shpreader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from helper_funcs import setup_directories
-from process_data.process_congestion import build_shadow_station_match_tables
 
 DEFAULT_MONTHS = [(2025, m) for m in range(1, 13)]
 
@@ -75,27 +74,46 @@ def _build_texas_mask(lats, lons):
     return mask
 
 
-def _load_hourly_shadow_costs(months, dirs):
-    """Load system-level economic_congestion_cost (one value per hour) for given months.
+def _load_hourly_wide(months, dirs, columns, label=""):
+    """Load one-row-per-hour data from pixel_hourly parquets.
 
-    Returns a 1-D numpy array of non-NaN congestion cost values [$/h].
+    Reads the given columns (plus valid_time), deduplicates to one row per hour,
+    and returns a sorted DataFrame.
+
+    Args:
+        months: List of (year, month) tuples.
+        dirs: Directory dict from setup_directories().
+        columns: List of column names to load (valid_time is always included).
+        label: Optional description for progress messages.
+
+    Returns:
+        DataFrame with valid_time and requested columns, one row per hour, sorted.
     """
     lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
-    values = []
+    chunks = []
     for year, month in months:
         path = lmp_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
         if not path.exists():
             print(f"  [WARNING] Missing parquet: {path.name}")
             continue
-        df = pd.read_parquet(path, columns=["valid_time", "economic_congestion_cost"])
+        df = pd.read_parquet(path, columns=["valid_time"] + columns)
         df["valid_time"] = pd.to_datetime(df["valid_time"])
         df = df.drop_duplicates("valid_time")
-        arr = df["economic_congestion_cost"].dropna().values
-        values.append(arr)
-        print(f"  Loaded congestion costs {year}-{month:02d}: {len(arr):,} hours")
-    if not values:
-        raise RuntimeError("No congestion cost data loaded.")
-    return np.concatenate(values)
+        chunks.append(df)
+        suffix = f" {label}" if label else ""
+        print(f"  Loaded{suffix} {year}-{month:02d}: {len(df):,} hours")
+    if not chunks:
+        raise RuntimeError(f"No{' ' + label if label else ''} data loaded.")
+    return pd.concat(chunks, ignore_index=True).sort_values("valid_time").reset_index(drop=True)
+
+
+def _load_hourly_shadow_costs(months, dirs):
+    """Load system-level economic_congestion_cost (one value per hour) for given months.
+
+    Returns a 1-D numpy array of non-NaN congestion cost values [$/h].
+    """
+    df = _load_hourly_wide(months, dirs, ["economic_congestion_cost"], label="congestion costs")
+    return df["economic_congestion_cost"].dropna().values
 
 
 def _load_era5_errors(months, dirs, model, lead):
@@ -191,26 +209,12 @@ def _load_hourly_curtailment(months, dirs):
 
     Returns dict with keys 'wind' and 'solar', each a 1-D numpy array [MW].
     """
-    lmp_dir = Path(dirs["processed"]) / "combined_hourly_gridded_data"
-    wind_chunks, solar_chunks = [], []
-    for year, month in months:
-        path = lmp_dir / f"pixel_hourly_gfs+hrrr_{year}_{month:02d}.parquet"
-        if not path.exists():
-            print(f"  [WARNING] Missing parquet: {path.name}")
-            continue
-        df = pd.read_parquet(
-            path, columns=["valid_time", "wind_curtailment_mw", "solar_curtailment_mw"]
-        )
-        df["valid_time"] = pd.to_datetime(df["valid_time"])
-        df = df.drop_duplicates("valid_time")
-        wind_chunks.append(df["wind_curtailment_mw"].dropna().values)
-        solar_chunks.append(df["solar_curtailment_mw"].dropna().values)
-        print(f"  Loaded curtailment {year}-{month:02d}: {len(df):,} hours")
-    if not wind_chunks:
-        raise RuntimeError("No curtailment data loaded.")
+    df = _load_hourly_wide(
+        months, dirs, ["wind_curtailment_mw", "solar_curtailment_mw"], label="curtailment"
+    )
     return {
-        "wind": np.concatenate(wind_chunks),
-        "solar": np.concatenate(solar_chunks),
+        "wind": df["wind_curtailment_mw"].dropna().values,
+        "solar": df["solar_curtailment_mw"].dropna().values,
     }
 
 
@@ -384,219 +388,6 @@ def plot_eda_combined(months=None, save_dir=None):
     plt.close(fig)
     print(f"Saved: {out_path}")
     return out_path
-
-
-def plot_shadow_station_geolocation(months=None, save_dir=None):
-    """Map geolocated shadow substations and export yearly aggregate match CSVs.
-
-    Processes each month to generate maps, but consolidates matched/unmatched
-    substations into single yearly CSVs. The yearly CSVs represent the UNION of
-    all unique stations seen across all months in that year (deduplicated by
-    station_name). Note: the set of active transmission substations varies
-    significantly by month (range: 227–372 substations in 2025), so the yearly
-    CSV contains all stations ever geolocated in that year.
-
-    Outputs:
-    - shadow_station_matches_{YYYY}.csv (yearly union, deduplicated by station_name)
-    - shadow_station_unmatched_{YYYY}.csv (yearly union, deduplicated by station_name)
-    - shadow_substation_geolocation_{YYYYMM}.png (monthly individual maps)
-    - shadow_substation_geolocation_{YYYY}_all_months.png (yearly consolidated map)
-
-    Args:
-        months: List of (year, month) tuples. Defaults to DEFAULT_MONTHS.
-        save_dir: Optional figure output directory.
-
-    Returns:
-        Dict with yearly CSV paths and list of monthly figure paths.
-    """
-    if months is None:
-        months = DEFAULT_MONTHS
-    dirs = setup_directories()
-    if save_dir is None:
-        save_dir = Path(dirs["figures"]) / "eda"
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    # Group months by year and collect all matched/unmatched per year
-    yearly_matched = {}  # year -> list of DataFrames
-    yearly_unmatched = {}  # year -> list of DataFrames
-    monthly_figures = []
-
-    matched_cols = [
-        "station_name",
-        "cleaned_name",
-        "matched_source_name",
-        "source",
-        "match_method",
-        "latitude",
-        "longitude",
-    ]
-    unmatched_cols = ["station_name", "cleaned_name"]
-
-    for year, month in months:
-        if year not in yearly_matched:
-            yearly_matched[year] = []
-            yearly_unmatched[year] = []
-
-        matched, unmatched = build_shadow_station_match_tables(year=year, month=month)
-
-        matched = matched[[c for c in matched_cols if c in matched.columns]]
-        unmatched = unmatched[[c for c in unmatched_cols if c in unmatched.columns]]
-
-        yearly_matched[year].append(matched)
-        yearly_unmatched[year].append(unmatched)
-
-        # Generate monthly map figure
-        fig = plt.figure(figsize=(9, 7))
-        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
-
-        states_shp = shpreader.natural_earth(
-            resolution="10m",
-            category="cultural",
-            name="admin_1_states_provinces",
-        )
-        texas_geom = None
-        for record in shpreader.Reader(states_shp).records():
-            if record.attributes.get("name") == "Texas":
-                texas_geom = record.geometry
-                break
-        if texas_geom is None:
-            raise RuntimeError("Texas geometry not found in Natural Earth shapefile.")
-
-        ax.add_geometries(
-            [texas_geom],
-            crs=ccrs.PlateCarree(),
-            facecolor="#f8f8f8",
-            edgecolor="black",
-            linewidth=1.0,
-            zorder=1,
-        )
-
-        if not matched.empty:
-            ax.scatter(
-                matched["longitude"],
-                matched["latitude"],
-                s=16,
-                color="#1f77b4",
-                alpha=0.8,
-                transform=ccrs.PlateCarree(),
-                zorder=3,
-                label="Matched substations",
-            )
-
-        ax.set_extent([-106.8, -93.0, 25.5, 36.8], crs=ccrs.PlateCarree())
-        ax.gridlines(draw_labels=True, linewidth=0.4, color="gray", alpha=0.4)
-
-        n_matched = len(matched)
-        n_unmatched = len(unmatched)
-        ax.set_title(
-            f"Shadow Substation Geolocation ({year}-{month:02d})\n"
-            f"Matched: {n_matched} | Unmatched: {n_unmatched}",
-            fontsize=11,
-            fontweight="bold",
-        )
-        ax.legend(loc="lower left", frameon=True)
-
-        out_path = save_dir / f"shadow_substation_geolocation_{year}{month:02d}.png"
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-        print(f"Saved: {out_path}")
-        monthly_figures.append(out_path)
-
-    # Consolidate yearly CSVs and generate consolidated figures
-    # NOTE: The set of active substations varies by month (227–372 in 2025).
-    # The yearly CSV contains the UNION of all unique stations ever geolocated
-    # that year, deduplicated by station_name.
-    yearly_csv_paths = {}
-    yearly_figures = {}
-    for year in yearly_matched:
-        # Combine all months for the year and deduplicate by station_name.
-        # This represents all transmission substations that appeared in shadow
-        # pricing data at any point during the year.
-        matched_combined = pd.concat(yearly_matched[year], ignore_index=True)
-        matched_combined = matched_combined.drop_duplicates(subset=["station_name"])
-
-        unmatched_combined = pd.concat(yearly_unmatched[year], ignore_index=True)
-        unmatched_combined = unmatched_combined.drop_duplicates(subset=["station_name"])
-
-        matched_out = Path(dirs["processed"]) / f"shadow_station_matches_{year}.csv"
-        unmatched_out = Path(dirs["processed"]) / f"shadow_station_unmatched_{year}.csv"
-
-        matched_combined.to_csv(matched_out, index=False)
-        unmatched_combined.to_csv(unmatched_out, index=False)
-
-        yearly_csv_paths[year] = {
-            "matched_csv": matched_out,
-            "unmatched_csv": unmatched_out,
-        }
-
-        print(f"Saved: {matched_out}")
-        print(f"Saved: {unmatched_out}")
-
-        # Generate consolidated yearly map
-        fig = plt.figure(figsize=(9, 7))
-        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
-
-        states_shp = shpreader.natural_earth(
-            resolution="10m",
-            category="cultural",
-            name="admin_1_states_provinces",
-        )
-        texas_geom = None
-        for record in shpreader.Reader(states_shp).records():
-            if record.attributes.get("name") == "Texas":
-                texas_geom = record.geometry
-                break
-        if texas_geom is None:
-            raise RuntimeError("Texas geometry not found in Natural Earth shapefile.")
-
-        ax.add_geometries(
-            [texas_geom],
-            crs=ccrs.PlateCarree(),
-            facecolor="#f8f8f8",
-            edgecolor="black",
-            linewidth=1.0,
-            zorder=1,
-        )
-
-        if not matched_combined.empty:
-            ax.scatter(
-                matched_combined["longitude"],
-                matched_combined["latitude"],
-                s=16,
-                color="#1f77b4",
-                alpha=0.8,
-                transform=ccrs.PlateCarree(),
-                zorder=3,
-                label="Matched substations",
-            )
-
-        ax.set_extent([-106.8, -93.0, 25.5, 36.8], crs=ccrs.PlateCarree())
-        ax.gridlines(draw_labels=True, linewidth=0.4, color="gray", alpha=0.4)
-
-        n_matched = len(matched_combined)
-        n_unmatched = len(unmatched_combined)
-        ax.set_title(
-            f"Shadow Substation Geolocation ({year}) — All Months Combined\n"
-            f"Matched: {n_matched} | Unmatched: {n_unmatched}",
-            fontsize=11,
-            fontweight="bold",
-        )
-        ax.legend(loc="lower left", frameon=True)
-
-        out_path = save_dir / f"shadow_substation_geolocation_{year}.png"
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-        print(f"Saved: {out_path}")
-        yearly_figures[year] = out_path
-
-    return {
-        "yearly_csvs": yearly_csv_paths,
-        "yearly_figures": yearly_figures,
-        "monthly_figures": monthly_figures,
-    }
 
 
 def plot_forecast_error_correlation_grid(months=None, save_dir=None, n_sample=200_000):
@@ -1009,6 +800,75 @@ def plot_std_forecast_error_maps(months=None, save_dir=None):
     print(f"Saved: {out_path}")
     return out_path
 
+def plot_co2_intensity(months=None, save_dir=None):
+    """Generate weekly-average time-series and diurnal-average plots of ERCOT grid CO₂ intensity.
+
+    Creates a 2-panel figure:
+    - Top: weekly-average CO₂ intensity time series (one point per calendar week).
+    - Bottom: mean CO₂ intensity by hour of day (0–23), averaged across all weeks.
+
+    Args:
+        months: List of (year, month) tuples. Defaults to DEFAULT_MONTHS.
+        save_dir: Optional figure output directory.
+
+    Returns:
+        Path to the saved figure.
+    """
+    if months is None:
+        months = DEFAULT_MONTHS
+    dirs = setup_directories()
+    if save_dir is None:
+        save_dir = Path(dirs["figures"]) / "eda"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    ts = _load_hourly_wide(months, dirs, ["avg_intensity_kg_per_mwh"], label="CO2 intensity")
+    ts = ts.dropna(subset=["avg_intensity_kg_per_mwh"])
+
+    week_start = ts["valid_time"].dt.to_period("W").dt.start_time
+    weekly_ts = (
+        ts.groupby(week_start)["avg_intensity_kg_per_mwh"]
+        .mean()
+        .rename_axis("week")
+        .reset_index(name="intensity")
+    )
+
+    diurnal_avg = (
+        ts.groupby(ts["valid_time"].dt.hour)["avg_intensity_kg_per_mwh"]
+        .mean()
+        .reindex(range(24))
+    )
+
+    C_CO2 = "#2e7d32"
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+    fig.suptitle("ERCOT Grid CO₂ Intensity — 2025", fontsize=12, fontweight="bold")
+
+    axes[0].plot(weekly_ts["week"], weekly_ts["intensity"], color=C_CO2, linewidth=1.8, marker="o", markersize=4)
+    axes[0].fill_between(weekly_ts["week"], weekly_ts["intensity"], alpha=0.15, color=C_CO2)
+    axes[0].set_xlabel("Date", fontsize=9)
+    axes[0].set_ylabel("CO₂ intensity (kg CO₂/MWh)", fontsize=9)
+    axes[0].set_title("Weekly Average CO₂ Intensity", fontsize=9, fontweight="bold")
+    axes[0].grid(axis="both", alpha=0.25, linewidth=0.5)
+
+    x = diurnal_avg.index.values
+    y = diurnal_avg.values
+    axes[1].plot(x, y, color=C_CO2, linewidth=2.0, marker="o", markersize=4)
+    axes[1].fill_between(x, y, alpha=0.15, color=C_CO2)
+    axes[1].set_xlim(0, 23)
+    axes[1].set_xticks(range(0, 24, 3))
+    axes[1].set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 3)], fontsize=9)
+    axes[1].set_xlabel("Hour of day (Central)", fontsize=9)
+    axes[1].set_ylabel("CO₂ intensity (kg CO₂/MWh)", fontsize=9)
+    axes[1].set_title("Average CO₂ Intensity by Hour of Day", fontsize=9, fontweight="bold")
+    axes[1].grid(axis="y", alpha=0.25, linewidth=0.5)
+
+    fig.tight_layout()
+    out_path = Path(save_dir) / "co2_intensity.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+    return out_path
+
 
 # =============================================================================
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1022,11 +882,11 @@ def run_eda_plots(months=None):
         # "shadow_cost":     plot_shadow_cost_distribution(months=months),
         # "forecast_errors": plot_forecast_error_distributions(months=months),
         # "combined":        plot_eda_combined(months=months),
-        # "shadow_geolocation": plot_shadow_station_geolocation(months=months),
         # "error_correlation_grid":  plot_forecast_error_correlation_grid(months=months),
         # "mean_error_maps":         plot_mean_forecast_error_maps(months=months),
         # "std_error_maps":          plot_std_forecast_error_maps(months=months),
-        "error_vs_realized":       plot_forecast_error_vs_realized(months=months),
+        # "error_vs_realized":       plot_forecast_error_vs_realized(months=months),
+        "co2_intensity":           plot_co2_intensity(months=months),
     }
 
 

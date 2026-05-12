@@ -46,17 +46,20 @@ warnings.filterwarnings("ignore", category=UserWarning)
 DEPVAR = "economic_congestion_cost"
 
 # Forecast error fields: difference between model forecast and ERA5 reanalysis
-ERROR_FIELDS = ["wspd_error_1h", "temp_error_1h", "wspd_error_0h", "temp_error_0h"]
+ERROR_FIELDS = ["wspd_error_1h", "temp_error_1h", "wspd_error_0h", "temp_error_0h", "wspd100_error_1h", "wspd100_error_0h"]
 # Realized weather fields: ERA5 observed values (captures the weather state)
-REALIZED_FIELDS = ["era5_wspd", "era5_temp"]
+REALIZED_FIELDS = ["era5_wspd", "era5_temp", "era5_wspd100"]
 ALL_FIELDS = ERROR_FIELDS + REALIZED_FIELDS
 
 FIELD_LABELS = {
-    "wspd_error_1h": "HRRR 1h Wind Error",
+    "wspd_error_1h": "HRRR 1h 10m Wind Error",
+    "wspd100_error_1h": "HRRR 1h 100m Wind Error",
     "temp_error_1h": "HRRR 1h Temp Error",
-    "wspd_error_0h": "GFS Day-Ahead Wind Error",
+    "wspd_error_0h": "GFS Day-Ahead 10m Wind Error",
+    "wspd100_error_0h": "GFS Day-Ahead 100m Wind Error",
     "temp_error_0h": "GFS Day-Ahead Temp Error",
-    "era5_wspd":     "Realized Wind Speed (ERA5)",
+    "era5_wspd":     "Realized 10m Wind Speed (ERA5)",
+    "era5_wspd100":  "Realized 100m Wind Speed (ERA5)",
     "era5_temp":     "Realized Temperature (ERA5)",
 }
 

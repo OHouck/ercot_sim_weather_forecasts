@@ -26,11 +26,33 @@ import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
-from process_data.process_ercot import load_rt_spp_month
+from process_data.process_ercot import (
+    load_rt_spp_month,
+    process_generation_mix,
+    compute_generation_emissions,
+)
 from process_data.gridded_generation_mapping import build_gridded_generation_map
 
 # Default model → lead-hours mapping.  Used when callers pass models=None.
 MODEL_LEAD_TIMES = {'hrrr': (1,), 'gfs': (0,)}
+
+
+def _first_per_hour(df):
+    """Aggregate a 15-minute DataFrame to hourly by taking the first reading per hour.
+
+    Args:
+        df: DataFrame with a 'time' column at sub-hourly resolution.
+
+    Returns:
+        DataFrame with a 'valid_time' column (floored to the hour) replacing 'time',
+        one row per hour (first interval of each hour retained).
+    """
+    return (
+        df.assign(valid_time=df['time'].dt.floor('h'))
+        .groupby('valid_time', as_index=False)
+        .first()
+        .drop(columns='time')
+    )
 
 
 def _round_coord_id(lat, lon):
@@ -86,7 +108,9 @@ def flatten_era5_errors(year, month, model='hrrr'):
     """Convert ERA5 gridded forecast errors NetCDF to a wide-format DataFrame.
 
     One row per (pixel_id, valid_time). Lead hours become column suffixes
-    (e.g., temp_error_1h, temp_error_18h).
+    (e.g., temp_error_1h, temp_error_18h). 100m wind columns are included
+    when present in the NetCDF (wspd100_error_{lead}h, wdir100_error_{lead}h,
+    forecast_wspd100_{lead}h, forecast_wdir100_{lead}h, era5_wspd100, era5_wdir100).
 
     Args:
         year: Integer year.
@@ -95,7 +119,8 @@ def flatten_era5_errors(year, month, model='hrrr'):
 
     Returns:
         DataFrame with columns: pixel_id, latitude, longitude, valid_time,
-        {var}_{lead}h columns, era5_temp, era5_wspd, era5_wdir.
+        {var}_{lead}h columns, era5_temp, era5_wspd, era5_wdir,
+        and optionally era5_wspd100, era5_wdir100.
     """
     dirs = setup_directories()
     nc_path = os.path.join(
@@ -134,6 +159,7 @@ def flatten_era5_errors(year, month, model='hrrr'):
           f"{len(lead_hours_vals)} leads")
 
     lead_short = int(lead_hours_vals[0])
+    has_100m = 'wspd100_error' in ds.data_vars
 
     # Build a DataFrame per lead, then merge
     dfs_by_lead = {}
@@ -162,6 +188,12 @@ def flatten_era5_errors(year, month, model='hrrr'):
             f'forecast_wdir_{lead_int}h': fc_wdir.ravel(),
         })
 
+        if has_100m:
+            df[f'wspd100_error_{lead_int}h'] = ds['wspd100_error'].values[:, li, land_lat_idx, land_lon_idx].ravel()
+            df[f'wdir100_error_{lead_int}h'] = ds['wdir100_error'].values[:, li, land_lat_idx, land_lon_idx].ravel()
+            df[f'forecast_wspd100_{lead_int}h'] = ds['forecast_wspd100'].values[:, li, land_lat_idx, land_lon_idx].ravel()
+            df[f'forecast_wdir100_{lead_int}h'] = ds['forecast_wdir100'].values[:, li, land_lat_idx, land_lon_idx].ravel()
+
         # Observed ERA5 values are identical across leads; add once
         if lead_int == lead_short:
             era5_temp = ds['era5_temp'].values[:, li, land_lat_idx, land_lon_idx]
@@ -172,6 +204,9 @@ def flatten_era5_errors(year, month, model='hrrr'):
             df['era5_wdir'] = era5_wdir.ravel()
             df['latitude'] = np.tile(pixel_lats, n_times)
             df['longitude'] = np.tile(pixel_lons, n_times)
+            if has_100m:
+                df['era5_wspd100'] = ds['era5_wspd100'].values[:, li, land_lat_idx, land_lon_idx].ravel()
+                df['era5_wdir100'] = ds['era5_wdir100'].values[:, li, land_lat_idx, land_lon_idx].ravel()
 
         dfs_by_lead[lead_int] = df
 
@@ -406,6 +441,26 @@ def build_pixel_hourly_dataset(year, month, models=None, force_rebuild=False):
               f"wind_curtailment_mw, solar_curtailment_mw, etc.")
     except FileNotFoundError:
         print("Step 6: SCED disclosure data not found — skipping curtailment merge.")
+
+    # ── Step 6b: Merge generation mix + emissions intensity ──
+    try:
+        print("Step 6b: Merging generation mix and emissions data...")
+        gen_mix = process_generation_mix(year, month)
+        emissions = compute_generation_emissions(gen_mix)
+
+        gen_hourly = _first_per_hour(gen_mix)
+        em_hourly = _first_per_hour(emissions)
+
+        pixel_hourly = (
+            pixel_hourly
+            .merge(gen_hourly, on='valid_time', how='left')
+            .merge(em_hourly, on='valid_time', how='left')
+        )
+        fuel_cols = [c for c in gen_hourly.columns if c != 'valid_time']
+        print(f"  Added generation mix columns: {fuel_cols}")
+        print(f"  Added emissions columns: total_generation_mw, total_co2_rate_kg_per_h, avg_intensity_kg_per_mwh")
+    except FileNotFoundError:
+        print("Step 6b: Generation mix file not found — skipping generation mix merge.")
 
     # ── Step 7: Merge weather-zone load data ──
     try:
