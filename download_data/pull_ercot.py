@@ -362,70 +362,38 @@ def download_wind_power_forecast(start_date, end_date, output_dir, api_key, bear
     )
 
 
-def _list_sced_lambda_archive(start_date, end_date, api_key, bearer_token=None):
-    """List SCED System Lambda archive document metadata for a date range.
+def _fetch_sced_lambda_bundle_index(api_key, bearer_token=None):
+    """Fetch the NP6-322-CD monthly bundle index.
 
-    The archive endpoint returns one entry per SCED run (~every 5 min). Each
-    entry contains a docId and download link for a zipped CSV.
+    ERCOT pre-packages all SCED lambda runs for each calendar month into a
+    single ZIP (a ZIP of ZIPs). This returns the full index so callers can
+    look up a month by name.
 
     Args:
-        start_date: 'YYYY-MM-DD' start
-        end_date: 'YYYY-MM-DD' end
         api_key: ERCOT API subscription key
         bearer_token: OAuth2 bearer token
 
     Returns:
-        List of dicts with keys: docId, friendlyName, postDatetime, download_href
+        Dict mapping 'YYYY-MM' → download URL string
     """
     headers = {'Ocp-Apim-Subscription-Key': api_key}
     if bearer_token:
         headers['Authorization'] = f'Bearer {bearer_token}'
 
-    url = f"{ERCOT_API_BASE}/archive/np6-322-cd"
-    all_docs = []
-    page = 1
+    resp = requests.get(
+        f"{ERCOT_API_BASE}/bundle/np6-322-cd",
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
 
-    while True:
-        params = {
-            'postDatetimeFrom': f"{start_date}T00:00:00",
-            'postDatetimeTo': f"{end_date}T23:59:59",
-            'size': 1000,
-            'page': page,
-        }
-
-        resp = requests.get(url, headers=headers, params=params, timeout=60)
-
-        if resp.status_code == 429:
-            print(f"    Rate limited, waiting 60s...")
-            time.sleep(60)
-            continue
-
-        if resp.status_code != 200:
-            print(f"    HTTP {resp.status_code}: {resp.text[:200]}")
-            break
-
-        data = resp.json()
-        meta = data.get('_meta', {})
-        total_pages = meta.get('totalPages', 1)
-        total_records = meta.get('totalRecords', 0)
-
-        if page == 1:
-            print(f"    Found {total_records} archive docs ({total_pages} pages)")
-
-        for doc in data.get('archives', []):
-            all_docs.append({
-                'docId': doc['docId'],
-                'friendlyName': doc['friendlyName'],
-                'postDatetime': doc['postDatetime'],
-                'download_href': doc['_links']['endpoint']['href'],
-            })
-
-        if page >= total_pages:
-            break
-        page += 1
-        time.sleep(0.5)
-
-    return all_docs
+    bundles = {}
+    for b in resp.json().get('bundles', []):
+        # friendlyName pattern: SCEDSYSLAMBDANP6322_2025-07
+        parts = b['friendlyName'].split('_')
+        if len(parts) == 2:
+            bundles[parts[1]] = b['_links']['endpoint']['href']
+    return bundles
 
 
 def _parse_sced_lambda_zip(content, friendly_name):
@@ -481,21 +449,18 @@ def download_sced_lambda(start_date, end_date, output_dir, api_key, bearer_token
 
     System lambda is the system-wide energy component of LMP — the shadow price
     on the power balance constraint before nodal congestion adjustments. Published
-    per SCED run (~every 5 minutes, ~288 runs/day).
+    per SCED run (~every 5 minutes, ~288 runs/day, ~8,900 runs/month).
 
-    Uses the ERCOT archive endpoint, which returns one zipped CSV per SCED run.
-    Aggregates all runs for each calendar month and saves a single parquet file.
-    Months that already have a parquet file are skipped.
-
-    Bearer tokens expire after ~1 hour. This function automatically refreshes
-    the token from ~/keys/ when a 401 is received mid-download.
+    Uses the ERCOT bundle endpoint (one ZIP per calendar month containing all
+    SCED runs as nested ZIPs), which avoids per-file rate limits and reduces
+    total requests from ~8,900/month to 1/month.
 
     Args:
         start_date: 'YYYY-MM-DD' start
         end_date: 'YYYY-MM-DD' end
         output_dir: Directory to save monthly parquet files
         api_key: ERCOT API subscription key
-        bearer_token: OAuth2 bearer token (refreshed automatically on expiry)
+        bearer_token: OAuth2 bearer token
 
     Saves sced_lambda_{YYYY-MM}.parquet per month. Columns: sced_timestamp
     (str, US/Central prevailing time), system_lambda (float, $/MWh), and
@@ -503,21 +468,12 @@ def download_sced_lambda(start_date, end_date, output_dir, api_key, bearer_token
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Pre-load credentials so we can silently refresh the bearer token on 401.
-    # Bearer tokens expire in ~1 hour; a full month takes ~5 hours to download.
-    try:
-        _creds = load_credentials()
-        _username, _password = _creds['username'], _creds['password']
-    except Exception:
-        _username = _password = None
+    headers = {'Ocp-Apim-Subscription-Key': api_key}
+    if bearer_token:
+        headers['Authorization'] = f'Bearer {bearer_token}'
 
-    def _make_headers():
-        h = {'Ocp-Apim-Subscription-Key': api_key}
-        if bearer_token:
-            h['Authorization'] = f'Bearer {bearer_token}'
-        return h
-
-    headers = _make_headers()
+    print("  Fetching bundle index...")
+    bundle_index = _fetch_sced_lambda_bundle_index(api_key, bearer_token)
 
     current = datetime.strptime(start_date, '%Y-%m-%d').replace(day=1)
     end = datetime.strptime(end_date, '%Y-%m-%d')
@@ -533,60 +489,27 @@ def download_sced_lambda(start_date, end_date, output_dir, api_key, bearer_token
             current = month_end + timedelta(days=1)
             continue
 
-        # Refresh token at the start of each month — each month takes ~5h to
-        # download but tokens only last ~1h, so we always need a fresh one here.
-        if _username:
-            new_token = get_bearer_token(_username, _password)
-            if new_token:
-                bearer_token = new_token
-                headers = _make_headers()
-            else:
-                print(f"  WARNING: Token refresh failed for {month_str}, trying with existing token")
+        bundle_url = bundle_index.get(month_str)
+        if not bundle_url:
+            print(f"  No bundle found for {month_str} (not yet published?)")
+            current = month_end + timedelta(days=1)
+            continue
 
-        print(f"  Downloading SCED lambda for {month_str}...")
-
-        docs = _list_sced_lambda_archive(
-            current.strftime('%Y-%m-%d'),
-            month_end.strftime('%Y-%m-%d'),
-            api_key, bearer_token,
-        )
-
-        if not docs:
-            print(f"    No archive docs found for {month_str}")
+        print(f"  Downloading bundle for {month_str}...")
+        resp = requests.get(bundle_url, headers=headers, timeout=300)
+        if resp.status_code != 200:
+            print(f"    HTTP {resp.status_code}, skipping {month_str}")
             current = month_end + timedelta(days=1)
             continue
 
         frames = []
-        for i, doc in enumerate(docs):
-            if i % 500 == 0:
-                print(f"    Downloading file {i + 1}/{len(docs)}...")
-
-            for attempt in range(6):
-                resp = requests.get(doc['download_href'], headers=headers, timeout=60)
-                if resp.status_code == 429:
-                    wait = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80, 160s
-                    print(f"    Rate limited, waiting {wait}s...")
-                    time.sleep(wait)
-                elif resp.status_code == 401 and _username:
-                    print(f"    Token expired, refreshing...")
-                    bearer_token = get_bearer_token(_username, _password)
-                    headers = _make_headers()
-                else:
-                    break
-            else:
-                print(f"    Exhausted retries for {doc['friendlyName']}, skipping")
-                time.sleep(2)
-                continue
-
-            if resp.status_code != 200:
-                print(f"    HTTP {resp.status_code} for {doc['friendlyName']}, skipping")
-                time.sleep(2)
-                continue
-
-            df = _parse_sced_lambda_zip(resp.content, doc['friendlyName'])
-            if df is not None:
-                frames.append(df)
-            time.sleep(2)  # ~30 req/min to stay within ERCOT API rate limit
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as outer:
+            inner_names = outer.namelist()
+            print(f"    Parsing {len(inner_names)} SCED run files...")
+            for name in inner_names:
+                df = _parse_sced_lambda_zip(outer.read(name), name)
+                if df is not None:
+                    frames.append(df)
 
         if not frames:
             print(f"    No data parsed for {month_str}")
@@ -710,8 +633,213 @@ def download_sced_lambda_year(year):
 
     print(f"\n=== SCED Lambda Download Complete: {year} ===")
 
+def _fetch_ruc_bundle_index(api_key, bearer_token=None):
+    """Fetch the NP3-764-CD monthly bundle index.
+
+    ERCOT pre-packages all HRUC runs for each calendar month into a single
+    ZIP (a ZIP of ZIPs). This returns the full index so callers can look up
+    a month by name.
+
+    Args:
+        api_key: ERCOT API subscription key
+        bearer_token: OAuth2 bearer token
+
+    Returns:
+        Dict mapping 'YYYY-MM' → download URL string
+    """
+    headers = {'Ocp-Apim-Subscription-Key': api_key}
+    if bearer_token:
+        headers['Authorization'] = f'Bearer {bearer_token}'
+
+    resp = requests.get(
+        f"{ERCOT_API_BASE}/bundle/np3-764-cd",
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    bundles = {}
+    for b in resp.json().get('bundles', []):
+        # friendlyName pattern: HRUCONSCEDOFFCOPNP3764_2025-07
+        parts = b['friendlyName'].split('_')
+        if len(parts) == 2:
+            bundles[parts[1]] = b['_links']['endpoint']['href']
+    return bundles
+
+
+def _parse_ruc_bundle_zip(content):
+    """Parse an NP3-764-CD monthly bundle (outer ZIP of inner ZIPs) into a DataFrame.
+
+    Each inner ZIP contains a single CSV with one row for one HRUC run.
+
+    Args:
+        content: Raw bytes of the outer ZIP
+
+    Returns:
+        DataFrame with columns delivery_date, hour_ending, ruc_timestamp,
+        sced_timestamp, deployment_mw_{south,north,west,houston}, dst_flag;
+        one row per HRUC run (one per operating hour after bundle dedup).
+    """
+    rename = {
+        'DeliveryDate': 'delivery_date',
+        'HourEnding': 'hour_ending',
+        'RUCTimestamp': 'ruc_timestamp',
+        'SCEDTimestamp': 'sced_timestamp',
+        'SumSCEDHSLsOnlineSCEDOfflineCOPSouth': 'deployment_mw_south',
+        'SumSCEDHSLsOnlineSCEDOfflineCOPNorth': 'deployment_mw_north',
+        'SumSCEDHSLsOnlineSCEDOfflineCOPWest': 'deployment_mw_west',
+        'SumSCEDHSLsOnlineSCEDOfflineCOPHouston': 'deployment_mw_houston',
+        'DSTFlag': 'dst_flag',
+    }
+    frames = []
+    with zipfile.ZipFile(io.BytesIO(content)) as outer:
+        for name in outer.namelist():
+            inner_bytes = outer.read(name)
+            try:
+                with zipfile.ZipFile(io.BytesIO(inner_bytes)) as inner:
+                    csv_names = [n for n in inner.namelist() if n.endswith('.csv')]
+                    if not csv_names:
+                        continue
+                    with inner.open(csv_names[0]) as f:
+                        frames.append(pd.read_csv(f))
+            except Exception as e:
+                print(f"    Parse error in {name}: {e}")
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in rename if c not in df.columns]
+    if missing:
+        print(f"    Unexpected columns; missing {missing}")
+        return None
+
+    return df.rename(columns=rename)[list(rename.values())]
+
+
+def download_ruc_deployments(start_date, end_date, output_dir, api_key, bearer_token=None):
+    """Download RUC deployment data (NP3-764-CD) using monthly bundles.
+
+    NP3-764-CD ("Hourly RUC Online In SCED Offline In COP Report") reports,
+    for each operating hour, the summed HSL of generation resources that are
+    online in SCED but offline in the QSE's Current Operating Plan — i.e.
+    capacity ERCOT forced online via RUC that the market would not have
+    committed on its own. These resources collect RUC make-whole payments that
+    would not exist in a DAM+RTM-only market.
+
+    Uses the ERCOT bundle endpoint (one ZIP per calendar month containing all
+    HRUC runs), which avoids per-file rate limits and reduces total requests
+    from ~800/month to 1/month.
+
+    ERCOT does not publish dollar make-whole amounts publicly — those are in
+    secured NP9-xxx settlement statements. To estimate cost, multiply
+    deployment_mw_total by an assumed markup above zonal RT LMP, or join with
+    the 60-Day SCED Disclosure for per-resource offer floors.
+
+    Args:
+        start_date: 'YYYY-MM-DD' start (operating date)
+        end_date: 'YYYY-MM-DD' end (operating date)
+        output_dir: Directory to save monthly parquet files
+        api_key: ERCOT API subscription key
+        bearer_token: OAuth2 bearer token
+
+    Saves ruc_deployment_{YYYY-MM}.parquet per month. Columns:
+    delivery_date, hour_ending, ruc_timestamp, sced_timestamp, dst_flag,
+    deployment_mw_{south,north,west,houston}, deployment_mw_total.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    headers = {'Ocp-Apim-Subscription-Key': api_key}
+    if bearer_token:
+        headers['Authorization'] = f'Bearer {bearer_token}'
+
+    print("  Fetching bundle index...")
+    bundle_index = _fetch_ruc_bundle_index(api_key, bearer_token)
+
+    current = datetime.strptime(start_date, '%Y-%m-%d').replace(day=1)
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+
+    while current <= end:
+        month_end_day = calendar.monthrange(current.year, current.month)[1]
+        month_end = min(current.replace(day=month_end_day), end)
+        month_str = current.strftime('%Y-%m')
+        output_file = os.path.join(output_dir, f"ruc_deployment_{month_str}.parquet")
+
+        if os.path.exists(output_file):
+            print(f"  Skipping {month_str} (already exists)")
+            current = month_end + timedelta(days=1)
+            continue
+
+        bundle_url = bundle_index.get(month_str)
+        if not bundle_url:
+            print(f"  No bundle found for {month_str} (not yet published?)")
+            current = month_end + timedelta(days=1)
+            continue
+
+        print(f"  Downloading bundle for {month_str}...")
+        resp = requests.get(bundle_url, headers=headers, timeout=120)
+        if resp.status_code != 200:
+            print(f"    HTTP {resp.status_code}, skipping {month_str}")
+            current = month_end + timedelta(days=1)
+            continue
+
+        month_df = _parse_ruc_bundle_zip(resp.content)
+        if month_df is None or month_df.empty:
+            print(f"    No data parsed for {month_str}")
+            current = month_end + timedelta(days=1)
+            continue
+
+        mw_cols = ['deployment_mw_south', 'deployment_mw_north',
+                   'deployment_mw_west', 'deployment_mw_houston']
+        month_df['deployment_mw_total'] = month_df[mw_cols].sum(axis=1)
+        month_df = month_df.sort_values(['delivery_date', 'hour_ending']).reset_index(drop=True)
+
+        month_df.to_parquet(output_file, index=False)
+        total = month_df['deployment_mw_total']
+        print(f"    Saved {len(month_df)} hours for {month_str}")
+        print(f"    Deployment MW: min={total.min():.1f}, mean={total.mean():.1f}, max={total.max():.1f}")
+
+        current = month_end + timedelta(days=1)
+
+
+def download_ruc_deployments_year(year):
+    """Download RUC deployment (NP3-764-CD) for all months of a year.
+
+    Args:
+        year: Integer year (e.g. 2025)
+    """
+    dirs = setup_directories()
+    output_dir = os.path.join(dirs['raw'], 'ercot', 'ruc_deployment', str(year))
+    creds = load_credentials()
+
+    print(f"=== RUC Deployment Download: {year} ===\n")
+
+    print("Authenticating with ERCOT API...")
+    bearer_token = get_bearer_token(creds['username'], creds['password'])
+    if bearer_token:
+        print("Bearer token obtained successfully.\n")
+    else:
+        print("WARNING: Could not get bearer token, proceeding with subscription key only.\n")
+
+    api_key = creds['api_key']
+
+    for month in range(1, 13):
+        num_days = calendar.monthrange(year, month)[1]
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{num_days:02d}"
+        month_dir = os.path.join(output_dir, f"{month:02d}")
+        print(f"\n--- RUC deployments {year}-{month:02d} ---")
+        download_ruc_deployments(
+            start_date, end_date, month_dir, api_key, bearer_token
+        )
+
+    print(f"\n=== RUC Deployment Download Complete: {year} ===")
+
 
 if __name__ == "__main__":
-    download_sced_lambda_year(2025)
+
 
     # download_year(2025)
+    download_sced_lambda_year(2025)
+    # download_ruc_deployments_year(2025)

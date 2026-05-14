@@ -318,6 +318,231 @@ def _strip_html_suffix(name):
     return s
 
 
+def _load_eia860():
+    """Load EIA 860 Texas generators table with a cleaned lmp_clean column.
+
+    Cleaning: strips parenthetical annotations like (ERCOT), takes the first
+    of multiple designations (comma/semicolon/pipe/slash delimited), replaces
+    whitespace with underscores, uppercases. Empty strings become NA.
+
+    Returns:
+        DataFrame with all texas_generators.csv columns plus lmp_clean.
+    """
+    dirs = setup_directories()
+    df = pd.read_csv(os.path.join(dirs['raw'], 'eia860', 'texas_generators.csv'))
+    df = df[df['plant_code'].notna()].copy()
+    df['plant_code'] = df['plant_code'].astype(int)
+    raw = df['lmp_node_designation'].astype('string').fillna('')
+    cleaned = (
+        raw.str.replace(r'\([^)]*\)', '', regex=True)
+        .str.strip()
+        .str.split(r'[,;|/]').str[0].str.strip()
+        .str.replace(r'\s+', '_', regex=True)
+        .str.upper()
+    )
+    df['lmp_clean'] = cleaned.where(cleaned != '', pd.NA)
+    return df
+
+
+def _extract_site_prefix(name):
+    """Return the leading uppercased alphanumeric segment of a node name.
+
+    Examples: 'FRNYPP_1_CCU' -> 'FRNYPP', 'GUADGCC1' -> 'GUADGCC1'.
+
+    Args:
+        name: node name string or None/NA
+
+    Returns:
+        uppercase alphanumeric prefix string, or '' if none found
+    """
+    if name is None or pd.isna(name):
+        return ''
+    m = re.match(r'^[A-Z0-9]+', str(name).upper())
+    return m.group() if m else ''
+
+
+def _build_sp_prefix_lookup(sp_names, min_prefix_len=3):
+    """Build {site_prefix: [sp_name]} dict from settlement point names.
+
+    Args:
+        sp_names: iterable of settlement point name strings
+        min_prefix_len: minimum prefix length to include (avoids spurious short matches)
+
+    Returns:
+        dict mapping prefix -> sorted list of SP names sharing that prefix
+    """
+    lookup = {}
+    for sp in sp_names:
+        prefix = _extract_site_prefix(sp)
+        if prefix and len(prefix) >= min_prefix_len:
+            lookup.setdefault(prefix, set()).add(sp)
+    return {p: sorted(sps) for p, sps in lookup.items()}
+
+
+def _match_via_sp_prefix(query, sp_prefix_lookup):
+    """Find settlement points whose prefix matches the start of query (longest match wins).
+
+    Underscores in query are removed before comparison so 'GUADGCC1' matches 'GUADG_CC1'.
+
+    Args:
+        query: candidate name string
+        sp_prefix_lookup: dict from _build_sp_prefix_lookup
+
+    Returns:
+        list of SP names at the longest matching prefix, or []
+    """
+    if query is None or pd.isna(query) or not str(query):
+        return []
+    target = str(query).upper().replace('_', '')
+    best, best_len = [], 0
+    for prefix, sps in sp_prefix_lookup.items():
+        if len(prefix) > best_len and target.startswith(prefix):
+            best, best_len = sps, len(prefix)
+    return best
+
+
+def _disambiguate_sp_by_unit_digit(query, candidate_sps):
+    """When multiple SPs share a prefix, pick those whose trailing digit appears in query.
+
+    Example: query='FRNYPP_1_CCU', candidates=['FRNYPP_CC1', 'FRNYPP_CC2']
+    -> returns ['FRNYPP_CC1'] because '1' is in both the query and the SP.
+    Returns the original list unchanged if disambiguation cannot be made.
+
+    Args:
+        query: candidate name string
+        candidate_sps: list of SP name strings
+
+    Returns:
+        filtered list of SP names, or the original list if no filtering was possible
+    """
+    if len(candidate_sps) <= 1:
+        return candidate_sps
+    digits = set(re.findall(r'\d', str(query).upper()))
+    if not digits:
+        return candidate_sps
+    matched = [sp for sp in candidate_sps if (m := re.search(r'(\d)$', sp)) and m.group(1) in digits]
+    return matched if matched else candidate_sps
+
+
+def _load_node_coords_plant_map():
+    """Load plant_name -> [settlement_point] mapping from the cached node_coordinates.csv.
+
+    Returns:
+        dict mapping plant_name -> list of settlement_point strings;
+        empty dict if node_coordinates.csv does not yet exist.
+    """
+    dirs = setup_directories()
+    path = os.path.join(dirs['processed'], 'node_coordinates.csv')
+    if not os.path.exists(path):
+        return {}
+    nc = pd.read_csv(path)
+    nc = nc[nc['plant_name'].notna()][['plant_name', 'settlement_point']].drop_duplicates()
+    return nc.groupby('plant_name')['settlement_point'].apply(list).to_dict()
+
+
+def _resolve_node_coord_sps(plant_name, plant_to_settlement_pts, resources_by_sp, sp_prefix_lookup):
+    """Resolve plant_name -> current ERCOT SPs via node_coordinates.csv, with prefix fall-through.
+
+    node_coordinates.csv may carry older SP names (e.g. FRNYPP_2_CCU) that don't match
+    current DAM SP names. When the literal SP isn't valid, falls back to prefix matching.
+
+    Args:
+        plant_name: EIA plant name string
+        plant_to_settlement_pts: dict from _load_node_coords_plant_map
+        resources_by_sp: dict mapping settlement point name -> list of resource names
+        sp_prefix_lookup: dict from _build_sp_prefix_lookup
+
+    Returns:
+        sorted list of current SP names; empty list if no resolution
+    """
+    raw_sps = plant_to_settlement_pts.get(plant_name, [])
+    if not raw_sps:
+        return []
+    resolved = []
+    for sp in raw_sps:
+        if sp in resources_by_sp:
+            resolved.append(sp)
+            continue
+        for prefix_sp in _match_via_sp_prefix(sp, sp_prefix_lookup):
+            if prefix_sp in resources_by_sp:
+                resolved.append(prefix_sp)
+    return sorted(set(resolved))
+
+
+def build_eia_resource_crosswalk(eia, resource_set, resources_by_sp, plant_to_sps,
+                                  sp_prefix_lookup, plant_name_overrides=None):
+    """Match EIA 860 generators to ERCOT resource names using tiered name matching.
+
+    Tiers applied in order; first hit wins (recorded in match_strategy column):
+      lmp_to_resource         — lmp_clean equals a resource name directly
+      lmp_to_settlement_pt    — lmp_clean equals a settlement point name
+      lmp_prefix_to_sp        — lmp_clean prefix matches SPs (with unit-digit disambiguation)
+      name_to_settlement_pt   — plant_name resolves via node_coordinates.csv bridge
+      name_override_to_prefix — caller-supplied plant_name -> SP prefix overrides
+      unmatched               — no link found
+
+    Args:
+        eia: EIA 860 DataFrame with lmp_clean, plant_name, plant_code, generator_id
+        resource_set: set of valid ERCOT resource names
+        resources_by_sp: dict mapping settlement point name -> list of resource names
+        plant_to_sps: dict mapping plant_name -> list of settlement point names
+        sp_prefix_lookup: dict mapping site prefix -> list of SP names
+        plant_name_overrides: optional dict mapping uppercase plant_name -> SP prefix string
+
+    Returns:
+        DataFrame with columns plant_code, generator_id, lmp_clean, resource_name,
+        match_strategy. One row per (generator, resource) pair; unmatched generators
+        appear once with resource_name=None.
+    """
+    if plant_name_overrides is None:
+        plant_name_overrides = {}
+
+    def _emit(plant_code, gen_id, lmp, sps, strategy, out):
+        for sp in sps:
+            for r in resources_by_sp.get(sp, []):
+                out.append((plant_code, gen_id, lmp, r, strategy))
+
+    rows = []
+    for _, gen in eia.iterrows():
+        lmp = gen['lmp_clean']
+        plant_name = gen['plant_name']
+        plant_code = gen['plant_code']
+        gen_id = gen['generator_id']
+
+        if pd.notna(lmp) and lmp:
+            if lmp in resource_set:
+                rows.append((plant_code, gen_id, lmp, lmp, 'lmp_to_resource'))
+                continue
+            if lmp in resources_by_sp:
+                _emit(plant_code, gen_id, lmp, [lmp], 'lmp_to_settlement_pt', rows)
+                continue
+            prefix_sps = _disambiguate_sp_by_unit_digit(
+                lmp, _match_via_sp_prefix(lmp, sp_prefix_lookup)
+            )
+            if prefix_sps:
+                _emit(plant_code, gen_id, lmp, prefix_sps, 'lmp_prefix_to_sp', rows)
+                continue
+
+        bridge_sps = _resolve_node_coord_sps(plant_name, plant_to_sps, resources_by_sp, sp_prefix_lookup)
+        if bridge_sps:
+            _emit(plant_code, gen_id, lmp, bridge_sps, 'name_to_settlement_pt', rows)
+            continue
+
+        if pd.notna(plant_name):
+            override = plant_name_overrides.get(str(plant_name).upper().strip())
+            if override:
+                override_sps = [sp for sp in sp_prefix_lookup.get(override, []) if sp in resources_by_sp]
+                if override_sps:
+                    _emit(plant_code, gen_id, lmp, override_sps, 'name_override_to_prefix', rows)
+                    continue
+
+        rows.append((plant_code, gen_id, lmp, None, 'unmatched'))
+
+    return pd.DataFrame(
+        rows, columns=['plant_code', 'generator_id', 'lmp_clean', 'resource_name', 'match_strategy']
+    )
+
+
 def _match_html_nodes_to_resource_nodes(html_df, rn_df):
     """Map HTML contour node names to current NP4-160 resource nodes.
 
@@ -765,7 +990,7 @@ def build_node_coordinates(force_rebuild=False):
 
     matched_so_far |= set(kml_results['settlement_point']) if len(kml_results) > 0 else set()
 
-    # --- Source 3: EIA 860 generator LMP node designation (direct match) ---
+    # --- Source 3: EIA 860 — LMP node designation + prefix matching ---
     eia_file = os.path.join(dirs['raw'], 'eia860', 'texas_plants.csv')
     gens_file = os.path.join(dirs['raw'], 'eia860', 'texas_generators.csv')
     if not os.path.exists(eia_file):
@@ -776,36 +1001,36 @@ def build_node_coordinates(force_rebuild=False):
 
     lmp_results = pd.DataFrame()
     if os.path.exists(gens_file):
-        gens = pd.read_csv(gens_file)
-        # Build mapping: LMP node designation → generator row (with lat/lon)
-        gens_with_lmp = gens[gens['lmp_node_designation'].notna()].copy()
-        # Deduplicate: if multiple generators share the same LMP node, take the first
-        lmp_lookup = gens_with_lmp.drop_duplicates(subset='lmp_node_designation')
-        lmp_map = {}
-        for _, grow in lmp_lookup.iterrows():
-            lmp_map[grow['lmp_node_designation']] = {
-                'lat': float(grow['lat']),
-                'lon': float(grow['lon']),
-                'plant_name': grow['plant_name'],
-            }
+        eia_gens = _load_eia860()
+        unmatched_rns = all_rn_names - matched_so_far
+        rn_prefix_lookup = _build_sp_prefix_lookup(unmatched_rns)
+        resources_by_rn = {rn: [rn] for rn in unmatched_rns}
 
-        lmp_matches = []
-        for rn_name in all_rn_names:
-            if rn_name in matched_so_far:
-                continue
-            if rn_name in lmp_map:
-                info = lmp_map[rn_name]
-                lmp_matches.append({
-                    'settlement_point': rn_name,
-                    'lat': info['lat'],
-                    'lon': info['lon'],
-                    'plant_name': info['plant_name'],
-                    'match_method': 'eia_lmp_node',
-                })
+        crosswalk_df = build_eia_resource_crosswalk(
+            eia_gens, unmatched_rns, resources_by_rn, {}, rn_prefix_lookup
+        )
+        matched_cw = crosswalk_df[crosswalk_df['resource_name'].notna()].copy()
+        eia_coords = eia_gens[['plant_code', 'generator_id', 'lat', 'lon', 'plant_name']].dropna(subset=['lat', 'lon'])
+        matched_with_coords = (
+            matched_cw.merge(eia_coords, on=['plant_code', 'generator_id'], how='inner')
+            .drop_duplicates(subset='resource_name')
+        )
+        strategy_to_method = {
+            'lmp_to_resource': 'eia_lmp_node',
+            'lmp_to_settlement_pt': 'eia_lmp_sp',
+            'lmp_prefix_to_sp': 'eia_lmp_prefix',
+        }
+        lmp_results = matched_with_coords.assign(
+            settlement_point=matched_with_coords['resource_name'],
+            match_method=matched_with_coords['match_strategy'].map(strategy_to_method).fillna('eia_name_match'),
+            lat=matched_with_coords['lat'].astype(float),
+            lon=matched_with_coords['lon'].astype(float),
+        )[['settlement_point', 'lat', 'lon', 'plant_name', 'match_method']].reset_index(drop=True)
 
-        lmp_results = pd.DataFrame(lmp_matches)
-        print(f"EIA LMP node: {len(lmp_map)} generators with LMP designations, "
-              f"{len(lmp_results)} new resource node matches")
+        strat_counts = matched_cw['match_strategy'].value_counts()
+        print(f"EIA matching: {len(lmp_results)} new resource node matches")
+        for s, c in strat_counts.items():
+            print(f"  {s}: {c}")
     else:
         print(f"Generator file not found at {gens_file}, skipping LMP node matching")
 
