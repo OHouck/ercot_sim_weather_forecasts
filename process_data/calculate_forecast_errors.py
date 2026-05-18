@@ -28,10 +28,8 @@ Regridding methods for the ERA5 path:
   - Bin-center averaging (HRRR): forecast resolution is finer than ERA5
     (~3 km vs ~11 km), so ~12 forecast cell centers fall within each ERA5 bin
     and are averaged.
-  - Bilinear interpolation (GFS): forecast resolution is coarser than ERA5
-    (~28 km vs ~11 km), so bin-averaging would leave ~60 % of ERA5 cells empty.
-    xarray .interp(method='linear') smoothly fills the finer grid instead.
-
+  - ERA5-land bin averaging (GFS): ERA5-Land (0.1°) is higher resolution than GFS (0.25°), 
+    regrid ERA5-Land to 0.25 via bin averaging before computing errors. 
 Timezone convention:
   All output valid_time columns are stored in **US/Central (tz-naive)**.
   Raw NetCDF files (HRRR, GFS, ERA5) remain in UTC; conversion happens at load
@@ -81,7 +79,7 @@ _MODEL_CONFIG = {
     'gfs': {
         'data_dir': 'gfs_data',
         'display_name': 'GFS',
-        'regrid_method': 'interp',
+        'regrid_method': 'era5_bin',
         'default_lead_hours': None,   # keep all available leads
         'collapse_leads': True,       # remap all lead_hours → 0 ("day-ahead")
     },
@@ -301,95 +299,89 @@ def spatial_join_stations_to_grid(stations_gdf, grid_gdf):
 
 # ── Bin-averaged regridding (forecast → ERA5 grid) ──────────────────────────
 
-def _build_hrrr_to_era5_bin_map(hrrr_lat2d, hrrr_lon2d, era5_lats, era5_lons,
-                                  cache_path=None, force_rebuild=False):
-    """Pre-compute which ERA5 bin each HRRR cell center falls into.
+def _build_bin_map(src_lats, src_lons, tgt_lats, tgt_lons,
+                    cache_path=None, force_rebuild=False):
+    """Pre-compute which target grid bin each source cell falls into.
 
-    ERA5 has a regular 0.1-degree grid. We construct bin edges at cell
-    boundaries (midpoints between adjacent centers) and use np.digitize to
-    assign each HRRR cell to its containing ERA5 bin. This assignment is
-    computed once and reused for every forecast field.
+    Constructs target bin edges at cell boundaries (midpoints between adjacent
+    target centers) and uses np.digitize to assign each source cell to its
+    containing target bin. Used for bin-center averaging when regridding between
+    two grids (HRRR→ERA5 or ERA5→GFS).
 
-    Handles ERA5 latitude in either ascending or descending order.
+    Handles target latitude in either ascending or descending order. Works for
+    both 1D regular source grids (ERA5, GFS) and 2D curvilinear source grids
+    (HRRR); for 1D inputs, a meshgrid is created internally.
 
-    The result can be cached to a .npz file and reloaded on subsequent calls,
-    since the HRRR and ERA5 grids are fixed for a given model configuration.
-    The cache stores the forecast grid shape alongside the index arrays; if
-    the cached shape doesn't match the current grid, the map is recomputed.
+    The result is cached to a .npz file and reloaded on subsequent calls since
+    source/target grids are fixed. If the cached source shape doesn't match,
+    the map is recomputed.
 
     Args:
-        hrrr_lat2d: 2D array of HRRR latitudes, shape (ny, nx).
-        hrrr_lon2d: 2D array of HRRR longitudes, shape (ny, nx).
-        era5_lats: 1D array of ERA5 latitude centers, shape (n_lat,).
-                   May be ascending or descending.
-        era5_lons: 1D array of ERA5 longitude centers (ascending), shape (n_lon,).
-        cache_path: Optional path to a .npz file for caching the bin map.
-                    If the file exists and force_rebuild is False, the cached
-                    map is loaded instead of recomputed. Pass None to skip
-                    caching entirely.
+        src_lats: Source latitude centers. 1D for regular grids (ERA5, GFS);
+                  2D for curvilinear grids (HRRR). May be ascending or descending.
+        src_lons: Source longitude centers, same ndim as src_lats.
+        tgt_lats: 1D array of target latitude centers. May be ascending or descending.
+        tgt_lons: 1D array of target longitude centers (ascending).
+        cache_path: Optional .npz path for caching. None disables caching.
         force_rebuild: If True, recompute and overwrite any existing cache file.
-                       Defaults to False.
 
     Returns:
         Tuple (bin_lat_idx, bin_lon_idx, valid_mask):
-            bin_lat_idx: 1D array, ERA5 lat index for each valid HRRR cell
-                         (indices into the original era5_lats ordering).
-            bin_lon_idx: 1D array, ERA5 lon index for each valid HRRR cell.
-            valid_mask: 1D boolean array (len = ny*nx), True for HRRR cells
-                        that fall within the ERA5 domain.
+            bin_lat_idx: 1D array, target lat index for each valid source cell
+                         (indices into the original tgt_lats ordering).
+            bin_lon_idx: 1D array, target lon index for each valid source cell.
+            valid_mask:  1D boolean array (len = total source cells), True for
+                         source cells that fall within the target domain.
     """
+    if src_lats.ndim == 1:
+        src_lat2d, src_lon2d = np.meshgrid(src_lats, src_lons, indexing='ij')
+    else:
+        src_lat2d, src_lon2d = src_lats, src_lons
+    src_shape = src_lat2d.shape
+
     # ── Try loading from cache ────────────────────────────────────────────
     if cache_path is not None and os.path.exists(cache_path) and not force_rebuild:
         cached = np.load(cache_path)
-        cached_shape = tuple(cached['hrrr_shape'])
-        if cached_shape == hrrr_lat2d.shape:
+        cached_shape = tuple(cached['src_shape'])
+        if cached_shape == src_shape:
             print(f"  Loaded bin map from cache: {cache_path}")
             return cached['bin_lat_idx'], cached['bin_lon_idx'], cached['valid_mask']
         else:
-            print(f"  Cache grid shape {cached_shape} ≠ current {hrrr_lat2d.shape}; "
-                  f"rebuilding...")
+            print(f"  Cache grid shape {cached_shape} ≠ current {src_shape}; rebuilding...")
 
     # Work in ascending latitude for np.digitize
-    lat_ascending = era5_lats[0] < era5_lats[-1] if len(era5_lats) > 1 else True
-    lats_asc = era5_lats if lat_ascending else era5_lats[::-1]
+    lat_ascending = tgt_lats[0] < tgt_lats[-1] if len(tgt_lats) > 1 else True
+    tgt_lats_asc = tgt_lats if lat_ascending else tgt_lats[::-1]
 
-    # Build bin edges as midpoints between adjacent centers, plus outer edges
-    # For a regular 0.1° grid, half-spacing is 0.05°
-    half_dlat = np.diff(lats_asc).mean() / 2.0
-    half_dlon = np.diff(era5_lons).mean() / 2.0
+    half_dlat = np.diff(tgt_lats_asc).mean() / 2.0
+    half_dlon = np.diff(tgt_lons).mean() / 2.0
 
     lat_edges = np.concatenate([
-        [lats_asc[0] - half_dlat],
-        (lats_asc[:-1] + lats_asc[1:]) / 2,
-        [lats_asc[-1] + half_dlat],
+        [tgt_lats_asc[0] - half_dlat],
+        (tgt_lats_asc[:-1] + tgt_lats_asc[1:]) / 2,
+        [tgt_lats_asc[-1] + half_dlat],
     ])
     lon_edges = np.concatenate([
-        [era5_lons[0] - half_dlon],
-        (era5_lons[:-1] + era5_lons[1:]) / 2,
-        [era5_lons[-1] + half_dlon],
+        [tgt_lons[0] - half_dlon],
+        (tgt_lons[:-1] + tgt_lons[1:]) / 2,
+        [tgt_lons[-1] + half_dlon],
     ])
 
-    flat_lat = hrrr_lat2d.ravel()
-    flat_lon = hrrr_lon2d.ravel()
+    lat_bin = np.digitize(src_lat2d.ravel(), lat_edges) - 1
+    lon_bin = np.digitize(src_lon2d.ravel(), lon_edges) - 1
 
-    # np.digitize with ascending edges returns 1-based indices; subtract 1
-    lat_bin = np.digitize(flat_lat, lat_edges) - 1
-    lon_bin = np.digitize(flat_lon, lon_edges) - 1
+    n_lat_asc = len(tgt_lats_asc)
+    n_lon = len(tgt_lons)
 
-    n_lat_asc = len(lats_asc)
-    n_lon = len(era5_lons)
-
-    # Valid = within ERA5 domain (bin index in [0, n-1])
     valid = ((lat_bin >= 0) & (lat_bin < n_lat_asc) &
              (lon_bin >= 0) & (lon_bin < n_lon))
 
-    # If ERA5 lats were descending, flip the ascending bin indices back
     if not lat_ascending:
         lat_bin_out = (n_lat_asc - 1) - lat_bin[valid]
     else:
         lat_bin_out = lat_bin[valid]
 
-    # ── Save to cache ─────────────────────────────────────────────────────
+    # ── Save to cache ─────────────────────────────────────────────────────────
     if cache_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         np.savez(
@@ -397,7 +389,7 @@ def _build_hrrr_to_era5_bin_map(hrrr_lat2d, hrrr_lon2d, era5_lats, era5_lons,
             bin_lat_idx=lat_bin_out,
             bin_lon_idx=lon_bin[valid],
             valid_mask=valid,
-            hrrr_shape=np.array(hrrr_lat2d.shape, dtype=np.int32),
+            src_shape=np.array(src_shape, dtype=np.int32),
         )
         print(f"  Saved bin map to cache: {cache_path}")
 
@@ -957,10 +949,10 @@ def _compute_era5_gridded_errors(
         fc_lons: Forecast longitudes — 2D array (ny, nx) for bin method, 1D for interp.
         regrid_method: 'bin' for bin-center averaging (HRRR) or 'interp' for
                        bilinear interpolation (GFS). Defaults to 'bin'.
-        bin_map_cache_path: Passed through to _build_hrrr_to_era5_bin_map (only used
-                            when regrid_method='bin'). None disables caching.
-        force_rebuild_bin_map: Passed through to _build_hrrr_to_era5_bin_map (only used
-                               when regrid_method='bin'). Defaults to False.
+        bin_map_cache_path: Passed through to _build_bin_map (only used
+                            when regrid_method='bin' or 'era5_bin'). None disables caching.
+        force_rebuild_bin_map: Passed through to _build_bin_map (only used
+                               when regrid_method='bin' or 'era5_bin'). Defaults to False.
         wspd100_forecasts: Optional list of forecast record dicts for 100m wind speed
                            (HRRR: si100 variable; GFS: si100 from wspd100/ dir).
         wdir100_forecasts: Optional list of forecast record dicts for 100m wind direction.
@@ -986,12 +978,28 @@ def _compute_era5_gridded_errors(
     # ── Step 2: Set up regridding ────────────────────────────────────────
     era5_lats = era5_ds.latitude.values   # 1D
     era5_lons = era5_ds.longitude.values  # 1D
-    n_lat = len(era5_lats)
-    n_lon = len(era5_lons)
 
     use_interp = (regrid_method == 'interp')
+    use_era5_bin = (regrid_method == 'era5_bin')
 
-    if use_interp:
+    # Output grid: GFS native for era5_bin, ERA5 grid for all other methods
+    out_lats = fc_lats if use_era5_bin else era5_lats
+    out_lons = fc_lons if use_era5_bin else era5_lons
+    n_lat = len(out_lats)
+    n_lon = len(out_lons)
+
+    if use_era5_bin:
+        # Bin-center averaging: ERA5 fine 0.1° grid → GFS coarse 0.25° grid
+        print(f"  Building ERA5 → {model_name} bin map for regridding...")
+        bin_lat_idx, bin_lon_idx, valid_mask = _build_bin_map(
+            era5_lats, era5_lons, fc_lats, fc_lons,
+            cache_path=bin_map_cache_path,
+            force_rebuild=force_rebuild_bin_map,
+        )
+        n_valid = valid_mask.sum()
+        print(f"  {n_valid}/{len(era5_lats) * len(era5_lons)} ERA5 cells fall within "
+              f"{model_name} domain; output: {n_lat} × {n_lon}")
+    elif use_interp:
         # Bilinear interpolation: GFS coarse regular grid → ERA5
         print(f"  Using bilinear interpolation for {model_name} → ERA5 regridding")
         print(f"  Forecast grid: {len(fc_lats)} lat × {len(fc_lons)} lon "
@@ -999,7 +1007,7 @@ def _compute_era5_gridded_errors(
     else:
         # Bin-center averaging: HRRR high-res 2D grid → ERA5
         print(f"  Building {model_name} → ERA5 bin map for regridding...")
-        bin_lat_idx, bin_lon_idx, valid_mask = _build_hrrr_to_era5_bin_map(
+        bin_lat_idx, bin_lon_idx, valid_mask = _build_bin_map(
             fc_lats, fc_lons, era5_lats, era5_lons,
             cache_path=bin_map_cache_path,
             force_rebuild=force_rebuild_bin_map,
@@ -1023,8 +1031,13 @@ def _compute_era5_gridded_errors(
         ti = time_to_idx[vt]
         li = lead_to_idx[lh]
 
-        if use_interp:
-            # Bilinear interpolation (GFS)
+        if use_era5_bin:
+            # ERA5 will be binned to GFS grid; forecast is already on the output grid
+            fc_temp_arr[ti, li] = temp_index[(vt, lh)]
+            fc_wspd_arr[ti, li] = wspd_index[(vt, lh)]
+            fc_wdir_arr[ti, li] = wdir_index[(vt, lh)]
+        elif use_interp:
+            # Bilinear interpolation (GFS → ERA5)
             fc_temp_arr[ti, li] = _regrid_regular_field_to_era5(
                 temp_index[(vt, lh)], fc_lats, fc_lons, era5_lats, era5_lons,
             )
@@ -1033,7 +1046,7 @@ def _compute_era5_gridded_errors(
                 fc_lats, fc_lons, era5_lats, era5_lons,
             )
         else:
-            # Bin-center averaging (HRRR)
+            # Bin-center averaging (HRRR → ERA5)
             fc_temp_arr[ti, li] = _regrid_field_to_era5(
                 temp_index[(vt, lh)], bin_lat_idx, bin_lon_idx,
                 valid_mask, n_lat, n_lon,
@@ -1070,7 +1083,11 @@ def _compute_era5_gridded_errors(
             if vt not in time_to_idx or lh not in lead_to_idx:
                 continue
             ti, li = time_to_idx[vt], lead_to_idx[lh]
-            if use_interp:
+            if use_era5_bin:
+                # GFS 100m wind is already on the native output grid
+                fc_wspd100_arr[ti, li] = wspd100_index[(vt, lh)]
+                fc_wdir100_arr[ti, li] = wdir100_index[(vt, lh)]
+            elif use_interp:
                 fc_wspd100_arr[ti, li], fc_wdir100_arr[ti, li] = _regrid_regular_wind_to_era5(
                     wspd100_index[(vt, lh)], wdir100_index[(vt, lh)],
                     fc_lats, fc_lons, era5_lats, era5_lons,
@@ -1097,8 +1114,8 @@ def _compute_era5_gridded_errors(
         coords={
             'valid_time': ('valid_time', vt_dt64),
             'lead_hours': ('lead_hours', lead_hours_list),
-            'latitude':   ('latitude', era5_lats),
-            'longitude':  ('longitude', era5_lons),
+            'latitude':   ('latitude', out_lats),
+            'longitude':  ('longitude', out_lons),
         },
     )
     if has_100m:
@@ -1111,40 +1128,60 @@ def _compute_era5_gridded_errors(
     # Convert ERA5-Land times to US/Central; deduplicate DST fall-back fold hour.
     era5_central_dt64, keep_idx = _era5_central_times(era5_ds)
 
-    # Land mask: cells where ERA5 t2m is all NaN across time are ocean
-    era5_t2m_vals = era5_ds['t2m'].values[keep_idx]  # (n_era5_times, n_lat, n_lon)
-    land_mask = ~np.all(np.isnan(era5_t2m_vals), axis=0)  # (n_lat, n_lon)
-    print(f"  ERA5 grid: {n_lat} lat × {n_lon} lon, {land_mask.sum()} land cells")
+    era5_t2m_raw  = era5_ds['t2m'].values[keep_idx]   # (n_era5_times, n_era5_lat, n_era5_lon), K
+    era5_wspd_raw = era5_ds['wspd'].values[keep_idx]   # m/s
+    era5_wdir_raw = era5_ds['wdir'].values[keep_idx]   # degrees
+
+    if use_era5_bin:
+        # Bin-average ERA5 0.1° fields to the GFS 0.25° output grid
+        n_era5_times = len(era5_central_dt64)
+        era5_temp_out = np.full((n_era5_times, n_lat, n_lon), np.nan, dtype=np.float32)
+        era5_wspd_out = np.full((n_era5_times, n_lat, n_lon), np.nan, dtype=np.float32)
+        era5_wdir_out = np.full((n_era5_times, n_lat, n_lon), np.nan, dtype=np.float32)
+        for ti in range(n_era5_times):
+            era5_temp_out[ti] = _regrid_field_to_era5(
+                era5_t2m_raw[ti], bin_lat_idx, bin_lon_idx, valid_mask, n_lat, n_lon,
+            )
+            era5_wspd_out[ti], era5_wdir_out[ti] = _regrid_wind_to_era5(
+                era5_wspd_raw[ti], era5_wdir_raw[ti],
+                bin_lat_idx, bin_lon_idx, valid_mask, n_lat, n_lon,
+            )
+        era5_temp_out -= np.float32(273.15)  # K → °C
+        land_mask = ~np.all(np.isnan(era5_temp_out), axis=0)
+        print(f"  Output grid: {n_lat} lat × {n_lon} lon, {land_mask.sum()} land cells")
+    else:
+        era5_temp_out = (era5_t2m_raw - 273.15).astype(np.float32)
+        era5_wspd_out = era5_wspd_raw.astype(np.float32)
+        era5_wdir_out = era5_wdir_raw.astype(np.float32)
+        land_mask = ~np.all(np.isnan(era5_t2m_raw), axis=0)
+        print(f"  ERA5 grid: {n_lat} lat × {n_lon} lon, {land_mask.sum()} land cells")
 
     era5_obs = xr.Dataset(
         {
-            'era5_temp': (['valid_time', 'latitude', 'longitude'],
-                          (era5_t2m_vals - 273.15).astype(np.float32)),
-            'era5_wspd': (['valid_time', 'latitude', 'longitude'],
-                          era5_ds['wspd'].values[keep_idx].astype(np.float32)),
-            'era5_wdir': (['valid_time', 'latitude', 'longitude'],
-                          era5_ds['wdir'].values[keep_idx].astype(np.float32)),
+            'era5_temp': (['valid_time', 'latitude', 'longitude'], era5_temp_out),
+            'era5_wspd': (['valid_time', 'latitude', 'longitude'], era5_wspd_out),
+            'era5_wdir': (['valid_time', 'latitude', 'longitude'], era5_wdir_out),
         },
         coords={
             'valid_time': ('valid_time', era5_central_dt64),
-            'latitude':   ('latitude', era5_lats),
-            'longitude':  ('longitude', era5_lons),
+            'latitude':   ('latitude', out_lats),
+            'longitude':  ('longitude', out_lons),
         },
     )
 
     # ── Step 5.5: Build ERA5 100m wind observations ───────────────────────────
     # ERA5 100m wind (reanalysis-era5-single-levels, 0.25°) is interpolated to
-    # the ERA5-Land 0.1° grid via U/V decomposition + bilinear interpolation.
+    # the output grid via U/V decomposition + bilinear interpolation.
     era5_100m_obs = None
     if has_100m:
         era5_100m_dt64, keep_100m = _era5_central_times(era5_wind100m_ds)
 
-        # Interpolate U/V from ERA5 0.25° to ERA5-Land 0.1° (all times at once)
+        # Interpolate U/V from ERA5 0.25° to the output grid (all times at once)
         u100_rg = era5_wind100m_ds['u100'].isel(valid_time=keep_100m).interp(
-            latitude=era5_lats, longitude=era5_lons, method='linear',
+            latitude=out_lats, longitude=out_lons, method='linear',
         ).values.astype(np.float32)
         v100_rg = era5_wind100m_ds['v100'].isel(valid_time=keep_100m).interp(
-            latitude=era5_lats, longitude=era5_lons, method='linear',
+            latitude=out_lats, longitude=out_lons, method='linear',
         ).values.astype(np.float32)
 
         era5_wspd100 = np.sqrt(u100_rg**2 + v100_rg**2)
@@ -1157,11 +1194,11 @@ def _compute_era5_gridded_errors(
             },
             coords={
                 'valid_time': ('valid_time', era5_100m_dt64),
-                'latitude':   ('latitude', era5_lats),
-                'longitude':  ('longitude', era5_lons),
+                'latitude':   ('latitude', out_lats),
+                'longitude':  ('longitude', out_lons),
             },
         )
-        print(f"  ERA5 100m wind interpolated to ERA5-Land grid: {len(era5_100m_dt64)} steps")
+        print(f"  ERA5 100m wind interpolated to output grid: {len(era5_100m_dt64)} steps")
 
     # ── Step 6: Merge forecast and ERA5 on shared coordinates ────────────
     # ERA5 has dims (valid_time, lat, lon); forecast has (valid_time, lead_hours, lat, lon).
@@ -1300,8 +1337,8 @@ def _compute_era5_gridded_errors(
                     continue
                 row = {
                     'cell_id': f'era5_{yi}_{xi}',
-                    'lat': float(era5_lats[yi]),
-                    'lon': float(era5_lons[xi]),
+                    'lat': float(out_lats[yi]),
+                    'lon': float(out_lons[xi]),
                     'lead_hours': lead,
                     'n_obs': int(n_obs[yi, xi]),
                     'temp_mae': float(temp_mae[yi, xi]),
@@ -1496,12 +1533,12 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
     # ── Regrid forecasts, merge with ERA5, compute errors ──────────────────
     regrid_method = cfg['regrid_method']
 
-    # Bin map caching is only relevant for the 'bin' regridding method
+    # Bin map caching is only relevant for bin-averaging regridding methods
     bin_map_cache_path = None
     if regrid_method == 'bin':
-        bin_map_cache_path = os.path.join(
-            processed_dir, f'{model_lower}_to_era5_bin_map.npz'
-        )
+        bin_map_cache_path = os.path.join(processed_dir, 'hrrr_to_era5_bin_map.npz')
+    elif regrid_method == 'era5_bin':
+        bin_map_cache_path = os.path.join(processed_dir, 'era5_to_gfs_bin_map.npz')
 
     print(f"Computing ERA5-vs-{model_name} errors for {year}-{month:02d}...")
     summary = _compute_era5_gridded_errors(
@@ -1522,4 +1559,4 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
 
 
 if __name__ == '__main__':
-    calculate_era5_errors_for_month(2025, 1, model='hrrr', force_rebuild_bin_map=False)
+    calculate_era5_errors_for_month(2025, 1, model='gfs', force_rebuild_bin_map=False)

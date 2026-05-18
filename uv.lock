@@ -704,6 +704,18 @@ wheels = [
 ]
 
 [[package]]
+name = "eofs"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/86/36/45486898340e705cf568c408b0c7a182bad15eeebb068ff98eabe083260b/eofs-2.0.0.tar.gz", hash = "sha256:4afecba7dd8076399803b71570d96a12dce237615c6317685f83a206fe70ee57", size = 1010315 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/e9/c0ad0bd4c1ac55cc9f1c0d77dc6be2eed9ef0027027a5dcef7575f860899/eofs-2.0.0-py3-none-any.whl", hash = "sha256:a5a045ac044cdf3a8f6607b5fde092b9a92bf7231ae57ecf3803e35287667c55", size = 1082764 },
+]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3181,6 +3193,7 @@ dependencies = [
     { name = "cfgrib" },
     { name = "cftime" },
     { name = "ecmwf-api-client" },
+    { name = "eofs" },
     { name = "formulaic" },
     { name = "geopandas" },
     { name = "great-tables" },
@@ -3221,6 +3234,7 @@ requires-dist = [
     { name = "cfgrib", specifier = ">=0.9.10" },
     { name = "cftime", specifier = ">=1.6.5" },
     { name = "ecmwf-api-client", specifier = ">=1.6.3" },
+    { name = "eofs", specifier = ">=2.0.0" },
     { name = "formulaic", specifier = ">=1.2.1" },
     { name = "geopandas", specifier = ">=1.1.2" },
     { name = "great-tables", specifier = ">=0.21.0" },

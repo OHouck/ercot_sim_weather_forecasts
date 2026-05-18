@@ -1,5 +1,11 @@
 """Build the ERA5 pixel × hour analysis dataset for all Texas grid cells.
 
+THIS WAS THE MAIN DATABUILD SCRIPT FOR THE PIXEL LEVEL REGRESSION ANALYSES. 
+NOT NEEDED FOR MAIN PCA ANALYSES, WHICH DIRECLTY USE .nc FORECAST ERROR FILES
+
+THIS IS NOW DEPRECIATED BECAUSE GFS ERRORS ARE NOT SAVED AT 0.25° RESOLUTION
+INSTEAD OF 0.1° RESOLUTION
+
 Merges, for every ERA5 0.1° pixel whose centre lies inside the Texas state
 boundary:
 1. ERA5 gridded forecast errors (NetCDF) — time-varying, 4D

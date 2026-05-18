@@ -40,4 +40,5 @@ dependencies = [
     "captum>=0.7.0",
     "binsreg>=2.1.7",
     "lightgbm>=4.6.0",
+    "eofs>=2.0.0",
 ]

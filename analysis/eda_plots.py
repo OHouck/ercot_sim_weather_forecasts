@@ -1134,11 +1134,17 @@ def plot_offer_curves(year=2025, save_dir=None):
     x_vals   = [int(q * 100) for q in QUANTILE_LEVELS]
     col_vals = [f"offer_price_p{x}" for x in x_vals]
 
-    dam_df = pd.read_parquet(dam_path, columns=["Resource Type", "Delivery Date", "marginal_cost"] + col_vals)
+    dam_df = pd.read_parquet(
+        dam_path,
+        columns=["Resource Name", "Resource Type", "Delivery Date", "HSL", "marginal_cost"] + col_vals,
+    )
     dam_df["month"] = pd.to_datetime(dam_df["Delivery Date"]).dt.month
 
     if rt_path.exists():
-        rt_df = pd.read_parquet(rt_path, columns=["Resource Type", "valid_time", "marginal_cost"] + col_vals)
+        rt_df = pd.read_parquet(
+            rt_path,
+            columns=["Resource Name", "Resource Type", "valid_time", "HSL", "marginal_cost"] + col_vals,
+        )
         rt_df["month"] = pd.to_datetime(rt_df["valid_time"]).dt.month
     else:
         rt_df = None
@@ -1227,6 +1233,127 @@ def plot_offer_curves(year=2025, save_dir=None):
         rt_sub  = rt_df[rt_df["month"].isin(months)] if rt_df is not None else None
         out_paths[season_key] = _render(dam_sub, rt_sub, season_title,
                                         save_dir / f"offer_curves_{year}_{season_key}.png")
+
+    # --- Top-5 generators per type (by average HSL) ---------------------
+    # Create a compact 2x3 figure showing offer curves for the 5 largest
+    # generators (by avg HSL over the full-year) for three aggregate groups:
+    #  CC (both sizes), CT (both sizes), Coal/Lignite.
+    def _select_top_n_resources(df, types_set, n=5):
+        if df is None or df.empty:
+            return []
+        # require necessary columns
+        if "Resource Name" not in df.columns or "HSL" not in df.columns or "Resource Type" not in df.columns:
+            return []
+        # compute average HSL per Resource Name
+        avg_hsl = (
+            df.groupby("Resource Name")["HSL"].mean().dropna()
+        )
+        # resources that are of the requested types
+        resources_of_type = df[df["Resource Type"].isin(types_set)]["Resource Name"].unique()
+        avg_hsl = avg_hsl.loc[avg_hsl.index.isin(resources_of_type)]
+        top = avg_hsl.nlargest(n).index.tolist()
+        return top
+
+    # aggregate groups: combine large+small CCGT and SCGT into single groups
+    CC_GROUP = {"CCGT90", "CCLE90"}
+    SC_GROUP = {"SCGT90", "SCLE90"}
+    COAL_GROUP = COAL_TYPES
+
+    top_groups = [
+        ("Combined Cycle", CC_GROUP),
+        ("Single Cycle", SC_GROUP),
+        ("Coal / Lignite", COAL_GROUP),
+    ]
+
+    def _render_top5(dam_df_full, rt_df_full, save_path):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+        fig.suptitle(
+            f"Top-5 Generators by Avg HSL — Offer Curves and Marginal Costs ({year})",
+            fontsize=11, fontweight="bold",
+        )
+
+        for row_axes, (row_df, market_label) in zip(
+            axes, [(dam_df_full, "DAM"), (rt_df_full, "RT")]
+        ):
+            if row_df is None or row_df.empty:
+                for ax in row_axes:
+                    ax.text(0.5, 0.5, f"No {market_label} data", transform=ax.transAxes,
+                            ha="center", va="center", fontsize=9, color="gray", style="italic")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                continue
+
+            for ax, (label, types) in zip(row_axes, top_groups):
+                ax.set_title(f"{market_label}: {label}", fontsize=9, fontweight="bold")
+
+                top_resources = _select_top_n_resources(row_df, types, n=5)
+                if not top_resources:
+                    ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
+                    continue
+
+                sub = row_df[row_df["Resource Name"].isin(top_resources)]
+                if sub.empty:
+                    ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
+                    continue
+
+                # compute winsorized mean offer curve across the selected resources
+                # derive per-column 99th-percentile caps from the selected subset
+                caps = {c: np.nanpercentile(sub[c].dropna(), 99) if sub[c].dropna().size else np.inf for c in col_vals}
+                clipped = sub[col_vals].clip(upper=pd.Series(caps), axis=1)
+                per_resource = clipped.groupby(sub["Resource Name"]).mean()
+                mean_offer = per_resource.mean().tolist() if len(per_resource) else []
+                mean_mc = sub["marginal_cost"].mean()
+
+                # If mean_offer is empty (e.g., grouping mismatch), fall back to simple mean
+                if not mean_offer or not any(np.isfinite(mean_offer)):
+                    mean_offer = sub[col_vals].mean().tolist()
+
+                # sanitize NaN/Inf in mean_offer and mean_mc
+                mo = np.array(mean_offer, dtype=float)
+                finite_mask = np.isfinite(mo)
+                if not finite_mask.any():
+                    ax.text(0.5, 0.5, "No valid offer prices", transform=ax.transAxes,
+                            ha="center", va="center")
+                    continue
+                # fill any non-finite entries with median of finite values
+                med = float(np.nanmedian(mo[finite_mask]))
+                mo[~finite_mask] = med
+                mean_offer = mo.tolist()
+                if not np.isfinite(mean_mc):
+                    mean_mc = med
+
+                ax.plot(x_vals, mean_offer, color=C_OFFER, linewidth=2.0,
+                        marker="o", markersize=4, label="Offer price")
+                ax.axhline(mean_mc, color=C_MC, linewidth=2.0, linestyle="-", label="Marginal cost")
+
+                finite_vals = [v for v in mean_offer + [mean_mc] if np.isfinite(v)]
+                if not finite_vals:
+                    ax.text(0.5, 0.5, "No valid numeric data", transform=ax.transAxes,
+                            ha="center", va="center")
+                    continue
+                y_min = min(finite_vals)
+                y_max = max(finite_vals)
+                pad = max((y_max - y_min) * 0.20, 10)
+                ax.set_ylim(y_min - pad, y_max + pad)
+                ax.set_xlim(0, 100)
+                ax.set_xlabel("Quantity (% of capacity)", fontsize=8)
+                ax.set_ylabel("Price ($/MWh)", fontsize=8)
+                ax.legend(fontsize=7)
+                ax.grid(axis="both", alpha=0.25, linewidth=0.5)
+
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+        return save_path
+
+    # For top-5 selection use full-year data (dam_df and rt_df as loaded above)
+    try:
+        top5_path = save_dir / f"offer_curves_{year}_top5.png"
+        _render_top5(dam_df, rt_df, top5_path)
+        out_paths["top5"] = top5_path
+    except Exception as e:
+        print(f"  [WARNING] could not create top5 offer curves: {e}")
 
     return out_paths
 
