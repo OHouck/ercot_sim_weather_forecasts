@@ -500,6 +500,237 @@ def plot_forecast_error_correlation_grid(months=None, save_dir=None, n_sample=20
     return out_path
 
 
+def plot_cems_ercot_merge(year=2025, save_dir=None):
+    """Plot fraction of ERCOT thermal resources matched to heat-rate data.
+
+    Reads `{processed}/resource_heat_rates_{year}.parquet` and the DAM
+    disclosure parquet files under `{raw}/ercot/dam_disclosure/{year}` to
+    obtain the full list of ERCOT thermal resources. Saves a CSV of resource
+    names and a bar plot showing the fraction matched by `heat_rate_source`.
+
+    Returns:
+        (csv_path, fig_path)
+    """
+    dirs = setup_directories()
+    if save_dir is None:
+        save_dir = Path(dirs["figures"]) / "eda"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    hr_path = Path(dirs["processed"]) / f"resource_heat_rates_{year}.parquet"
+    if not hr_path.exists():
+        raise FileNotFoundError(f"Missing heat-rate parquet: {hr_path}")
+    hr = pd.read_parquet(hr_path)
+
+    # Ensure expected columns
+    if "resource_name" not in hr.columns:
+        raise RuntimeError("resource_heat_rates parquet missing 'resource_name' column")
+    if "heat_rate_source" not in hr.columns:
+        # if older pipeline used different column name, try to detect
+        if "heat_rate_source" not in hr.columns:
+            hr["heat_rate_source"] = pd.NA
+
+    # Load DAM disclosure resource names (thermal resources list)
+    dam_dir = Path(dirs["raw"]) / "ercot" / "dam_disclosure" / str(year)
+    resource_names = []
+    if dam_dir.exists():
+        for month_dir in sorted(dam_dir.glob("[0-9][0-9]")):
+            for p in month_dir.glob(f"dam_gen_resource_{year}*.parquet"):
+                try:
+                    df = pd.read_parquet(p)
+                except Exception:
+                    continue
+                if "Resource Name" in df.columns:
+                    vals = df["Resource Name"].dropna().astype(str).unique().tolist()
+                elif "resource_name" in df.columns:
+                    vals = df["resource_name"].dropna().astype(str).unique().tolist()
+                else:
+                    vals = []
+                resource_names.extend(vals)
+    else:
+        print(f"  [WARNING] DAM disclosure folder not found: {dam_dir}")
+
+    resource_names = sorted(set(resource_names))
+    if not resource_names:
+        print("  [WARNING] No DAM resource names found — falling back to heat-rate table list")
+        resource_names = sorted(hr["resource_name"].dropna().astype(str).unique().tolist())
+
+    # Save resource names CSV
+    csv_path = Path(save_dir) / f"ercot_thermal_resources_{year}.csv"
+    pd.DataFrame({"resource_name": resource_names}).to_csv(csv_path, index=False)
+    print(f"Saved resource name list: {csv_path}")
+
+    # Merge heat-rate source info onto the resource list
+    hr_subset = hr[["resource_name", "heat_rate_source"]].drop_duplicates("resource_name")
+    resources_df = pd.DataFrame({"resource_name": resource_names})
+    merged = resources_df.merge(hr_subset, on="resource_name", how="left")
+    merged["heat_rate_source"] = merged["heat_rate_source"].fillna("unmatched")
+
+    counts = merged["heat_rate_source"].value_counts().sort_values(ascending=False)
+    frac = counts / counts.sum()
+
+    # Make a readable label mapping
+    label_map = {
+        "cems_unit": "CEMS (unit)",
+        "cems_plant": "CEMS (plant)",
+        "eia923_pm_fuel": "EIA-923 (plant×PM×fuel)",
+        "eia923_pm": "EIA-923 (plant×PM)",
+        "eia923_plant": "EIA-923 (plant)",
+        "tech_default": "Tech default",
+        "unmatched": "Unmatched",
+    }
+    labels = [label_map.get(k, k) for k in frac.index]
+
+    # Plot fractions
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(range(len(frac)), frac.values, color="#4c72b0", edgecolor="none")
+    ax.set_xticks(range(len(frac)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel("Fraction of thermal resources")
+    ax.set_ylim(0, 1.02)
+    ax.set_title(f"ERCOT thermal resources: heat-rate source breakdown ({year})")
+
+    # Annotate bars with percentages
+    for i, v in enumerate(frac.values):
+        ax.text(i, v + 0.02, f"{v*100:.1f}%", ha="center", va="bottom", fontsize=9)
+
+    fig.tight_layout()
+    fig_path = Path(save_dir) / f"cems_ercot_merge_match_fraction_{year}.png"
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved match-fraction plot: {fig_path}")
+
+    return csv_path, fig_path
+
+
+def plot_cems_ercot_merge_enriched(year=2025, save_dir=None, top_n_types=8):
+    """Enriched stacked-bar plot of match fractions.
+
+    Produces a single figure with stacked bars for:
+      - Overall sample
+      - Each resource type (up to `top_n_types` most common)
+      - Quartiles of annual SCED net generation (Q1..Q4)
+
+    Also saves a CSV with the fractional breakdown per group and per source.
+    Returns: (breakdown_csv_path, fig_path)
+    """
+    dirs = setup_directories()
+    if save_dir is None:
+        save_dir = Path(dirs["figures"]) / "eda"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    hr_path = Path(dirs["processed"]) / f"resource_heat_rates_{year}.parquet"
+    if not hr_path.exists():
+        raise FileNotFoundError(f"Missing heat-rate parquet: {hr_path}")
+    hr = pd.read_parquet(hr_path)
+
+    # Load SCED annual net generation to form quartiles (fallback to zero)
+    try:
+        from process_data.process_sced_thermal import build_sced_thermal_annual
+        sced = build_sced_thermal_annual(year, force_rebuild=False)
+        sced = sced[["resource_name", "net_gen_mwh_annual"]]
+    except Exception:
+        sced = pd.DataFrame(columns=["resource_name", "net_gen_mwh_annual"])
+        print(f"  [WARNING] could not load SCED annual; quartile groups will be empty")
+
+    # Prepare master resource table
+    resources = hr[["resource_name", "resource_type", "heat_rate_source"]].drop_duplicates("resource_name")
+    resources["resource_name"] = resources["resource_name"].astype(str)
+    resources = resources.merge(sced, on="resource_name", how="left")
+    resources["net_gen_mwh_annual"] = pd.to_numeric(resources.get("net_gen_mwh_annual"), errors="coerce").fillna(0.0)
+    resources["heat_rate_source"] = resources["heat_rate_source"].fillna("unmatched")
+
+    # Define groups: Overall, top resource types, quartiles
+    overall_label = "Overall"
+    type_counts = resources["resource_type"].fillna("UNKNOWN").value_counts()
+    top_types = type_counts.nlargest(top_n_types).index.tolist()
+    type_labels = list(top_types)
+
+    # Quartiles among resources with positive generation; if none, use empty
+    pos = resources[resources["net_gen_mwh_annual"] > 0]
+    if len(pos) >= 4:
+        quart_edges = pos["net_gen_mwh_annual"].quantile([0.25, 0.5, 0.75]).values
+        def qlabel(val):
+            if val <= quart_edges[0]:
+                return "Q1"
+            if val <= quart_edges[1]:
+                return "Q2"
+            if val <= quart_edges[2]:
+                return "Q3"
+            return "Q4"
+        resources["gen_quartile"] = resources["net_gen_mwh_annual"].map(qlabel)
+    else:
+        resources["gen_quartile"] = pd.NA
+
+    quart_labels = ["Q1", "Q2", "Q3", "Q4"]
+
+    groups = [overall_label] + type_labels + quart_labels
+
+    # Identify all heat_rate_source categories present
+    sources = resources["heat_rate_source"].fillna("unmatched").unique().tolist()
+    # Put tech_default and unmatched last for readability
+    def sort_key(s):
+        if s == "tech_default":
+            return (2, s)
+        if s == "unmatched":
+            return (3, s)
+        return (1, s)
+    sources = sorted(sources, key=sort_key)
+
+    # Compute fractional breakdown per group
+    rows = []
+    for g in groups:
+        if g == overall_label:
+            subset = resources
+        elif g in quart_labels:
+            subset = resources[resources["gen_quartile"] == g]
+        else:
+            subset = resources[resources["resource_type"] == g]
+
+        total = len(subset)
+        counts = subset["heat_rate_source"].value_counts()
+        for src in sources:
+            cnt = int(counts.get(src, 0))
+            frac = cnt / total if total > 0 else 0.0
+            rows.append({"group": g, "source": src, "count": cnt, "fraction": frac, "n_total": total})
+
+    breakdown = pd.DataFrame(rows)
+    csv_out = Path(save_dir) / f"cems_ercot_match_breakdown_{year}.csv"
+    breakdown.to_csv(csv_out, index=False)
+    print(f"Saved breakdown CSV: {csv_out}")
+
+    # Pivot for plotting stacked bars
+    pivot = breakdown.pivot_table(index="group", columns="source", values="fraction", fill_value=0.0)
+    pivot = pivot.reindex(groups)  # ensure order
+
+    # Colors for sources
+    cmap = plt.get_cmap("tab20")
+    n_src = len(pivot.columns)
+    colors = [cmap(i % 20) for i in range(n_src)]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    left = np.zeros(len(pivot))
+    x = np.arange(len(pivot))
+    for i, src in enumerate(pivot.columns):
+        vals = pivot[src].values
+        ax.bar(x, vals, bottom=left, color=colors[i], label=src)
+        left += vals
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, rotation=45, ha="right")
+    ax.set_ylabel("Fraction of resources")
+    ax.set_title(f"Heat-rate match fractions — overall / by type / by gen quartile ({year})")
+    ax.set_ylim(0, 1.02)
+    ax.legend(title="heat_rate_source", bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    fig_out = Path(save_dir) / f"cems_ercot_merge_stacked_{year}.png"
+    fig.savefig(fig_out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved stacked-bar plot: {fig_out}")
+
+    # mark todo items complete
+    return csv_out, fig_out
+
+
 def plot_mean_forecast_error_maps(months=None, save_dir=None):
     """2×2 cartopy maps showing per-pixel mean forecast error across all hours.
 
@@ -870,6 +1101,136 @@ def plot_co2_intensity(months=None, save_dir=None):
     return out_path
 
 
+def plot_offer_curves(year=2025, save_dir=None):
+    """2×5 offer-curve figures split by season, plus a full-year figure.
+
+    Rows: DAM (top) | RT (bottom).
+    Columns: CC≥90 MW | CC<90 MW | CT≥90 MW | CT<90 MW | Coal/Lignite.
+
+    Four figures are produced: full year, summer (Jun–Aug), winter (Dec–Feb),
+    and fall+spring (Mar–May, Sep–Nov). Offer prices above the 99th percentile
+    per fuel group are winsorized to suppress extreme scarcity hours. Caps are
+    computed once from the full-year data so seasonal plots share the same scale.
+
+    Args:
+        year: operating year (default 2025)
+        save_dir: optional output directory; defaults to {figures}/eda
+
+    Returns:
+        dict mapping season label to saved figure Path.
+        Keys: "full", "summer", "winter", "spring_fall".
+    """
+    from process_data.compute_markups import QUANTILE_LEVELS, COAL_TYPES
+
+    dirs = setup_directories()
+    save_dir = Path(save_dir) if save_dir is not None else Path(dirs["figures"]) / "eda"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    dam_path = Path(dirs["processed"]) / f"dam_markups_{year}.parquet"
+    rt_path  = Path(dirs["processed"]) / f"rt_markups_{year}.parquet"
+    if not dam_path.exists():
+        raise FileNotFoundError(f"Missing DAM markups parquet: {dam_path}")
+
+    x_vals   = [int(q * 100) for q in QUANTILE_LEVELS]
+    col_vals = [f"offer_price_p{x}" for x in x_vals]
+
+    dam_df = pd.read_parquet(dam_path, columns=["Resource Type", "Delivery Date", "marginal_cost"] + col_vals)
+    dam_df["month"] = pd.to_datetime(dam_df["Delivery Date"]).dt.month
+
+    if rt_path.exists():
+        rt_df = pd.read_parquet(rt_path, columns=["Resource Type", "valid_time", "marginal_cost"] + col_vals)
+        rt_df["month"] = pd.to_datetime(rt_df["valid_time"]).dt.month
+    else:
+        rt_df = None
+
+    panels = [
+        ("CC ≥90 MW (CCGT90)", {"CCGT90"}),
+        ("CC <90 MW (CCLE90)", {"CCLE90"}),
+        ("CT ≥90 MW (SCGT90)", {"SCGT90"}),
+        ("CT <90 MW (SCLE90)", {"SCLE90"}),
+        ("Coal / Lignite",     COAL_TYPES),
+    ]
+
+    seasons = {
+        "full":        (list(range(1, 13)),   f"Full Year {year}"),
+        "summer":      ([6, 7, 8],            f"Summer (Jun–Aug) {year}"),
+        "winter":      ([12, 1, 2],           f"Winter (Dec–Feb) {year}"),
+        "spring_fall": ([3, 4, 5, 9, 10, 11], f"Spring/Fall (Mar–May, Sep–Nov) {year}"),
+    }
+
+    C_OFFER = "#6baed6"
+    C_MC    = "#08306b"
+
+    def _winsorize_caps(df):
+        caps = {}
+        for label, types in panels:
+            sub = df[df["Resource Type"].isin(types)]
+            caps[label] = {c: np.nanpercentile(sub[c], 99) if len(sub) else np.inf
+                           for c in col_vals}
+        return caps
+
+    dam_caps = _winsorize_caps(dam_df)
+    rt_caps  = _winsorize_caps(rt_df) if rt_df is not None else None
+
+    def _render(dam_sub, rt_sub, title, save_path):
+        fig, axes = plt.subplots(2, 5, figsize=(22, 9))
+        fig.suptitle(
+            f"Average Supply Offer Curves and Marginal Costs — ERCOT Thermal Generators\n{title}",
+            fontsize=11, fontweight="bold",
+        )
+        for row_axes, (row_df, market_label, caps) in zip(
+            axes, [(dam_sub, "DAM", dam_caps), (rt_sub, "RT", rt_caps)]
+        ):
+            if row_df is None:
+                for ax in row_axes:
+                    ax.text(0.5, 0.5, "No RT data", transform=ax.transAxes,
+                            ha="center", va="center", fontsize=8, color="gray", style="italic")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                continue
+
+            for ax, (label, types) in zip(row_axes, panels):
+                ax.set_title(f"{market_label}: {label}", fontsize=8, fontweight="bold")
+
+                sub = row_df[row_df["Resource Type"].isin(types)]
+                if sub.empty:
+                    ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
+                    continue
+
+                clipped    = sub[col_vals].clip(upper=pd.Series(caps[label]), axis=1)
+                mean_offer = clipped.mean().tolist()
+                mean_mc    = sub["marginal_cost"].mean()
+
+                ax.plot(x_vals, mean_offer, color=C_OFFER, linewidth=2.0,
+                        marker="o", markersize=4, label="Offer price")
+                ax.axhline(mean_mc, color=C_MC, linewidth=2.0, linestyle="-", label="Marginal cost")
+
+                y_min = min(mean_offer + [mean_mc])
+                y_max = max(mean_offer + [mean_mc])
+                pad = max((y_max - y_min) * 0.20, 10)
+                ax.set_ylim(y_min - pad, y_max + pad)
+                ax.set_xlim(0, 100)
+                ax.set_xlabel("Quantity (% of capacity)", fontsize=8)
+                ax.set_ylabel("Price ($/MWh)", fontsize=8)
+                ax.legend(fontsize=7)
+                ax.grid(axis="both", alpha=0.25, linewidth=0.5)
+
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+        return save_path
+
+    out_paths = {}
+    for season_key, (months, season_title) in seasons.items():
+        dam_sub = dam_df[dam_df["month"].isin(months)]
+        rt_sub  = rt_df[rt_df["month"].isin(months)] if rt_df is not None else None
+        out_paths[season_key] = _render(dam_sub, rt_sub, season_title,
+                                        save_dir / f"offer_curves_{year}_{season_key}.png")
+
+    return out_paths
+
+
 # =============================================================================
 # ── Entry point ───────────────────────────────────────────────────────────────
 # =============================================================================
@@ -886,7 +1247,8 @@ def run_eda_plots(months=None):
         # "mean_error_maps":         plot_mean_forecast_error_maps(months=months),
         # "std_error_maps":          plot_std_forecast_error_maps(months=months),
         # "error_vs_realized":       plot_forecast_error_vs_realized(months=months),
-        "co2_intensity":           plot_co2_intensity(months=months),
+        # "co2_intensity":           plot_co2_intensity(months=months),
+        "offer_curves":            plot_offer_curves(year=2025),
     }
 
 

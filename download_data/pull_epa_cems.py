@@ -1,16 +1,22 @@
-"""pull_epa_cems.py — Download EPA CEMS hourly emissions data for Texas (2025).
+"""pull_epa_cems.py — Download EPA CEMS hourly emissions data for Texas.
 
 Pulls hourly fuel input, gross load, SO2 and NOx mass from the EPA CAMD
 streaming API for all CEMS-reporting units in Texas. Data is fetched one month
-at a time and saved as parquet files. Unit-average heat rates and emissions rates
-are computed from these records and saved separately.
+at a time and saved as parquet files. Per-unit annual totals of heat input
+and emissions mass are aggregated and saved separately.
+
+Heat rates are deliberately **not** computed here — CEMS reports gross load
+(MW at the generator terminals) which is the wrong denominator. Heat rates
+are computed in ``process_data.cems_ercot_crosswalk`` after joining each
+CEMS unit to its ERCOT Resource Name(s) and dividing CEMS heat input by SCED
+net generation, following Woerman (2023) §C.1.
 
 Requires ~/keys/epa_camd_key.txt (free registration at
 https://www.epa.gov/power-sector/cam-api-portal).
 
 Output:
-  {raw}/cems/{year}/{mm}/cems_tx_{YYYYMM}.parquet
-  {processed}/unit_heat_rates_{year}.parquet
+  {raw}/cems/{year}/{mm}/cems_tx_{YYYYMM}.parquet      — hourly per-unit
+  {processed}/unit_heat_rates_{year}.parquet           — annual per-unit aggregates
 """
 
 import sys
@@ -92,26 +98,28 @@ def download_cems_month(year, month, force_rebuild=False):
     return df
 
 
-def compute_unit_heat_rates(year, force_rebuild=False):
-    """Compute unit-average heat rate and emissions rates from CEMS + net generation.
+def aggregate_unit_annual(year, force_rebuild=False):
+    """Aggregate CEMS hourly records to per-unit annual totals.
 
-    Follows Woerman (2023) §C.1: aggregate heat input (fuel burned) over the
-    full year, divide by aggregate net generation from the SCED disclosure to
-    get a constant heat rate per unit. Emissions rates use the same denominator.
+    Sums heat input (MMBtu), SO2 mass (lb), NOx mass (lb), gross load (MWh)
+    and operating hours over the full year for each (facilityId, unitId). Heat
+    rates are intentionally not computed here — they require SCED net
+    generation as the denominator and are produced by
+    ``process_data.cems_ercot_crosswalk.build_crosswalk``.
 
-    For units >25 MW: uses CEMS heat input / SCED net generation.
-    For units <25 MW or not in CEMS: falls back to EIA Form 923 plant-level data
-    (handled in cems_ercot_crosswalk.py after merging).
+    Gross load is retained for diagnostic purposes (e.g. cross-check against
+    SCED, identify periods where CEMS reported fuel input but no output).
 
     Args:
-        year: operating year (int)
-        force_rebuild: overwrite cached output if True (bool)
+        year: Operating year (int).
+        force_rebuild: Overwrite cached output if True.
 
     Returns:
-        DataFrame with one row per (facilityId, unitId) and columns:
-        heat_rate_mmbtu_mwh, so2_rate_lb_mwh, nox_rate_lb_mwh,
-        primary_fuel, unit_type, cems_gross_load_mwh, cems_heat_input_mmbtu,
-        heat_rate_source='cems'
+        DataFrame with columns:
+            facilityId, facilityName, unitId, primaryFuelInfo, unitType,
+            heat_input_mmbtu, so2_mass_lbs, nox_mass_lbs,
+            cems_gross_load_mwh, operating_hours.
+        One row per (facilityId, unitId) that operated at least one hour.
     """
     dirs = setup_directories()
     out_path = Path(dirs["processed"]) / f"unit_heat_rates_{year}.parquet"
@@ -120,7 +128,6 @@ def compute_unit_heat_rates(year, force_rebuild=False):
         print(f"  Cached: {out_path}")
         return pd.read_parquet(out_path)
 
-    # Load all monthly CEMS parquets for the year
     cems_dir = Path(dirs["raw"]) / "cems" / str(year)
     frames = []
     for month in range(1, 13):
@@ -128,77 +135,45 @@ def compute_unit_heat_rates(year, force_rebuild=False):
         if p.exists():
             frames.append(pd.read_parquet(p))
     if not frames:
-        raise FileNotFoundError(f"No CEMS parquets found for {year}. Run download_cems_month first.")
+        raise FileNotFoundError(
+            f"No CEMS parquets found for {year}. Run download_cems_month first."
+        )
     cems = pd.concat(frames, ignore_index=True)
+    operating = cems[cems["opTime"] > 0]
 
-    operating = cems[cems["opTime"] > 0].copy()
-
-    # calculate total heat input, SO2 and NOX mass and operating hours per unit for full year
     agg = (
         operating.groupby(["facilityId", "facilityName", "unitId", "primaryFuelInfo", "unitType"])
         .agg(
-            gross_load_mwh=("grossLoad", "sum"),
             heat_input_mmbtu=("heatInput", "sum"),
             so2_mass_lbs=("so2Mass", "sum"),
             nox_mass_lbs=("noxMass", "sum"),
+            cems_gross_load_mwh=("grossLoad", "sum"),
             operating_hours=("opTime", "sum"),
         )
         .reset_index()
     )
-
-    # net gen (denominator) is added during crosswalk step; gross load used here
-    valid = agg["gross_load_mwh"] > 0
-    agg["heat_rate_mmbtu_mwh"] = agg["heat_input_mmbtu"] / agg["gross_load_mwh"]
-    agg["so2_rate_lb_mwh"] = agg["so2_mass_lbs"] / agg["gross_load_mwh"]
-    agg["nox_rate_lb_mwh"] = agg["nox_mass_lbs"] / agg["gross_load_mwh"]
-    agg.loc[~valid, ["heat_rate_mmbtu_mwh", "so2_rate_lb_mwh", "nox_rate_lb_mwh"]] = None
-
-    BOUNDS = {
-        "Combustion turbine": (9.0, 16.0),
-        "Combined cycle": (6.0, 10.0),
-        "Boiler": (8.5, 14.0),
-        "Steam turbine": (8.5, 14.0),
-    }
-    for unit_type, (lo, hi) in BOUNDS.items():
-        mask = (agg["unitType"] == unit_type) & valid
-        out_of_range = mask & ((agg["heat_rate_mmbtu_mwh"] < lo) | (agg["heat_rate_mmbtu_mwh"] > hi))
-        n_flagged = out_of_range.sum()
-        if n_flagged > 0:
-            print(f"  WARNING: {n_flagged} {unit_type} units outside expected heat-rate range [{lo}, {hi}]")
-
-    agg["heat_rate_source"] = "cems"
     agg.to_parquet(out_path, index=False)
-    print(f"  Saved {len(agg)} unit heat rates to {out_path}")
-
-    print(f"\n  Summary by fuel type:")
-    summary = (
-        agg[valid]
-        .groupby("primaryFuelInfo")["heat_rate_mmbtu_mwh"]
-        .agg(["count", "mean", "min", "max"])
-        .round(2)
-    )
-    print(summary.to_string())
+    print(f"  Saved {len(agg)} unit annual aggregates to {out_path}")
     return agg
 
 
 def main():
-    """Download TX CEMS hourly data for all months of a year."""
+    """Download TX CEMS hourly data and aggregate to per-unit annual totals."""
     parser = argparse.ArgumentParser(description="Download EPA CEMS for Texas")
     parser.add_argument("--year", type=int, default=2025)
-    parser.add_argument("--months", type=int, nargs="+", default=list(range(12, 13)))
+    parser.add_argument("--months", type=int, nargs="+", default=list(range(1, 13)))
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--heat-rates-only", action="store_true",
-                        help="Skip downloads, just recompute heat rates from cached data")
+    parser.add_argument("--aggregate-only", action="store_true",
+                        help="Skip downloads, just rebuild annual aggregates from cached data")
     args = parser.parse_args()
 
-    if not args.heat_rates_only:
+    if not args.aggregate_only:
         for month in args.months:
             print(f"\n=== CEMS {args.year}-{month:02d} ===")
             download_cems_month(args.year, month, force_rebuild=args.force)
-    exit()
 
-    print(f"\n=== Computing unit heat rates for {args.year} ===")
-    df = compute_unit_heat_rates(args.year, force_rebuild=args.force)
+    print(f"\n=== Aggregating annual CEMS totals for {args.year} ===")
+    df = aggregate_unit_annual(args.year, force_rebuild=args.force)
     print(f"Total CEMS units: {len(df):,}")
 
 

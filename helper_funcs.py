@@ -4,6 +4,14 @@ import os
 
 import numpy as np
 
+# T90 -> turbine >90 MW, LE90 -> <= 90
+THERMAL_RESOURCE_TYPES = {
+    "CCGT90", "CCLE90", # combined-cycle gas turbines > or <= 90 MW
+    "SCGT90", "SCLE90", # simple-cycle gas turbines > or <= 90 MW
+    "GSREH", "GSNONR", "GSSUP", # gas steam resources (REH: reheatable, NONR: non-reheatable, SUP: supercritical)
+    "CLLIG" # lignite coal 
+}
+
 
 def setup_directories():
     """Set up directory structure based on environment."""

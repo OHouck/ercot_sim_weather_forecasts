@@ -132,6 +132,10 @@ def _extract_generators(zf, tx_plants):
             col_map['nameplate_power_factor'] = col
         elif ('lmp' in low and 'node' in low) or ('rto' in low and 'lmp' in low):
             col_map['lmp_node_designation'] = col
+        elif low in ('prime mover code', 'prime mover'):
+            col_map['prime_mover_code'] = col
+        elif low == 'energy source 1':
+            col_map['energy_source_1'] = col
 
     print(f"  Mapped generator columns: {col_map}")
 
@@ -148,7 +152,8 @@ def _extract_generators(zf, tx_plants):
     # Keep only the columns we want
     keep_cols = [c for c in ['plant_code', 'generator_id', 'technology',
                               'nameplate_capacity_mw', 'nameplate_power_factor',
-                              'lmp_node_designation']
+                              'lmp_node_designation',
+                              'prime_mover_code', 'energy_source_1']
                  if c in tx_gens.columns]
     tx_gens = tx_gens[keep_cols].copy()
 
@@ -158,6 +163,7 @@ def _extract_generators(zf, tx_plants):
 
     # Reorder columns
     desired_order = ['plant_code', 'generator_id', 'plant_name', 'technology',
+                     'prime_mover_code', 'energy_source_1',
                      'nameplate_capacity_mw', 'nameplate_power_factor',
                      'lmp_node_designation', 'lat', 'lon']
     tx_gens = tx_gens[[c for c in desired_order if c in tx_gens.columns]]

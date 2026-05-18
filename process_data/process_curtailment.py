@@ -100,18 +100,26 @@ def _find_sced_folders(year, month):
     return folders
 
 
-def _load_sced_disclosure_month(year, month):
+def _load_sced_disclosure_month(year, month, resource_types=None):
     """Load all SCED Gen Resource Data CSVs for one operating month.
 
     Navigates the nested ZIP structure:
       outer.zip → inner.zip → 60d_SCED_Gen_Resource_Data-{DD}-{MON}-{YY}.csv
 
-    Only loads renewable resource types (WIND, PVGR) to save memory.
+    Args:
+        year: Operating year (int).
+        month: Operating month (int, 1-12).
+        resource_types: Iterable of Resource Type codes to retain (e.g.
+            ``{"WIND", "PVGR"}`` or ``{"CCGT90", "CLLIG", ...}``). Defaults to
+            renewable types when None.
 
     Returns:
         DataFrame with columns: sced_time, resource_name, resource_type,
-        hsl, base_point, telemetered_output
+        hsl, base_point, telemetered_output, valid_time (hour floor).
     """
+    if resource_types is None:
+        resource_types = RENEWABLE_TYPES
+    resource_types = set(resource_types)
     sced_dirs = _find_sced_folders(year, month)
 
     frames = []
@@ -132,7 +140,6 @@ def _load_sced_disclosure_month(year, month):
             inner_data = outer_zip.read(inner_name)
             inner_zip = zipfile.ZipFile(io.BytesIO(inner_data))
 
-            # Find the Gen Resource Data CSV
             gen_csvs = [
                 n for n in inner_zip.namelist()
                 if "Gen_Resource" in n and n.endswith(".csv")
@@ -150,7 +157,6 @@ def _load_sced_disclosure_month(year, month):
                     dtype={"Resource Type": str},
                 )
             except (ValueError, KeyError):
-                # Try without trailing space in column name
                 try:
                     alt_cols = [c.rstrip() if c.endswith(" ") else c for c in USECOLS]
                     df = pd.read_csv(
@@ -162,11 +168,8 @@ def _load_sced_disclosure_month(year, month):
                     print(f"    WARNING: Could not read {csv_name}: {e}")
                     continue
 
-            # Normalize column names (strip whitespace)
             df.columns = df.columns.str.strip()
-
-            # Filter to renewable types only
-            df = df[df["Resource Type"].isin(RENEWABLE_TYPES)].copy()
+            df = df[df["Resource Type"].isin(resource_types)].copy()
 
             if len(df) > 0:
                 frames.append(df)

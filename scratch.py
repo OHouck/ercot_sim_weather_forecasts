@@ -9,13 +9,15 @@ import xarray as xr
 import pandas as pd
 
 
+THERMAL_RESOURCE_TYPES = {
+    "CCGT90", "CCLE90", "CCGT00", "CCLE00",
+    "SCGT90", "SCLE90",
+    "GSREH", "GSNONR", "GSSUP",
+    "CLLIG", "STEAM", "COAL", "NUC",
+}
 
-# path = "/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/raw_data/cems/2025/08/cems_tx_202508.parquet"
-# path = "/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/raw_data/cems/2025/12/cems_tx_202512.parquet"
-path = "/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/raw_data/ercot/dam_disclosure/2025/05/dam_gen_resource_202505.parquet"
-df = pd.read_parquet(path)
+path = "/Users/ohouck/Library/CloudStorage/OneDrive-TheUniversityofChicago/ercot_sim_weather_forecasts/processed_data/dam_markups_2025.parquet"
 
-# save to csv
-out_path = "~/Downloads/dam_gen_resource_202505.csv"
-df.to_csv(out_path, index=False)
-print(f"Saved to {out_path}")
+ds = pd.read_parquet(path)
+
+print(ds.head())
