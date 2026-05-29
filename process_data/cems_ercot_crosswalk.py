@@ -21,10 +21,14 @@ Tier A (CEMS unit ↔ EIA generator, within facility):
     - trailing-digit match (strip leading alpha from CEMS unitId)
     - suffix match (CEMS unitId ends with EIA generator_id or vice versa)
 
-Tier B (EIA generator ↔ ERCOT Resource Name, direct):
-    - lmp_clean == Resource Name                  (1:1)
+Tier B (EIA generator ↔ ERCOT Resource Name, via lmp_clean and settlement points):
+    - lmp_clean == Resource Name                  (exact)
     - lmp_clean is a prefix of Resource Names     (1:N, e.g. THW_CC1 → THW_CC1_1.._8)
-    - Resource Name is a prefix of lmp_clean      (N:1, rare)
+    - Resource Name is a prefix of lmp_clean      (rare reverse)
+    - lmp_clean == settlement_point               (SP expansion)
+    - lmp_clean is a prefix of settlement_points  (SP prefix expansion)
+    - fuzzy lmp_clean ↔ settlement_point          (WRatio ≥ 90)
+    - _MANUAL_PLANT_TO_SPS override               (hand-coded coal/steam plants)
 
 Aggregation (per facility):
     - If every CEMS unit at the facility maps to an EIA gen AND every such
@@ -55,6 +59,7 @@ import argparse
 import requests
 import pandas as pd
 from pathlib import Path
+from fuzzywuzzy import process as fuzz_process
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories, THERMAL_RESOURCE_TYPES
@@ -91,6 +96,47 @@ PLAUSIBLE_HEAT_RATE_RANGE = {
     "GSREH":  (8.0, 16.0), "GSNONR": (8.0, 16.0), "GSSUP": (8.0, 16.0),
     "CLLIG":  (8.5, 13.5), "STEAM":  (8.5, 13.5), "COAL":  (8.5, 13.5),
     "NUC":    (9.5, 12.0),
+}
+
+# Minimum fuzzywuzzy WRatio score to accept a settlement-point fuzzy match in Tier B.
+_FUZZY_SP_MIN_SCORE = 90
+
+# Column schema for the gen_to_resource DataFrame returned by _match_eia_gens_to_resources.
+_GEN_TO_RESOURCE_COLS = ["plant_code", "generator_id", "lmp_clean", "resource_name", "gen_match_strategy"]
+
+# Hand-coded EIA plant_code (= EPA ORIS) → ERCOT settlement-point list.
+# Fires before all lmp_clean strategies, overriding stale or missing EIA-860 lmp_node values.
+# Resource-level expansion from SP → resource_name happens automatically via sp_to_resources.
+# Three cases require entries here:
+#   (a) Coal/steam plants with no lmp_node in EIA-860
+#   (b) Gas plants whose lmp_node is stale (old SP naming convention, no longer in DAM)
+#   (c) Facilities absent from EIA-860 entirely (no_eia_plant in CEMS Tier A)
+_PLANT_SP_OVERRIDES = {
+    # --- Coal / steam: no lmp_node in EIA-860 ---
+    6146: ["MLSES_UNIT1", "MLSES_UNIT2", "MLSES_UNIT3"],          # Martin Lake SES
+    6178: ["COL_COLETOG1"],                                         # Coleto Creek
+    6179: ["FPPYD_FPP_G1", "FPPYD_FPP_G2", "FPPYD_FPP_G3"],       # Fayette Power Project
+    6180: ["OGSES_1", "OGSES_2"],                                   # Oak Grove SES
+    6183: ["SAN_SANMIGG1"],                                         # San Miguel Electric Coop
+    3446: ["TNP_TNP_O_1", "TNP_TNP_O_2"],                          # TNP One
+    # --- Gas plants: stale lmp_node (old SP names → current DAM names) ---
+    55480: ["FRNYPP_CC1", "FRNYPP_CC2"],             # Forney Power Plant (was FRNYPP_1/2_CCU)
+    55215: ["OECCS_CC1", "OECCS_CC2"],               # Odessa Ector (was OECCS_1/2)
+    60122: ["CBECII_CC3"],                            # Colorado Bend II (was CBECII_1/2)
+    50815: ["PSA_CC1"],                               # Odyssey/Altura Cogen (was PSA_PSA_G*)
+    59812: ["WHCCS2_CC2"],                            # Wolf Hollow II (was WHCCS2_4/5_6)
+    55097: ["LPCCS_CC1", "LPCCS_CC2"],               # Lamar Power Plant (was LPCCS_UNIT1/2)
+     4937: ["FERGCC_CC1"],                            # TC Ferguson (was FERCCC_GT1_1)
+    55320: ["WCPP_CC1"],                              # Wise County Power (was WCPP_CT1/CT2/ST1)
+    55086: ["LGE_CC1"],                               # Gregory Power (was LGE_LGE_GT*)
+    60264: ["BAC_RN_ALL"],                            # Bacliff Generating (was BAC_BAC_CTG*)
+    # --- Gas plants: no lmp_node in EIA-860 ---
+    55154: ["LOSTPI_CC1"],                                          # Lost Pines 1
+     3452: ["LHSES_UNIT1", "LHSES_UNIT2"],                         # Lake Hubbard SES
+     3601: ["GID_GIDEONG1", "GID_GIDEONG2", "GID_GIDEONG3"],       # Sim Gideon
+    # --- no_eia_plant facilities that are in ERCOT ---
+    55357: ["BVE_CC1"],                                             # Brazos Valley Energy LP
+    57865: ["AEEC"],                                                # Antelope Elk Energy Center
 }
 
 
@@ -262,70 +308,130 @@ def _match_cems_units_to_eia_gens(cems_units, eia):
 
 
 # ---------------------------------------------------------------------------
-# Tier B: EIA generator ↔ ERCOT Resource Name (direct, no settlement-point hop)
+# Tier B: EIA generator ↔ ERCOT Resource Name (via lmp_clean and settlement points)
 # ---------------------------------------------------------------------------
 
-def _match_eia_gens_to_resources(eia, resource_names):
-    """Match each EIA generator directly to ERCOT Resource Names via lmp_clean.
+def _is_lmp_prefix(lmp: str, candidate: str) -> bool:
+    """Return True if lmp is a strict prefix of candidate separated by _ or digit."""
+    return len(candidate) > len(lmp) and candidate.startswith(lmp) and candidate[len(lmp)] in "_0123456789"
 
-    Three strategies, applied in order, first hit wins per generator (a single
-    generator can still expand to multiple resources via prefix matching):
 
-      1. ``lmp_to_resource``      lmp_clean equals a Resource Name exactly
-      2. ``lmp_prefix_to_resource``  lmp_clean is a prefix of one or more
-                                     Resource Names (with at least one resource
-                                     name being strictly longer — common CC
-                                     split pattern THW_CC1 → THW_CC1_1.._8)
-      3. ``resource_prefix_to_lmp``  a Resource Name is a prefix of lmp_clean
-                                     (rare; covers cases where EIA carries a
-                                     more specific suffix than DAM)
+def _match_eia_gens_to_resources(eia, resource_names, thermal=None, sp_to_resources=None):
+    """Match each EIA generator to ERCOT Resource Names via lmp_clean.
+
+    Eight strategies applied in order; first hit wins per generator (a generator
+    can still expand to multiple resources via prefix or SP expansion):
+
+      0. ``manual_plant_sp``        plant is in _PLANT_SP_OVERRIDES — unconditional
+                                    override for missing or stale lmp_node values
+      1. ``lmp_to_resource``        lmp_clean equals a Resource Name exactly
+      2. ``lmp_prefix_to_resource`` lmp_clean is a prefix of Resource Names
+                                    (CC split: THW_CC1 → THW_CC1_1.._8)
+      3. ``resource_prefix_to_lmp`` a Resource Name is a prefix of lmp_clean
+      4. ``lmp_to_sp``              lmp_clean equals a settlement_point →
+                                    all resources for that SP
+      5. ``lmp_prefix_to_sp``       lmp_clean is a prefix of settlement_point(s)
+      6. ``lmp_fuzzy_to_sp``        fuzzy match of lmp_clean vs settlement_points
+                                    (WRatio >= _FUZZY_SP_MIN_SCORE, single best)
+
+    Strategies 0, 4–6 require ``thermal`` or ``sp_to_resources`` to be provided.
 
     Args:
         eia: EIA Form 860 DataFrame with plant_code, generator_id, lmp_clean.
         resource_names: iterable of valid ERCOT thermal Resource Names.
+        thermal: optional DataFrame with columns resource_name, settlement_point.
+            Used to build sp_to_resources if that arg is not passed directly.
+        sp_to_resources: optional prebuilt dict {settlement_point: [resource_name]}.
+            If provided, thermal is ignored for SP lookups (avoids duplicate groupby).
 
     Returns:
-        DataFrame with columns plant_code, generator_id, lmp_clean,
-        resource_name, gen_match_strategy. One row per (generator, resource)
+        DataFrame with columns _GEN_TO_RESOURCE_COLS. One row per (generator, resource)
         pair; generators with no match appear once with resource_name=None.
     """
     resource_set = set(resource_names)
     resource_list = sorted(resource_set)
 
+    if sp_to_resources is None and thermal is not None:
+        sp_to_resources = dict(thermal.groupby("settlement_point")["resource_name"].apply(list))
+    sp_to_resources = sp_to_resources or {}
+    sp_list_sorted = sorted(sp_to_resources)
+
     rows = []
     for _, gen in eia.iterrows():
         lmp = gen["lmp_clean"]
-        plant_code = gen["plant_code"]
+        raw_pc = gen["plant_code"]
+        plant_code = int(raw_pc) if not pd.isna(raw_pc) else None
         gen_id = gen["generator_id"]
+
+        # Strategy 0: plant-level SP override — fires first, overriding stale or missing
+        # lmp_node values in EIA-860. Handles (a) no lmp_node, (b) renamed SPs.
+        if sp_to_resources and plant_code is not None:
+            override_sps = _PLANT_SP_OVERRIDES.get(plant_code, [])
+            if override_sps:
+                override_rows = [
+                    (plant_code, gen_id, lmp, r, "manual_plant_sp")
+                    for sp in override_sps
+                    for r in sp_to_resources.get(sp, [])
+                ]
+                if override_rows:
+                    rows.extend(override_rows)
+                    continue
+                # Override SP not found in DAM — fall through with a warning so the
+                # entry can be corrected without silently losing the plant.
+                print(f"  WARN: _PLANT_SP_OVERRIDES[{plant_code}] SPs {override_sps} "
+                      "not found in DAM; falling back to lmp_clean strategies")
 
         if pd.isna(lmp) or not lmp:
             rows.append((plant_code, gen_id, lmp, None, "no_lmp"))
             continue
 
+        # Strategy 1: exact resource name match
         if lmp in resource_set:
             rows.append((plant_code, gen_id, lmp, lmp, "lmp_to_resource"))
             continue
 
-        prefix_hits = [
-            r for r in resource_list
-            if len(r) > len(lmp) and r.startswith(lmp) and (r[len(lmp)] in "_0123456789")
-        ]
+        # Strategy 2: lmp_clean is a strict prefix of resource names
+        prefix_hits = [r for r in resource_list if _is_lmp_prefix(lmp, r)]
         if prefix_hits:
             for r in prefix_hits:
                 rows.append((plant_code, gen_id, lmp, r, "lmp_prefix_to_resource"))
             continue
 
+        # Strategy 3: a resource name is a prefix of lmp_clean
         reverse_hits = [r for r in resource_list if len(r) < len(lmp) and lmp.startswith(r)]
         if reverse_hits:
             best = max(reverse_hits, key=len)
             rows.append((plant_code, gen_id, lmp, best, "resource_prefix_to_lmp"))
             continue
 
+        if sp_to_resources:
+            # Strategy 4: lmp_clean exactly matches a settlement_point
+            if lmp in sp_to_resources:
+                for r in sp_to_resources[lmp]:
+                    rows.append((plant_code, gen_id, lmp, r, "lmp_to_sp"))
+                continue
+
+            # Strategy 5: lmp_clean is a strict prefix of settlement_point names
+            sp_prefix_hits = [sp for sp in sp_list_sorted if _is_lmp_prefix(lmp, sp)]
+            if sp_prefix_hits:
+                for sp in sp_prefix_hits:
+                    for r in sp_to_resources[sp]:
+                        rows.append((plant_code, gen_id, lmp, r, "lmp_prefix_to_sp"))
+                continue
+
+            # Strategy 6: fuzzy match of lmp_clean against settlement_points
+            fuzzy_result = fuzz_process.extractOne(
+                lmp, sp_list_sorted, score_cutoff=_FUZZY_SP_MIN_SCORE
+            )
+            if fuzzy_result is not None:
+                best_sp = fuzzy_result[0]
+                for r in sp_to_resources[best_sp]:
+                    rows.append((plant_code, gen_id, lmp, r, "lmp_fuzzy_to_sp"))
+                continue
+
         rows.append((plant_code, gen_id, lmp, None, "unmatched"))
 
-    return pd.DataFrame(
-        rows, columns=["plant_code", "generator_id", "lmp_clean", "resource_name", "gen_match_strategy"]
-    )
+    return pd.DataFrame(rows, columns=_GEN_TO_RESOURCE_COLS)
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +443,8 @@ def _assign_groups(cems_with_gens, gen_to_resource):
 
     Within each facility, build a bipartite graph: CEMS unit ↔ ERCOT Resource
     Name, with an edge whenever the unit's matched EIA generator reaches the
-    resource (Tier B). The connected components of that graph are the
-    aggregation cells — every CEMS unit in a component contributes heat input
-    to the numerator and every resource in the component contributes net
-    generation to the denominator.
+    resource (Tier B). The connected components of that graph are the aggregation
+    cells.
 
     If any CEMS unit at the facility has no chain to a resource (missing Tier A
     or missing Tier B for its gen), the whole facility is promoted to a single
@@ -483,6 +587,55 @@ def _compute_heat_rates_per_group(cems_units, unit_groups, resource_groups, sced
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic CSV outputs
+# ---------------------------------------------------------------------------
+
+def _save_match_diagnostics(year, cw, resource_groups, thermal, dirs):
+    """Save three diagnostic CSVs: matched pairs, unmatched CEMS, unmatched ERCOT.
+
+    Args:
+        year: Operating year (int).
+        cw: Crosswalk DataFrame from build_crosswalk.
+        resource_groups: From _assign_groups.
+        thermal: Thermal resources DataFrame with resource_name, resource_type.
+        dirs: Directories dict from setup_directories.
+    """
+    proc = Path(dirs["processed"])
+
+    def _match_method(row):
+        """Classify the match path for a (CEMS unit, ERCOT resource) pair."""
+        if row["group_level"] == "plant":
+            return "plant_fallback"
+        return f"tier_a:{row['unit_match_strategy']}_tier_b"
+
+    matched = cw[cw["resource_name"].notna()][
+        ["facilityId", "facilityName", "unitId", "resource_name",
+         "unit_match_strategy", "group_level"]
+    ].drop_duplicates().copy()
+    matched["match_method"] = matched.apply(_match_method, axis=1)
+    matched.to_csv(proc / f"cems_ercot_matched_{year}.csv", index=False)
+    print(f"  Saved {len(matched):,} matched pairs → cems_ercot_matched_{year}.csv")
+
+    unmatched_cems = (
+        cw[cw["resource_name"].isna()][
+            ["facilityId", "facilityName", "unitId", "primaryFuelInfo",
+             "unitType", "unit_match_strategy", "heat_input_mmbtu", "operating_hours"]
+        ]
+        .drop_duplicates(["facilityId", "unitId"])
+        .reset_index(drop=True)
+    )
+    unmatched_cems.to_csv(proc / f"cems_unmatched_{year}.csv", index=False)
+    print(f"  Saved {len(unmatched_cems):,} unmatched CEMS units → cems_unmatched_{year}.csv")
+
+    claimed = set(resource_groups["resource_name"].dropna())
+    unmatched_ercot = thermal[~thermal["resource_name"].isin(claimed)][
+        ["resource_name", "resource_type", "settlement_point"]
+    ].reset_index(drop=True)
+    unmatched_ercot.to_csv(proc / f"ercot_unmatched_{year}.csv", index=False)
+    print(f"  Saved {len(unmatched_ercot):,} unmatched thermal ERCOT resources → ercot_unmatched_{year}.csv")
+
+
+# ---------------------------------------------------------------------------
 # Tier C: EIA-923 fallback (Woerman 2023 §C.1 Tier 2)
 # ---------------------------------------------------------------------------
 
@@ -570,7 +723,9 @@ def _lookup_eia923_heat_rates(gen_to_resource, eia, eia923):
         num = 0.0
         denom = 0.0
         sources = []
-        for _, gen in group.iterrows():
+        for _, gen in group.drop_duplicates(
+            subset=["plant_code", "prime_mover_code", "energy_source_1"]
+        ).iterrows():
             mmbtu, mwh, src = lookup_row(
                 int(gen["plant_code"]), gen["prime_mover_code"], gen["energy_source_1"],
             )
@@ -616,9 +771,9 @@ def build_crosswalk(year, force_rebuild=False):
     cw_path = Path(dirs["processed"]) / f"cems_ercot_crosswalk_{year}.parquet"
     hr_path = Path(dirs["processed"]) / f"resource_heat_rates_{year}.parquet"
 
-    # if cw_path.exists() and hr_path.exists() and not force_rebuild:
-    #     print(f"  Cached: {cw_path.name}, {hr_path.name}")
-    #     return pd.read_parquet(cw_path), pd.read_parquet(hr_path)
+    if cw_path.exists() and hr_path.exists() and not force_rebuild:
+        print(f"  Cached: {cw_path.name}, {hr_path.name}")
+        return pd.read_parquet(cw_path), pd.read_parquet(hr_path)
 
     print(f"  Loading thermal DAM resources for {year}...")
     thermal = _load_thermal_resources(year)
@@ -644,13 +799,39 @@ def build_crosswalk(year, force_rebuild=False):
     strat_a = unit_match["unit_match_strategy"].value_counts().to_dict()
     print(f"    {strat_a}")
 
+    # Build sp_to_resources once; passed into both Tier B and the no_eia_plant injection below.
+    sp_to_res = dict(thermal.groupby("settlement_point")["resource_name"].apply(list))
+
     print("  Tier B: matching EIA generators → ERCOT Resource Names (direct)...")
-    gen_to_resource = _match_eia_gens_to_resources(eia, thermal["resource_name"])
+    gen_to_resource = _match_eia_gens_to_resources(
+        eia, thermal["resource_name"], sp_to_resources=sp_to_res
+    )
     strat_b = gen_to_resource["gen_match_strategy"].value_counts().to_dict()
     print(f"    {strat_b}")
     matched_gens = gen_to_resource.dropna(subset=["resource_name"])
     print(f"    {matched_gens['generator_id'].nunique()} EIA generators reach "
           f"{matched_gens['resource_name'].nunique()} ERCOT resources")
+
+    # Inject synthetic gen_to_resource rows for no_eia_plant facilities in _PLANT_SP_OVERRIDES.
+    # These plants have no EIA record, so _match_eia_gens_to_resources never sees them.
+    # Adding plant_code rows here lets _assign_groups pick them up via plant_resources fallback.
+    no_eia_fids = set(
+        unit_match[unit_match["unit_match_strategy"] == "no_eia_plant"]["facilityId"].astype(int)
+    )
+    direct_resources: set[str] = set()
+    direct_rows = [
+        (fid, "direct_override", None, r, "manual_plant_sp")
+        for fid in no_eia_fids
+        for sp in _PLANT_SP_OVERRIDES.get(fid, [])
+        for r in sp_to_res.get(sp, [])
+        if not direct_resources.add(r)  # collect unique resources as a side effect
+    ]
+    if direct_rows:
+        gen_to_resource = pd.concat([
+            gen_to_resource,
+            pd.DataFrame(direct_rows, columns=_GEN_TO_RESOURCE_COLS),
+        ], ignore_index=True)
+        print(f"    +{len(direct_resources)} resources via direct override for no_eia_plant facilities")
 
     print("  Assigning unit/plant aggregation groups...")
     cems_with_gens = cems[["facilityId", "unitId"]].merge(
@@ -731,6 +912,8 @@ def build_crosswalk(year, force_rebuild=False):
     out.loc[needs_default, "heat_rate_source"] = "tech_default"
     out.to_parquet(hr_path, index=False)
     print(f"  Saved resource heat rates to {hr_path}")
+
+    _save_match_diagnostics(year, cw, resource_groups, thermal, dirs)
 
     return cw, out
 

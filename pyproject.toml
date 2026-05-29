@@ -41,4 +41,6 @@ dependencies = [
     "binsreg>=2.1.7",
     "lightgbm>=4.6.0",
     "eofs>=2.0.0",
+    "fuzzywuzzy>=0.18.0",
+    "python-levenshtein>=0.27.3",
 ]
