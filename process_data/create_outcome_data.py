@@ -22,8 +22,9 @@ Thermal offer prices (HSL-weighted mean over in-market units, p85 of HSL)
   rt_scgt_p85,  dam_scgt_p85,  scgt_mc    — SCGT (SCGT90 + SCLE90)
   rt_ccgt_p85,  dam_ccgt_p85,  ccgt_mc    — CCGT (CCGT90 + CCLE90)
 
-RUC
-  ruc_deployment_mw   — total capacity forced online via RUC
+RUC (from 60-Day SCED Disclosure Telemetered Resource Status)
+  ruc_deployment_mw         — total output of ONRUC units (committed by RUC)
+  ruc_optout_deployment_mw  — total output of ONOPTOUT units (opted out of RUC)
 
 Output: {processed}/system_hourly_outcomes_{year}.csv
 """
@@ -158,39 +159,43 @@ def _load_generation_hourly(year, month):
 
 
 def _load_ruc(year, month):
-    """Load RUC deployment totals for one month.
+    """Load RUC and opt-out committed generation for one month.
 
-    Reads the monthly RUC parquet downloaded by pull_ercot.download_ruc_deployments.
-    Returns an empty DataFrame with the expected schema if the file is missing.
+    Reads the yearly per-SCED-timestep CSV produced by
+    calculate_ruc_commitments.compute_ruc_commitments, filters to the requested
+    month, and collapses each hour's ~12 SCED intervals to the first observation
+    per hour (matching the rt_system_lambda convention). Returns an empty
+    DataFrame with the expected schema if the file is missing.
 
     Args:
         year: Integer year.
         month: Integer month.
 
     Returns:
-        DataFrame with columns: valid_time, ruc_deployment_mw.
+        DataFrame with columns: valid_time, ruc_deployment_mw,
+        ruc_optout_deployment_mw.
     """
+    cols = ['valid_time', 'ruc_deployment_mw', 'ruc_optout_deployment_mw']
     dirs = setup_directories()
     path = os.path.join(
-        dirs['raw'], 'ercot', 'ruc_deployment',
-        str(year), f'{month:02d}',
-        f'ruc_deployment_{year}-{month:02d}.parquet',
+        dirs['processed'], 'ruc_commitments', f'ruc_commitments_{year}.csv'
     )
     if not os.path.exists(path):
-        print(f"  RUC deployment file not found (skipping): {path}")
-        return pd.DataFrame(columns=['valid_time', 'ruc_deployment_mw'])
+        print(f"  RUC commitments file not found (skipping): {path}")
+        return pd.DataFrame(columns=cols)
 
-    df = pd.read_parquet(path, columns=['delivery_date', 'hour_ending', 'deployment_mw_total'])
-    # delivery_date is MM/DD/YYYY; hour_ending is "HH:MM" (hour-ending convention:
-    # "10:00" = the hour that ends at 10:00, so valid_time = delivery_date + 9h)
-    hour = df['hour_ending'].str.split(':').str[0].astype(int)
-    df['valid_time'] = (
-        pd.to_datetime(df['delivery_date'], format='%m/%d/%Y')
-        + pd.to_timedelta(hour - 1, unit='h')
+    df = pd.read_csv(path, parse_dates=['sced_time_step'])
+    df = df[df['sced_time_step'].dt.month == month].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df['valid_time'] = df['sced_time_step'].dt.floor('h')
+    first = (
+        df.sort_values('sced_time_step')
+        .groupby('valid_time', as_index=False)
+        .first()[['valid_time', 'ruc_deployment_mw', 'ruc_optout_deployment_mw']]
     )
-    return df[['valid_time', 'deployment_mw_total']].rename(
-        columns={'deployment_mw_total': 'ruc_deployment_mw'}
-    )
+    return first
 
 
 def _hsl_weighted_mean(df, value_cols, weight_col='HSL'):
@@ -322,7 +327,7 @@ def _load_markups_hourly(year):
 # Main build function
 # ---------------------------------------------------------------------------
 
-def build_system_hourly_outcomes(year, months=None, force_rebuild=False):
+def build_system_hourly_outcomes(year, months=None, force_rebuild=True):
     """Build and save the system-wide hourly outcome dataset.
 
     Merges economic congestion, curtailment, generation/emissions, thermal
@@ -394,6 +399,11 @@ def build_system_hourly_outcomes(year, months=None, force_rebuild=False):
             if df.empty:
                 continue
             panel = panel.merge(df, on='valid_time', how='left')
+            # replace missing ruc values with 0 (assumes missingness is due to no RUC deployment, not missing file)
+            if 'ruc_deployment_mw' in panel.columns:
+                panel['ruc_deployment_mw'] = panel['ruc_deployment_mw'].fillna(0)
+            if 'ruc_optout_deployment_mw' in panel.columns:
+                panel['ruc_optout_deployment_mw'] = panel['ruc_optout_deployment_mw'].fillna(0)
 
         monthly_frames.append(panel)
 
@@ -423,7 +433,7 @@ def build_system_hourly_outcomes(year, months=None, force_rebuild=False):
         'rt_cllig_p85', 'dam_cllig_p85', 'cllig_mc',
         'rt_scgt_p85', 'dam_scgt_p85', 'scgt_mc',
         'rt_ccgt_p85', 'dam_ccgt_p85', 'ccgt_mc',
-        'ruc_deployment_mw',
+        'ruc_deployment_mw', 'ruc_optout_deployment_mw',
     ]
     ordered = ['valid_time'] + time_feat_cols + [
         c for c in outcome_cols if c in result.columns
@@ -452,8 +462,12 @@ if __name__ == '__main__':
     parser.add_argument('--year', type=int, default=2025)
     parser.add_argument('--months', type=int, nargs='+', default=None,
                         help='Months to include (default: all 12)')
-    parser.add_argument('--force', action='store_true',
-                        help='Overwrite cached output')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--force', dest='force', action='store_true',
+                       help='Overwrite cached output')
+    group.add_argument('--no-force', dest='force', action='store_false',
+                       help="Don't overwrite cached output")
+    parser.set_defaults(force=True)
     args = parser.parse_args()
 
     build_system_hourly_outcomes(args.year, months=args.months, force_rebuild=args.force)

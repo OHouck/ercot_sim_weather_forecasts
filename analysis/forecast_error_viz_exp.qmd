@@ -1,0 +1,335 @@
+---
+title: "Interactive Forecast Error Viewer (Experimental)"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    page-layout: full
+jupyter: python3
+---
+
+## Overview
+
+This notebook renders an **interactive 2×2 map** of ERCOT weather-forecast errors built
+from the gridded error surfaces produced by
+[`process_data/calculate_forecast_errors.py`](../process_data/calculate_forecast_errors.py)
+(`era5_errors_{YYYYMM}.nc`).
+
+- **Rows** — 2 m temperature error (top) and 100 m wind-speed error (bottom).
+- **Columns** — day-ahead **GFS** (left) and hour-ahead **HRRR** (right).
+- Each panel is a heat-map of *forecast − ERA5* error overlaid on the ERCOT weather-zone map.
+
+Use the **slider** to step forward hour-by-hour from the selected start date through the
+window (a week by default; set `N_DAYS = 30` in the config cell for ~a month). The **day
+dropdown** jumps straight to a given day, and **▶ Play** animates the window. Everything is
+client-side, so the rendered HTML is self-contained and shareable — note that every hour is
+embedded as a frame, so longer windows produce a larger file (≈13 MB/week, ≈30 MB/month).
+
+## Setup
+
+```{python}
+#| label: setup
+#| echo: true
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import geopandas as gpd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+sys.path.insert(0, str(Path.cwd().parent))
+from helper_funcs import setup_directories, DEFAULT_WEATHER_ZONE_SHP
+
+dirs = setup_directories()
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Pick the window to display. The slider steps hourly from START_DATE for N_DAYS.
+# Set N_DAYS = 7 for a week or 30 for ~a month; the loader spans month-boundary
+# NetCDF files automatically, so the window may cross into the next month.
+START_DATE = pd.Timestamp("2025-06-02 00:00")   # US/Central, tz-naive (matches files)
+N_DAYS = 7                                       # window length in days
+N_HOURS = 24 * N_DAYS                            # hour-by-hour steps
+
+# Map row -> (NetCDF variable, label, units). Both models store these variables.
+ROW_VARS = [
+    ("temp_error",    "2 m Temperature Error", "°C"),
+    ("wspd100_error", "100 m Wind-Speed Error", "m/s"),
+]
+COL_MODELS = [("gfs", "GFS Day-Ahead"), ("hrrr", "HRRR Hour-Ahead")]
+
+# Display stride per model — thin the grid before embedding so the self-contained
+# HTML stays loadable. Every hour is one frame, so a long window embeds a lot of
+# data; the stride scales with N_DAYS to keep file size bounded. HRRR (0.1°) is
+# the dominant cost; GFS (0.25°) is already coarse. Override explicitly if you
+# want full resolution and don't mind a larger HTML.
+if N_DAYS <= 10:
+    DISPLAY_STRIDE = {"hrrr": 2, "gfs": 1}   # ~week  → ~13 MB
+else:
+    DISPLAY_STRIDE = {"hrrr": 3, "gfs": 2}   # ~month → ~30 MB
+
+# Texas / ERCOT bounding box used for all panels (from the data domain).
+LON_MIN, LON_MAX = -106.6, -93.5
+LAT_MIN, LAT_MAX = 25.7, 36.6
+
+TIMES = pd.date_range(START_DATE, periods=N_HOURS, freq="h")
+print(f"Window: {TIMES[0]} → {TIMES[-1]}  ({N_DAYS} days, {N_HOURS} hourly steps)")
+```
+
+## Load the gridded error surfaces
+
+```{python}
+#| label: load-data
+#| echo: true
+
+def load_error_cube(model, var, times):
+    """Load one forecast-error variable for one model, sampled at given times.
+
+    Opens the monthly era5_errors NetCDF file(s) covering the requested window,
+    concatenates them along valid_time, then nearest-neighbour selects the field
+    for each target timestamp (within a 1-hour tolerance).
+
+    Args:
+        model (str): 'gfs' or 'hrrr'.
+        var (str): NetCDF variable name (e.g. 'temp_error', 'wspd100_error').
+        times (pd.DatetimeIndex): target US/Central tz-naive timestamps.
+
+    Returns:
+        tuple(lon, lat, frames):
+            lon (np.ndarray): 1-D longitudes of the model grid.
+            lat (np.ndarray): 1-D latitudes of the model grid.
+            frames (list[np.ndarray]): one 2-D (lat, lon) error array per time;
+                all-NaN where no matching forecast hour exists.
+    """
+    base = os.path.join(dirs['processed'], 'forecast_errors_era5', model)
+    months = sorted({(t.year, t.month) for t in times})
+
+    ds_parts = []
+    for year, month in months:
+        fpath = os.path.join(base, str(year), f"{month:02d}",
+                             f"era5_errors_{year}{month:02d}.nc")
+        if os.path.exists(fpath):
+            ds_parts.append(xr.open_dataset(fpath)[[var]])
+    if not ds_parts:
+        raise FileNotFoundError(f"No era5_errors files for {model} covering {months}")
+
+    ds = xr.concat(ds_parts, dim='valid_time') if len(ds_parts) > 1 else ds_parts[0]
+    ds = ds.isel(lead_hours=0)                      # single lead per model
+    ds = ds.sortby('valid_time')
+
+    stride = DISPLAY_STRIDE.get(model, 1)           # thin fine grids for the viewer
+    if stride > 1:
+        ds = ds.isel(latitude=slice(None, None, stride),
+                     longitude=slice(None, None, stride))
+
+    lon = ds.longitude.values
+    lat = ds.latitude.values
+    nan_field = np.full((lat.size, lon.size), np.nan, dtype="float32")
+
+    frames = []
+    for t in times:
+        try:
+            arr = ds[var].sel(valid_time=t, method='nearest',
+                              tolerance=np.timedelta64(1, 'h')).values
+            frames.append(np.round(arr.astype("float32"), 2))
+        except KeyError:
+            frames.append(nan_field)
+    return lon, lat, frames
+
+
+# Build a cube[(model, var)] = (lon, lat, frames) for all four panels.
+cubes = {}
+for var, _, _ in ROW_VARS:
+    for model, _ in COL_MODELS:
+        cubes[(model, var)] = load_error_cube(model, var, TIMES)
+        lon, lat, frames = cubes[(model, var)]
+        n_valid = sum(int(np.isfinite(f).any()) for f in frames)
+        print(f"  {model:4s} {var:13s}: grid {lat.size}×{lon.size}, "
+              f"{n_valid}/{N_HOURS} hours with data")
+
+# Symmetric, robust color limits shared within each row (across both models).
+def row_limit(var):
+    """98th-percentile absolute error across both models for a shared diverging scale."""
+    vals = np.concatenate([
+        np.abs(np.concatenate([f.ravel() for f in cubes[(m, var)][2]]))
+        for m, _ in COL_MODELS
+    ])
+    vals = vals[np.isfinite(vals)]
+    return float(np.nanpercentile(vals, 98)) if vals.size else 1.0
+
+CLIM = {var: row_limit(var) for var, _, _ in ROW_VARS}
+print("Color limits (±):", {k: round(v, 2) for k, v in CLIM.items()})
+```
+
+## Texas / ERCOT boundary overlay
+
+```{python}
+#| label: boundary
+#| echo: true
+
+def weather_zone_outline(shp_path):
+    """Extract ERCOT weather-zone polygon outlines as plottable x/y line arrays.
+
+    Reads the weather-zone shapefile, reprojects to lon/lat (EPSG:4326), and
+    flattens every polygon ring into a single pair of coordinate arrays with
+    None separators (so Plotly draws disconnected zone borders in one trace).
+
+    Args:
+        shp_path (str): path to Weather_Zone.shp.
+
+    Returns:
+        tuple(list, list): (xs, ys) longitude/latitude vertices with None gaps.
+    """
+    gdf = gpd.read_file(shp_path).to_crs(4326)
+    xs, ys = [], []
+    for geom in gdf.geometry:
+        polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+        for poly in polys:
+            x, y = poly.exterior.xy
+            xs.extend(list(x) + [None])
+            ys.extend(list(y) + [None])
+    return xs, ys
+
+try:
+    BOUND_X, BOUND_Y = weather_zone_outline(DEFAULT_WEATHER_ZONE_SHP)
+    print(f"Loaded weather-zone outline ({sum(v is None for v in BOUND_X)} rings)")
+except Exception as e:
+    BOUND_X, BOUND_Y = [], []
+    print(f"Boundary unavailable ({e}); panels will render without an outline.")
+```
+
+## Interactive figure
+
+```{python}
+#| label: figure
+#| echo: true
+
+col_titles = [c[1] for c in COL_MODELS]
+fig = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=col_titles + ["", ""],
+    horizontal_spacing=0.07, vertical_spacing=0.10,
+)
+
+# Panel order (row, col) -> trace index 0..3, matching frame update order.
+panels = []  # list of (row, col, model, var, coloraxis)
+for r, (var, _, _) in enumerate(ROW_VARS, start=1):
+    coloraxis = "coloraxis" if r == 1 else "coloraxis2"
+    for c, (model, _) in enumerate(COL_MODELS, start=1):
+        panels.append((r, c, model, var, coloraxis))
+
+# ── Base heat-maps (traces 0-3) = first hour ──
+for r, c, model, var, coloraxis in panels:
+    lon, lat, frames = cubes[(model, var)]
+    fig.add_trace(
+        go.Heatmap(
+            z=frames[0], x=lon, y=lat,
+            coloraxis=coloraxis, zsmooth="best",
+            hovertemplate="lon %{x:.2f}<br>lat %{y:.2f}<br>err %{z:.2f}<extra></extra>",
+        ),
+        row=r, col=c,
+    )
+
+# ── Boundary overlays (traces 4-7), one per panel ──
+for r, c, *_ in panels:
+    fig.add_trace(
+        go.Scatter(
+            x=BOUND_X, y=BOUND_Y, mode="lines",
+            line=dict(color="black", width=0.8),
+            hoverinfo="skip", showlegend=False,
+        ),
+        row=r, col=c,
+    )
+
+# ── Animation frames: update only the four heat-map z arrays per hour ──
+frames_out = []
+for k, t in enumerate(TIMES):
+    frame_data = [
+        go.Heatmap(z=cubes[(model, var)][2][k])
+        for _, _, model, var, _ in panels
+    ]
+    frames_out.append(go.Frame(name=t.isoformat(), data=frame_data,
+                               traces=[0, 1, 2, 3]))
+fig.frames = frames_out
+
+# ── Shared diverging color axes (one per row) ──
+fig.update_layout(
+    coloraxis=dict(
+        colorscale="RdBu_r", cmin=-CLIM["temp_error"], cmax=CLIM["temp_error"],
+        colorbar=dict(title="°C", len=0.42, y=0.785, yanchor="middle", x=1.01),
+    ),
+    coloraxis2=dict(
+        colorscale="RdBu_r", cmin=-CLIM["wspd100_error"], cmax=CLIM["wspd100_error"],
+        colorbar=dict(title="m/s", len=0.42, y=0.215, yanchor="middle", x=1.01),
+    ),
+)
+
+# ── Geographic aspect + fixed extent on every panel ──
+for axx, axy in [("x", "y"), ("x2", "y2"), ("x3", "y3"), ("x4", "y4")]:
+    fig.layout[f"xaxis{axx[1:]}"].update(range=[LON_MIN, LON_MAX], constrain="domain")
+    fig.layout[f"yaxis{axy[1:]}"].update(
+        range=[LAT_MIN, LAT_MAX], scaleanchor=axx, scaleratio=1.18,
+    )
+
+# ── Row labels on the left ──
+for y, (_, label, units) in zip((0.785, 0.215), ROW_VARS):
+    fig.add_annotation(
+        text=f"<b>{label}</b><br>({units})", x=-0.07, y=y, xref="paper", yref="paper",
+        showarrow=False, textangle=-90, font=dict(size=12),
+    )
+
+# Shared "jump straight to this frame" animation args (slider, day buttons, pause).
+IMMEDIATE = dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                 transition=dict(duration=0))
+
+# ── Hour slider ──
+slider_steps = [
+    dict(method="animate", label=t.strftime("%m-%d %Hh"),
+         args=[[t.isoformat()], IMMEDIATE])
+    for t in TIMES
+]
+slider = dict(
+    active=0, x=0.05, len=0.9, y=-0.02, pad=dict(t=30),
+    currentvalue=dict(prefix="Valid time:  ", font=dict(size=14)),
+    steps=slider_steps,
+)
+
+# ── Day-jump buttons + Play / Pause ──
+n_days = N_HOURS // 24
+day_buttons = [
+    dict(method="animate", label=TIMES[d * 24].strftime("%b %d"),
+         args=[[TIMES[d * 24].isoformat()], IMMEDIATE])
+    for d in range(n_days)
+]
+play_buttons = [
+    dict(method="animate", label="▶ Play",
+         args=[None, dict(frame=dict(duration=400, redraw=True),
+                          fromcurrent=True, transition=dict(duration=0))]),
+    dict(method="animate", label="⏸ Pause", args=[[None], IMMEDIATE]),
+]
+
+fig.update_layout(
+    height=860, width=1000,
+    margin=dict(l=90, r=70, t=80, b=70),
+    title=dict(text="ERCOT Forecast Errors — forecast minus ERA5", x=0.5),
+    sliders=[slider],
+    updatemenus=[
+        dict(type="buttons", direction="left", buttons=play_buttons,
+             x=0.05, y=1.12, xanchor="left", yanchor="top", showactive=False),
+        dict(type="dropdown", direction="down", buttons=day_buttons,
+             x=0.42, y=1.14, xanchor="left", yanchor="top",
+             pad=dict(r=10), showactive=True),
+    ],
+)
+fig.update_xaxes(title_text="", showgrid=False)
+fig.update_yaxes(showgrid=False)
+
+fig.show()
+```
+
+The day dropdown and ▶ Play snap the panels to a new hour; the slider underneath gives
+fine hour-by-hour control across the whole window. To view a different period, change
+`START_DATE` and/or `N_DAYS` in the configuration cell and re-render.

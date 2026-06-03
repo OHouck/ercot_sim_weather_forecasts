@@ -40,7 +40,16 @@ dependencies = [
     "captum>=0.7.0",
     "binsreg>=2.1.7",
     "lightgbm>=4.6.0",
-    "eofs>=2.0.0",
     "fuzzywuzzy>=0.18.0",
     "python-levenshtein>=0.27.3",
+    "plotly>=6.7.0",
+    "xeofs>=3.0.4",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "nbclient>=0.10.4",
+    "nbformat>=5.10.4",
 ]

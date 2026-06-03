@@ -349,7 +349,7 @@ class TestAdjustSign:
         positive and a positive score means above-average field.
         """
         import xarray as xr
-        from eofs.xarray import Eof
+        from xeofs.single import EOF
 
         rng = np.random.default_rng(seed)
         n_lat, n_lon = grid
@@ -372,16 +372,19 @@ class TestAdjustSign:
                 "longitude": lons,
             },
         )
-        solver = Eof(da, center=True, ddof=1)
-        eofs   = solver.eofs(neofs=3, eofscaling=0)
-        scores = np.asarray(solver.pcs(npcs=3, pcscaling=0).values, dtype=np.float32)
+        model = EOF(n_modes=3, center=True)
+        model.fit(da, dim="valid_time")
+        eofs   = model.components()
+        scores = np.asarray(
+            model.scores(normalized=False).transpose("valid_time", "mode").values,
+            dtype=np.float32)  # xeofs scores are (mode, valid_time); _adjust_sign expects (T, mode)
         return da, eofs, scores
 
     @staticmethod
     def _flip_mode0(eofs_da, scores):
-        """Return copies with mode 0 of both EOF and scores multiplied by -1."""
+        """Return copies with the first mode of both EOF and scores multiplied by -1."""
         eofs_flipped = eofs_da.copy()
-        eofs_flipped.loc[{"mode": 0}] *= -1
+        eofs_flipped.loc[{"mode": 1}] *= -1  # xeofs uses 1-based mode coordinates
         scores_flipped = scores.copy()
         scores_flipped[:, 0] *= -1
         return eofs_flipped, scores_flipped
@@ -390,7 +393,7 @@ class TestAdjustSign:
     def _pc1_vs_spatial_mean_corr(eofs_da, da):
         """Recompute PC1 from EOF and return its correlation with spatial mean."""
         anom = (da - da.mean("valid_time")).values.reshape(da.shape[0], -1)
-        eof1 = np.nan_to_num(eofs_da.sel(mode=0).values.ravel(), nan=0.0)
+        eof1 = np.nan_to_num(eofs_da.sel(mode=1).values.ravel(), nan=0.0)  # xeofs: mode=1 is first
         pc1  = anom @ eof1
         sm   = anom.mean(axis=1)
         return float(np.corrcoef(pc1, sm)[0, 1])
@@ -421,7 +424,7 @@ class TestAdjustSign:
         eofs_fixed, _ = _adjust_sign(eofs_wrong, scores=scores_wrong)
 
         anom = (da - da.mean("valid_time")).values.reshape(da.shape[0], -1)
-        eof1_fixed     = np.nan_to_num(eofs_fixed.sel(mode=0).values.ravel(), nan=0.0)
+        eof1_fixed     = np.nan_to_num(eofs_fixed.sel(mode=1).values.ravel(), nan=0.0)  # xeofs: mode=1
         pc1_recomputed = anom @ eof1_fixed
 
         corr = float(np.corrcoef(scores_wrong[:, 0], pc1_recomputed)[0, 1])
@@ -453,15 +456,18 @@ class TestAdjustSign:
         here for both a monopole and a dipole.
         """
         import xarray as xr
-        from eofs.xarray import Eof
+        from xeofs.single import EOF
 
         def _verify(da, mode_idx=0):
-            solver = Eof(da, center=True, ddof=1)
-            eofs   = solver.eofs(neofs=3, eofscaling=0)
-            scores = np.asarray(solver.pcs(npcs=3, pcscaling=0).values, dtype=np.float32)
-            _adjust_sign(eofs, scores=scores)
+            model = EOF(n_modes=3, center=True)
+            model.fit(da, dim="valid_time")
+            eofs   = model.components()
+            scores = np.asarray(
+            model.scores(normalized=False).transpose("valid_time", "mode").values,
+            dtype=np.float32)  # xeofs scores are (mode, valid_time); _adjust_sign expects (T, mode)
+            eofs, _ = _adjust_sign(eofs, scores=scores)
 
-            eof_m = eofs.sel(mode=mode_idx).values
+            eof_m = eofs.isel(mode=mode_idx).values  # isel: 0-based position, independent of xeofs mode coords
             pc    = scores[:, mode_idx]
             anom  = (da - da.mean("valid_time")).values  # (T, lat, lon)
 
@@ -517,7 +523,7 @@ class TestAdjustSign:
           - when score > 0, north is above average and south is below average
         """
         import xarray as xr
-        from eofs.xarray import Eof
+        from xeofs.single import EOF
 
         rng = np.random.default_rng(42)
         n_time = 400
@@ -543,13 +549,16 @@ class TestAdjustSign:
                 "longitude": lons,
             },
         )
-        solver = Eof(da, center=True, ddof=1)
-        eofs   = solver.eofs(neofs=3, eofscaling=0)
-        scores = np.asarray(solver.pcs(npcs=3, pcscaling=0).values, dtype=np.float32)
+        model = EOF(n_modes=3, center=True)
+        model.fit(da, dim="valid_time")
+        eofs   = model.components()
+        scores = np.asarray(
+            model.scores(normalized=False).transpose("valid_time", "mode").values,
+            dtype=np.float32)  # xeofs scores are (mode, valid_time); _adjust_sign expects (T, mode)
 
-        _adjust_sign(eofs, scores=scores)
+        eofs, _ = _adjust_sign(eofs, scores=scores)
 
-        eof1 = eofs.sel(mode=0).values   # (lat, lon)
+        eof1 = eofs.sel(mode=1).values   # (lat, lon) — xeofs uses 1-based mode coordinates
         pc1  = scores[:, 0]
         anom = (da - da.mean("valid_time")).values  # (T, lat, lon)
 

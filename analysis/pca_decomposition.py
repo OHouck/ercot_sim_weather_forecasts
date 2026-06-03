@@ -2,8 +2,9 @@
 EOF/PCA spatial decomposition of ERCOT forecast error fields.
 
 Loads ERA5 forecast error NetCDFs (processed_data/forecast_errors_era5/),
-fits EOFs per spatial channel on a training split, projects scores to all
-hours, and saves results to disk for downstream analysis in pca_mode_analysis.py.
+fits EOFs per spatial channel on a training split using xeofs, projects
+scores to all hours, and saves results to disk for downstream analysis in
+pca_mode_analysis.py.
 
 Outputs written to processed/pca/ and figures/pca_analysis/:
   pca_scores_K{K}.parquet       — PC scores per channel (valid_time × PC cols)
@@ -154,15 +155,16 @@ def _adjust_sign(eofs_da, scores=None):
 
     Parameters
     ----------
-    eofs_da : xr.DataArray (mode, latitude, longitude) — modified in place
+    eofs_da : xr.DataArray (mode, latitude, longitude)
     scores  : ndarray (T, n_modes) or None — PC scores; flipped in place
               to stay consistent with the (possibly flipped) EOFs
 
     Returns
     -------
-    eofs_da : the (possibly flipped) EOF patterns
+    eofs_da : new DataArray with signs applied (input is not modified)
     signs   : ndarray (n_modes,) of ±1 — multiplier applied to each mode
     """
+    eofs_da = eofs_da.copy()
     modes = list(eofs_da["mode"].values)
     signs = np.ones(len(modes), dtype=np.float32)
 
@@ -202,13 +204,13 @@ def build_ercot_mask(latitudes, longitudes, shp_path=DEFAULT_WEATHER_ZONE_SHP):
     return within.values.reshape(len(latitudes), len(longitudes))
 
 
-def _make_pca_adapter(solver, eofs_da, K_eff, land_mask):
-    """Wrap an eofs solver exposing sklearn-PCA-compatible attributes.
+def _make_pca_adapter(eofs_da, evr, K_eff, land_mask):
+    """Build a sklearn-PCA-compatible namespace from EOF loadings and variance fractions.
 
     Parameters
     ----------
-    solver    : eofs.xarray.Eof solver object after fitting to training data
-    eofs_da: xr.DataArray of EOF loadings (mode, latitude, longitude)
+    eofs_da   : xr.DataArray of EOF loadings (mode, latitude, longitude)
+    evr       : array-like — explained variance ratios, one per mode
     K_eff     : int
     land_mask : ndarray bool (n_lat, n_lon) — True where cells are inside ERCOT and non-NaN
 
@@ -220,8 +222,7 @@ def _make_pca_adapter(solver, eofs_da, K_eff, land_mask):
     components = eofs_vals.reshape(K_eff, -1)[:, land_mask.ravel()]
     return SimpleNamespace(
         components_=components,
-        explained_variance_ratio_=np.asarray(
-            solver.varianceFraction(neigs=K_eff).values, dtype=float),
+        explained_variance_ratio_=np.asarray(evr, dtype=float),
     )
 
 
@@ -435,11 +436,12 @@ def fit_pca_channels(bundle, fields, K=N_COMPONENTS, seed=RANDOM_STATE):
 
     scores_dict, pca_dict, lat_dict, lon_dict = {}, {}, {}, {}
     var_rows = []
-    if importlib.util.find_spec("eofs.xarray") is None:
+    try:
+        from xeofs.single import EOF
+    except ImportError:
         raise ImportError(
-            "eofs is required to fit PCA channels. Install project dependencies with `uv sync`."
+            "xeofs is required to fit PCA channels. Install project dependencies with `uv sync`."
         )
-    Eof = importlib.import_module("eofs.xarray").Eof
 
     for field in fields:
         da        = bundle["channel_da"][field]
@@ -449,27 +451,24 @@ def fit_pca_channels(bundle, fields, K=N_COMPONENTS, seed=RANDOM_STATE):
         lat_dict[field] = lat_2d[land_mask].astype(float)
         lon_dict[field] = lon_2d[land_mask].astype(float)
 
-        K_eff      = min(K, n_train - 1, n_cells)
-        da_train   = da.isel(valid_time=train_idx)
-        train_mean = da_train.mean("valid_time")
+        K_eff    = min(K, n_train - 1, n_cells)
+        da_train = da.isel(valid_time=train_idx)
 
-        solver = Eof(da_train, weights=None, center=True, ddof=1)
+        eof_model = EOF(n_modes=K_eff, center=True, random_state=seed)
+        eof_model.fit(da_train, dim="valid_time")
 
-        # save components and variance ratios in PCA-like format for downstream analysis and plotting
-        eofs_da   = solver.eofs(neofs=K_eff, eofscaling=0)
-
-        # subtract training mean before projecting — projectField expects pre-centered anomalies
-        anom_full = da - train_mean
+        # components() returns (mode, latitude, longitude)
+        eofs_da = eof_model.components()
+        # transform() centers using training mean internally and projects all hours onto the fitted
+        # basis; xeofs returns (mode, valid_time) so transpose to the (T, K) layout downstream expects
         scores = np.asarray(
-            solver.projectField(anom_full, neofs=K_eff, eofscaling=0, weighted=True).values,
-            dtype=np.float32,
-        )
+            eof_model.transform(da).transpose("valid_time", "mode").values, dtype=np.float32)
 
         # enforce that positive PC scores correspond to above-average values in the original variable;
         # must be applied to EOFs and scores together since scores were computed against the un-flipped basis
         eofs_da, _ = _adjust_sign(eofs_da, scores=scores)
 
-        pca_dict[field]    = _make_pca_adapter(solver, eofs_da, K_eff, land_mask)
+        pca_dict[field]    = _make_pca_adapter(eofs_da, eof_model.explained_variance_ratio().values, K_eff, land_mask)
         scores_dict[field] = scores
 
         vr     = pca_dict[field].explained_variance_ratio_
