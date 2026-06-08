@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analysis.pca_decomposition import ERROR_FIELDS
 from analysis import eof_methods
 from analysis.eof_methods import (
-    fit_eof_perchannel, fit_eof_joint, fit_varimax_joint, fit_sparse_joint,
+    fit_eof_perchannel, fit_eof_joint, fit_varimax, fit_sparse_joint,
     fit_eeof_perchannel, fit_mca, _project_eeof, MethodResult,
 )
 from analysis.eof_method_comparison import (
@@ -109,7 +109,7 @@ def _builders(synthetic):
     return {
         "eof_perchannel":  (fit_eof_perchannel,  common),
         "eof_joint":       (fit_eof_joint,       common),
-        "varimax_joint":   (fit_varimax_joint,   common),
+        "varimax_joint":   (fit_varimax,   common),
         "sparse_joint":    (fit_sparse_joint,    common),
         "eeof_perchannel": (fit_eeof_perchannel, common),
         "mca":             (fit_mca,             mca_kw),

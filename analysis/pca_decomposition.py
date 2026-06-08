@@ -538,7 +538,7 @@ def load_pca_results(K, pca_dir):
 
     Parameters
     ----------
-    K          : int — number of modes used in decomposition
+    K       : int — number of modes used in decomposition
     pca_dir : Path
 
     Returns

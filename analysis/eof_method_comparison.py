@@ -46,6 +46,7 @@ from analysis.pca_decomposition import (
 from analysis.pca_mode_analysis import load_outcomes, DEPVAR_CONFIGS, DEPVARS
 from analysis import eof_methods
 from analysis.eof_methods import MethodResult, DEFAULT_K
+from analysis.eof_analysis import _extract_grid_coords
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -78,7 +79,7 @@ def _build_specs(common, outcomes_df=None):
     return {
         "eof_perchannel":  (eof_methods.fit_eof_perchannel,  common),
         "eof_joint":       (eof_methods.fit_eof_joint,       common),
-        "varimax_joint":   (eof_methods.fit_varimax_joint,   common),
+        "varimax_joint":   (eof_methods.fit_varimax,   common),
         "sparse_joint":    (eof_methods.fit_sparse_joint,    common),
         "eeof_perchannel": (eof_methods.fit_eeof_perchannel, common),
         "mca":             (eof_methods.fit_mca,             mca_kw),
@@ -525,25 +526,6 @@ def visualize_modes(model, months=None, K=DEFAULT_K):
         squeeze=False,
     )
 
-    # For joint methods, characterize each mode by its dominant channels
-    # (mean |loading| per field, ranked high→low) so column titles are interpretable.
-    _MODE_SHORT = {
-        "temp_error_1h":    "T·1h",
-        "wspd100_error_1h": "W·1h",
-        "temp_error_0h":    "T·0h",
-        "wspd100_error_0h": "W·0h",
-    }
-    if is_joint:
-        fields_diag = diag.get("fields", ERROR_FIELDS)
-        mode_chars  = []
-        for ci in range(n_modes):
-            mags   = [(_MODE_SHORT.get(f, f), np.nanmean(np.abs(da.isel(mode=ci).values)))
-                      for f, da in zip(fields_diag, diag["loadings_list"])]
-            ranked = sorted(mags, key=lambda x: x[1], reverse=True)
-            mode_chars.append(" ▸ ".join(lbl for lbl, _ in ranked))
-    else:
-        mode_chars = [""] * n_modes
-
     # Hoist the static parts of scatter kwargs (same every cell).
     base_sc_kw = {"cmap": "RdBu_r", "norm": norm, "rasterized": True}
     if crs_pc is not None:
@@ -551,20 +533,7 @@ def visualize_modes(model, months=None, K=DEFAULT_K):
 
     # ri (field) is the outer loop so lat/lon and marker size are computed once per field.
     for ri, (field_label, da, field_ve) in enumerate(panels):
-        # Resolve lat/lon once per field — handles 1-D regular and 2-D curvilinear grids.
-        ref_da  = da.isel(mode=0)
-        lat_c   = ref_da.coords.get("latitude", ref_da.coords.get("lat"))
-        lon_c   = ref_da.coords.get("longitude", ref_da.coords.get("lon"))
-        if lat_c is None:
-            lat_c = ref_da.coords[ref_da.dims[-2]]
-            lon_c = ref_da.coords[ref_da.dims[-1]]
-        lats_raw, lons_raw = lat_c.values, lon_c.values
-        if lats_raw.ndim == 1:
-            lons_2d, lats_2d = np.meshgrid(lons_raw, lats_raw)
-            lats, lons = lats_2d.ravel(), lons_2d.ravel()
-        else:
-            lats, lons = lats_raw.ravel(), lons_raw.ravel()
-        marker_s = _grid_marker_size(lons)
+        lats, lons, marker_s = _extract_grid_coords(da)
 
         for ci in range(n_modes):
             ax   = axes[ri, ci]
@@ -583,10 +552,7 @@ def visualize_modes(model, months=None, K=DEFAULT_K):
             if ri == 0:
                 var_pct   = float(joint_ve[ci]) * 100 if ci < len(joint_ve) else float("nan")
                 ve_str    = f"  ({var_pct:.1f}%)" if not np.isnan(var_pct) else ""
-                title     = f"Mode {ci + 1}{ve_str}"
-                if mode_chars[ci]:
-                    title += f"\n{mode_chars[ci]}"
-                ax.set_title(title, fontsize=6.5, pad=3)
+                ax.set_title(f"Mode {ci + 1}{ve_str}", fontsize=7, pad=3)
             if ci == 0:
                 ax.set_ylabel(field_label, fontsize=6.5, labelpad=2)
             if not is_joint and ci < len(field_ve):

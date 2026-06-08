@@ -256,6 +256,40 @@ def run_ols_inference(y, X_df, feature_groups, maxlags=HAC_MAXLAGS):
     return result, f_tests, col_names
 
 
+def save_coef_table(result, col_names, path, dep_series=None):
+    """Write an OLS coefficient table (coef, HAC s.e., t, p, CI, stars) to CSV.
+
+    Parameters
+    ----------
+    result    : statsmodels OLS result
+    col_names : list of str — coefficient names (includes 'const')
+    path      : Path — output CSV path
+    dep_series: pd.Series or None — when given, adds a percent_of_mean column
+                (coef as a percent of the mean outcome)
+    """
+    ci = result.conf_int()
+    df = pd.DataFrame({
+        "feature": col_names,
+        "coef":    result.params,
+        "se_hac":  result.bse,
+        "t_stat":  result.tvalues,
+        "p_value": result.pvalues,
+        "ci_low":  ci[:, 0],
+        "ci_high": ci[:, 1],
+        "signif":  pd.cut(result.pvalues,
+                          bins=[-np.inf, 0.001, 0.01, 0.05, 0.1, np.inf],
+                          labels=["***", "**", "*", ".", ""]),
+    })
+    if dep_series is not None:
+        mean_y = dep_series.mean()
+        if mean_y != 0 and not np.isnan(mean_y):
+            df["percent_of_mean"] = df["coef"] / mean_y * 100.0
+        else:
+            df["percent_of_mean"] = np.nan
+    df.to_csv(path, index=False)
+    print(f"  Saved: {path}")
+
+
 # ── Regime regressions ─────────────────────────────────────────────────────────
 
 
@@ -340,7 +374,8 @@ def build_ar_features(dep_series, hours):
 
 
 def plot_coefficient_forest(result, col_names, feature_groups, fig_dir,
-                            depvar="", depvar_label="", title_suffix=""):
+                            depvar="", depvar_label="", title_suffix="",
+                            fname_prefix="pca", method_label="PCA"):
     """Coefficient forest plot with 95% HAC confidence intervals.
 
     Parameters
@@ -352,6 +387,8 @@ def plot_coefficient_forest(result, col_names, feature_groups, fig_dir,
     depvar       : str — outcome key (used in filename)
     depvar_label : str — human-readable outcome label (used in title)
     title_suffix : str — appended to title and filename
+    fname_prefix : str — output-filename prefix (e.g. "pca" or "eof")
+    method_label : str — decomposition name shown in the title (e.g. "PCA" or "EOF")
     """
     plot_order = [
         ("HRRR 1h 100m Wind Error",          "wspd100_error_1h"),
@@ -424,7 +461,7 @@ def plot_coefficient_forest(result, col_names, feature_groups, fig_dir,
         scale_note = ""
     ax.set_xlabel(f"OLS coefficient ({scale_note}standardized inputs)", fontsize=9)
     ax.set_title(
-        f"PCA Feature Coefficients — {dep_title}{title_suffix}\n"
+        f"{method_label} Feature Coefficients — {dep_title}{title_suffix}\n"
         "HAC s.e.  ●  dark blue p < 0.01  ●  light blue p < 0.05  ●  gray n.s.",
         fontsize=9,
     )
@@ -432,7 +469,7 @@ def plot_coefficient_forest(result, col_names, feature_groups, fig_dir,
     ax.grid(axis="x", linestyle=":", linewidth=0.5, alpha=0.6)
     plt.tight_layout()
     dep_slug = f"_{depvar}" if depvar else ""
-    fname = f"pca_coefficient_forest{dep_slug}{title_suffix.replace(' ', '_')}.png"
+    fname = f"{fname_prefix}_coefficient_forest{dep_slug}{title_suffix.replace(' ', '_')}.png"
     out   = fig_dir / fname
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -451,15 +488,17 @@ FTEST_LABELS = {
 }
 
 
-def plot_ftest_heatmap(all_f_tests, fig_dir):
+def plot_ftest_heatmap(all_f_tests, fig_dir, fname_prefix="pca", method_label="PCA"):
     """Heatmap of joint F-test results across outcome variables and feature groups.
 
     Cell color encodes the F-statistic; significance stars reflect the p-value.
 
     Parameters
     ----------
-    all_f_tests : dict {depvar: {group: (f_stat, p_val)}}
-    fig_dir     : Path
+    all_f_tests  : dict {depvar: {group: (f_stat, p_val)}}
+    fig_dir      : Path
+    fname_prefix : str — output-filename prefix (e.g. "pca" or "eof")
+    method_label : str — decomposition name shown in the title (e.g. "PCA" or "EOF")
     """
     group_order = list(FTEST_LABELS.keys())
     depvars     = list(all_f_tests.keys())
@@ -508,11 +547,11 @@ def plot_ftest_heatmap(all_f_tests, fig_dir):
     cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
     cbar.set_label("F-statistic", fontsize=8)
 
-    ax.set_title("Joint F-tests: PCA Feature Groups × Outcome Variables\n"
+    ax.set_title(f"Joint F-tests: {method_label} Feature Groups × Outcome Variables\n"
                  "*** p<0.001  ** p<0.01  * p<0.05",
                  fontsize=9)
     plt.tight_layout()
-    out = fig_dir / "pca_ftest_heatmap.png"
+    out = fig_dir / f"{fname_prefix}_ftest_heatmap.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -588,7 +627,8 @@ def _scatter_component(ax, lons, lats, component, norm, crs_pc, s=None):
     _draw_texas(ax)
 
 
-def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=None):
+def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=None,
+                  fname_prefix="pca", method_label="PCA"):
     """Spatial heatmaps of PCA mode loadings for each field.
 
     Shows variance explained per panel header. No significance borders or OLS
@@ -596,11 +636,13 @@ def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=None):
 
     Parameters
     ----------
-    pca_dict : dict {field: fitted PCA}
-    lat_dict : dict {field: ndarray}
-    lon_dict : dict {field: ndarray}
-    fig_dir  : Path
-    K_show   : int or None — modes to display; defaults to all fitted components
+    pca_dict     : dict {field: fitted PCA}
+    lat_dict     : dict {field: ndarray}
+    lon_dict     : dict {field: ndarray}
+    fig_dir      : Path
+    K_show       : int or None — modes to display; defaults to all fitted components
+    fname_prefix : str — output-filename prefix (e.g. "pca" or "eof")
+    method_label : str — decomposition name shown in the title (e.g. "PCA" or "EOF")
     """
     from matplotlib.colors import TwoSlopeNorm
 
@@ -640,10 +682,14 @@ def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=None):
         for k in range(len(vr), K_show):
             axes[r, k].set_visible(False)
 
-    fig.suptitle("PCA Mode Loadings — variance explained shown per panel",
+    fig.suptitle(f"{method_label} Mode Loadings — variance explained shown per panel",
                  fontsize=8.5, y=1.01)
     plt.tight_layout()
-    out = fig_dir / "pca_component_maps.png"
+    sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6, pad=0.02,
+                 fraction=0.02, label="Normalised loading")
+    out = fig_dir / f"{fname_prefix}_component_maps.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -651,6 +697,7 @@ def plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir, K_show=None):
 
 def plot_pca_coefs_across_outcomes(
     pca_dict, lat_dict, lon_dict, all_results, fig_dir, K_show=N_COMPONENTS,
+    fname_prefix="pca",
 ):
     """One figure per weather field: K_show×3 grid — map | log-outcome coefs | markup coefs.
 
@@ -761,6 +808,7 @@ def plot_pca_coefs_across_outcomes(
         fig = plt.figure(figsize=(14, K_eff * 2.4))
         gs  = fig.add_gridspec(K_eff, 3, width_ratios=[1, 1.3, 1.3], hspace=0.35, wspace=0.35)
 
+        map_axes = []
         for k in range(K_eff):
             col_name = f"PC{k+1}_{field}"
 
@@ -771,6 +819,7 @@ def plot_pca_coefs_across_outcomes(
             ax_map.set_title(f"PC{k+1}  ({vr[k]*100:.1f}% var)", fontsize=7.5, pad=3)
             ax_map.set_xticks([])
             ax_map.set_yticks([])
+            map_axes.append(ax_map)
 
             ax_log = fig.add_subplot(gs[k, 1])
             _draw_coef_panel(ax_log, log_labels,
@@ -782,12 +831,17 @@ def plot_pca_coefs_across_outcomes(
                              *_collect_coefs(col_name, raw_dvs),
                              xlabel="OLS coef ($/MWh change in markup)")
 
+        sm_map = plt.cm.ScalarMappable(cmap="RdBu_r", norm=norm)
+        sm_map.set_array([])
+        fig.colorbar(sm_map, ax=map_axes, shrink=0.6, pad=0.02, fraction=0.05,
+                     label="Normalised loading")
+
         fig.suptitle(
             f"{label}\n"
             "dark blue p<0.01  ●  light blue p<0.05  ●  grey n.s.  |  HAC s.e., 95% CI",
             fontsize=8.5, fontweight="bold",
         )
-        out = fig_dir / f"pca_coefs_across_outcomes_{field}.png"
+        out = fig_dir / f"{fname_prefix}_coefs_across_outcomes_{field}.png"
         fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved: {out}")
@@ -844,31 +898,6 @@ def run_pca_mode_analysis(K=N_COMPONENTS, depvars=None):
     print("\n=== Step 3: Loading outcome variables ===")
     outcomes_df = load_outcomes(dirs)
 
-    def _save_coef_table(result, cnames, path, dep_series=None):
-            ci = result.conf_int()
-            df = pd.DataFrame({
-                "feature": cnames,
-                "coef":    result.params,
-                "se_hac":  result.bse,
-                "t_stat":  result.tvalues,
-                "p_value": result.pvalues,
-                "ci_low":  ci[:, 0],
-                "ci_high": ci[:, 1],
-                "signif":  pd.cut(result.pvalues,
-                                  bins=[-np.inf, 0.001, 0.01, 0.05, 0.1, np.inf],
-                                  labels=["***", "**", "*", ".", ""]),
-            })
-            # If a dep_series is provided, compute coefficient as percent of mean outcome
-            if dep_series is not None:
-                mean_y = dep_series.mean()
-                if mean_y != 0 and not np.isnan(mean_y):
-                    df["percent_of_mean"] = df["coef"] / mean_y * 100.0
-                else:
-                    df["percent_of_mean"] = np.nan
-
-            df.to_csv(path, index=False)
-            print(f"  Saved: {path}")
-
     all_results = {}
     all_f_tests = {}
 
@@ -910,7 +939,7 @@ def run_pca_mode_analysis(K=N_COMPONENTS, depvars=None):
             print(f"  Test R²={test_r2_nat:.4f}  (raw scale)")
 
         # Tables
-        _save_coef_table(
+        save_coef_table(
             ols_result,
             col_names,
             tables_dir / f"pca_ols_coefficients_{depvar}.csv",

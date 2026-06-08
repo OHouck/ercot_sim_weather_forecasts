@@ -182,9 +182,30 @@ def fit_eof_joint(bundle, train_idx, hours, K=DEFAULT_K,
     )
 
 
-def fit_varimax_joint(bundle, train_idx, hours, K=DEFAULT_K,
-                      error_fields=ERROR_FIELDS, seed=42, power=VARIMAX_POWER):
-    """Varimax-rotated multivariate EOF (orthogonal rotation of the joint basis)."""
+def fit_varimax(bundle, train_idx, hours, K=DEFAULT_K,
+                error_fields=ERROR_FIELDS, seed=42, power=VARIMAX_POWER):
+    """Varimax-rotated EOF (orthogonal rotation of the EOF basis).
+
+    Handles both single-channel and joint multivariate decompositions automatically:
+    the channels named in ``error_fields`` are bundled into a list and fed to xeofs,
+    which decomposes a single-element list as an ordinary per-channel EOF and a
+    multi-element list as a joint multivariate EOF (one shared basis across channels).
+    Pass ``error_fields=[field]`` for a single channel or several names for a joint fit.
+
+    Parameters
+    ----------
+    bundle       : dict from pca_decomposition.load_channel_fields
+    train_idx    : ndarray of integer positions into `hours` used for fitting
+    hours        : pd.DatetimeIndex — all hours (scores reindexed to this)
+    K            : int — rotated modes to retain
+    error_fields : list of channel names (one → per-channel, many → joint)
+    seed         : int — solver random_state
+    power        : 1 = Varimax (orthogonal); >1 = Promax-like obliqueness
+
+    Returns
+    -------
+    MethodResult with K predictor columns.
+    """
     from xeofs.single import EOF, EOFRotator
 
     da_list = _error_da_list(bundle, error_fields)
@@ -380,7 +401,7 @@ def fit_mca(bundle, train_idx, hours, K=DEFAULT_K, error_fields=ERROR_FIELDS,
 METHOD_REGISTRY: dict[str, Callable] = {
     "eof_perchannel":  fit_eof_perchannel,
     "eof_joint":       fit_eof_joint,
-    "varimax_joint":   fit_varimax_joint,
+    "varimax_joint":   fit_varimax,
     "sparse_joint":    fit_sparse_joint,
     "eeof_perchannel": fit_eeof_perchannel,
     "mca":             fit_mca,

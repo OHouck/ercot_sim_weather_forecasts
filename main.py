@@ -1,208 +1,217 @@
-"""main.py — Run all data download, processing, and analysis steps.
+"""Build the EOF analysis inputs and run the EOF workflow.
 
-Comment/uncomment sections below to control which steps run.
-Steps are ordered by dependency — later steps require earlier ones to have
-completed at least once (data is cached on disk between runs).
-
-All per-month steps loop over MONTHS, a list of (year, month) tuples defined
-at the top. Each download script skips files that already exist on disk, so
-re-running is cheap.
-
-Usage:
-    uv run python main.py
+This entrypoint rebuilds the raw weather and grid inputs, then the ERA5
+forecast-error inputs, the yearly system outcome file, and finally runs the
+three EOF phases from analysis/eof_analysis.py.
 """
 
-import os
+from __future__ import annotations
+
+import argparse
+from typing import Iterable
+
 from helper_funcs import setup_directories
 
-# ── Time period ─────────────────────────────────────────────────────────────
-# List of (year, month) tuples to process. Every per-month step loops over
-# this list.  Change this single variable to expand or restrict the period.
-MONTHS = [(2025, m) for m in range(1, 13)]
 
-dirs = setup_directories()
-
-# #############################################################################
-#                        DATA DOWNLOADS (Steps 1–4)
-# #############################################################################
-# These steps download raw data from external sources. They are generally
-# slow (hours) but idempotent — existing files are skipped.  Uncomment
-# individual blocks only when you need to (re-)download specific datasets.
+DEFAULT_YEAR = 2024
+DEFAULT_MONTHS = tuple(range(1, 13))
 
 
-# =============================================================================
-# STEP 1b-i: Download HRRR weather forecasts from NOAA S3
-# Byte-range downloads of TMP/UGRD/VGRD, extracts Texas, saves as NetCDF.
-# ~2-3 hours per month (1,488 files × ~6 MB each). Skips existing files.
-# =============================================================================
-# from download_data.pull_hrrr import download_hrrr_month
-# hrrr_base = os.path.join(dirs['raw'], 'hrrr_data')
-# for year, month in MONTHS:
-#     download_hrrr_month(year, month, hrrr_base)
+def _validate_months(months: Iterable[int]) -> list[int]:
+    """Validate and normalize month numbers.
 
-# =============================================================================
-# STEP 1b-ii: Download GFS weather forecasts from NOAA S3
-# Day-ahead forecasts (12z cycle, f018–f041). ~1-2 hours per month.
-# =============================================================================
-# from download_data.pull_gfs import download_gfs_month
-# gfs_base = os.path.join(dirs['raw'], 'gfs_data')
-# for year, month in MONTHS:
-#     download_gfs_month(year, month, gfs_base)
+    Parameters
+    ----------
+    months : iterable[int]
 
-# =============================================================================
-# STEP 1c: Download ERA5-Land hourly reanalysis for Texas
-# Downloads 2m_temperature and 10m_u/v_wind from the Copernicus CDS API.
-# Derives wind speed and direction and saves as compressed NetCDF.
-# Requires ~/.cdsapirc with a valid API key.
-# ~10-30 min per month. Skips files that already exist.
-# =============================================================================
-# from download_data.pull_era5 import download_era5_month
-# for year, month in MONTHS:
-#     download_era5_month(year, month, base_dir=dirs['raw'])
-
-# =============================================================================
-# STEP 3: Download ERCOT market data (DAM SPP + RT SPP + load + forecasts)
-# Day-ahead and real-time settlement point prices. Requires ERCOT API
-# credentials in ~/keys/. ~30 min per month. Skips days already downloaded.
-# =============================================================================
-# from download_data.pull_ercot import download_month as download_ercot
-# for year, month in MONTHS:
-#     download_ercot(year, month)
-
-# =============================================================================
-# STEP 4a: Download NP4-160 settlement point mapping from ERCOT MIS
-# Maps resource nodes to unit substations. Public download, no auth.
-# (Not month-specific — run once.)
-# =============================================================================
-# from download_data.pull_np4160 import download_np4_160
-# download_np4_160()
-
-# =============================================================================
-# STEP 4b: Download EIA Form 860 plant data
-# Gets lat/lon coordinates for all Texas power plants. Public download.
-# (Not month-specific — run once.)
-# =============================================================================
-# from download_data.pull_eia860 import download_eia860_plants
-# download_eia860_plants()
-
-# =============================================================================
-# STEP 4c: Build node coordinate mapping (NP4-160 x EIA 860)
-# Matches ERCOT settlement point names to EIA plant names to get lat/lon.
-# Saves to processed_data/node_coordinates.csv.
-# Requires Steps 4a and 4b.  (Not month-specific — run once.)
-# =============================================================================
-# from process_data.process_ercot import build_node_coordinates
-# build_node_coordinates(force_rebuild=True)
+    Returns
+    -------
+    list[int]
+    """
+    normalized = []
+    for month in months:
+        if month < 1 or month > 12:
+            raise ValueError(f"Month must be between 1 and 12, got {month}")
+        normalized.append(int(month))
+    return normalized
 
 
-# #############################################################################
-#                     DATA PROCESSING (Steps 5–7)
-# #############################################################################
+def _download_weather_inputs(year: int, months: list[int], dirs: dict) -> None:
+    """Download the weather inputs needed for the EOF pipeline."""
+    from download_data.pull_hrrr import download_hrrr_month
+    from download_data.pull_gfs import download_gfs_month
+    from download_data.pull_era5 import download_era5_month, download_era5_wind100m_month
+
+    print("\n=== Step 1: Download weather inputs ===")
+    for month in months:
+        download_hrrr_month(year, month, dirs["raw"])
+        download_gfs_month(year, month, dirs["raw"])
+        download_era5_month(year, month, base_dir=dirs["raw"], forece_rebuild=True)
+        download_era5_wind100m_month(year, month, base_dir=dirs["raw"], forece_rebuild=True)
 
 
-# =============================================================================
-# STEP 5b: Calculate ERA5-based gridded forecast errors
-# Uses ERA5-Land reanalysis as ground truth instead of ISD weather stations.
-# Dense spatial coverage (~14,000 ERA5 cells). PRIMARY error source.
-# Requires Step 1b (HRRR/GFS) AND Step 1c (ERA5-Land).
-# ~10-20 min per month per model.
-# =============================================================================
-# from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
-# for year, month in MONTHS:
-#     calculate_era5_errors_for_month(year, month, model='hrrr')
-#     calculate_era5_errors_for_month(year, month, model='gfs')
+def _download_grid_inputs(dirs: dict) -> None:
+    """Download the grid and coordinate inputs needed downstream."""
+    from download_data.pull_np4160 import download_np4_160
+    from download_data.pull_eia860 import download_eia860_plants
+    from process_data.process_ercot import build_node_coordinates
 
-# =============================================================================
-# STEP 5c: Build gridded generation & infrastructure map
-# Maps EIA 860 generation capacity, transmission lines, load buses onto
-# the ERA5 0.1 grid. One-time static map. Requires Steps 4b, 4c.
-# =============================================================================
-# from process_data.gridded_generation_mapping import build_gridded_generation_map
-# build_gridded_generation_map(force_rebuild=False)
-
-# =============================================================================
-# STEP 5d: Build pixel x hour analysis dataset
-# Merges ERA5 forecast errors (HRRR + GFS), generation map, system LMP,
-# congestion metrics, and curtailment into one parquet per month.
-# Requires Steps 5b, 5c, 3, 3b.
-# =============================================================================
-from process_data.create_pixel_level_data import build_pixel_hourly_dataset
-for year, month in MONTHS:
-    build_pixel_hourly_dataset(year, month, force_rebuild=True)
-exit()
+    print("\n=== Step 2: Download grid inputs ===")
+    download_np4_160()
+    download_eia860_plants()
+    build_node_coordinates(force_rebuild=True)
 
 
-# #############################################################################
-#                        ANALYSIS PIPELINE (Steps A1–A10)
-# #############################################################################
-# Each step saves figures to {OneDrive}/figures/ and tables to {repo}/tables/.
+def _download_market_inputs(year: int, months: list[int]) -> None:
+    """Download the ERCOT market inputs used by the outcome builder."""
+    from download_data.pull_ercot import download_month as download_ercot_month
 
-# ── Analysis configuration ────────────────────────────────────────────────────
-ANALYSIS_MONTHS = [(2025, m) for m in range(1, 13)]
-N_CLUSTERS = 7
-GEO_WEIGHT = 2.0
-N_NEIGHBORS = 8
+    print("\n=== Step 3: Download ERCOT market inputs ===")
+    for month in months:
+        download_ercot_month(year, month)
 
-# # ── Step A1: Cluster heterogeneity regressions ─────────────────────────────
-# # Per-cluster joint HRRR 1h + GFS day-ahead regression
-# from analysis.cluster_heterogeneity_lr import run_cluster_analysis
-# cluster_outputs = run_cluster_analysis(
-#     months=ANALYSIS_MONTHS,
-#     n_clusters=N_CLUSTERS,
-#     geo_weight=GEO_WEIGHT,
-#     n_neighbors=N_NEIGHBORS,
-# )
 
-# ── Step A3: Pixel-level regression coefficient maps (2x2) ────────────────
-# Per-pixel OLS with controls and absorbed FE
-from analysis.pixel_regression_maps import run_pixel_regression_maps, REGIMES
+def _build_thermal_inputs(year: int, months: list[int], force_rebuild: bool) -> None:
+    """Download thermal source data and build the markup tables."""
+    from download_data.pull_epa_cems import download_cems_month, aggregate_unit_annual
+    from download_data.pull_epa_eia_crosswalk import download_crosswalk
+    from download_data.pull_eia923 import build_heat_rates
+    from download_data.pull_dam_disclosure import download_dam_disclosure_month
+    from download_data.pull_fuel_prices import build_fuel_price_tables
+    from download_data.pull_ercot import load_credentials, get_bearer_token
+    from process_data.compute_markups import compute_dam_markups, compute_rt_markups
 
-# PIXEL_DEPVARS = ["economic_congestion_cost", "total_curtailment_mw"]
-PIXEL_DEPVARS = ["economic_congestion_cost"]
+    creds = load_credentials()
+    bearer_token = get_bearer_token(creds["username"], creds["password"])
+    if not bearer_token:
+        raise RuntimeError("Failed to obtain ERCOT bearer token for DAM disclosure downloads")
 
-# Full-sample maps
-for depvar in PIXEL_DEPVARS:
-    run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar)
-
-    # No-controls maps just plotting raw correlation between error and outcome 
-    run_pixel_regression_maps(months=ANALYSIS_MONTHS, depvar=depvar, 
-                              no_controls=True)
-
-# Regime-conditioned maps (extreme cold, heat, wind, stressed grid)
-for depvar in PIXEL_DEPVARS:
-    for regime_name in REGIMES:
-        run_pixel_regression_maps(
-            months=ANALYSIS_MONTHS,
-            depvar=depvar,
-            regime=regime_name,
-        )
-        run_pixel_regression_maps(
-            months=ANALYSIS_MONTHS,
-            depvar=depvar,
-            regime=regime_name,
-            no_controls=True
+    print("\n=== Step 4: Download thermal inputs ===")
+    for month in months:
+        download_cems_month(year, month, force_rebuild=force_rebuild)
+        download_dam_disclosure_month(
+            year, month, bearer_token, creds["api_key"], force_rebuild=force_rebuild
         )
 
-# # ── Step A4: Infrastructure-level regressions ──────────────────────────────
-# # Capacity-weighted aggregation by tech category
-# from analysis.gridded_infrastructure_lr import run_infrastructure_analysis
-# infra_outputs = run_infrastructure_analysis(months=ANALYSIS_MONTHS)
+    download_crosswalk(force_rebuild=force_rebuild)
+    build_heat_rates(year, force_rebuild=force_rebuild)
+    aggregate_unit_annual(year, force_rebuild=force_rebuild)
+    build_fuel_price_tables(year, force_rebuild=force_rebuild)
 
-# ── Step A6: Forecast value maps (shadow cost DV) ──────────────────────────
-# Dollar value of forecast improvement at each pixel
-# from analysis.forecast_value_map import run_forecast_value_analysis
-# value_outputs = run_forecast_value_analysis(
-#     months=ANALYSIS_MONTHS,
-#     depvar="first_interval_shadow_cost",
-# )
+    print("\n=== Step 5: Build markup amounts ===")
+    compute_dam_markups(year, months=months, force_rebuild=force_rebuild)
+    compute_rt_markups(year, months=months, force_rebuild=force_rebuild)
 
-# ── Step A7: Forecast error asymmetry analysis (shadow cost DV) ────────────
-# Over-forecast vs under-forecast effects on congestion
-# from analysis.asymmetric_forecast_error_analysis import run_asymmetry_regressions
-# asymmetry_outputs = run_asymmetry_regressions(
-#     months=ANALYSIS_MONTHS,
-#     depvar="first_interval_shadow_cost",
-# )
 
+def build_pipeline(year=DEFAULT_YEAR, months=None, force_rebuild=True,
+                   run_analysis=True, n_modes=None, depvars=None,
+                   run_significance=True):
+    """Build the EOF analysis inputs and run the EOF workflow.
+
+    Parameters
+    ----------
+    year : int
+    months : iterable[int] or None
+    force_rebuild : bool
+    run_analysis : bool
+    n_modes : int or None
+    depvars : list[str] or None
+    run_significance : bool
+
+    Returns
+    -------
+    dict
+    """
+    from process_data.calculate_forecast_errors import calculate_era5_errors_for_month
+    from process_data.calculate_ruc_commitments import compute_ruc_commitments
+    from process_data.create_outcome_data import build_system_hourly_outcomes
+    from analysis.eof_analysis import (
+        run_eof_significance,
+        run_eof_decomposition,
+        run_eof_analysis,
+    )
+
+    dirs = setup_directories()
+    month_numbers = _validate_months(months or DEFAULT_MONTHS)
+    month_pairs = [(year, month) for month in month_numbers]
+
+    print("Building EOF pipeline for:")
+    print("  " + ", ".join(f"{year}-{month:02d}" for year, month in month_pairs))
+
+    _download_weather_inputs(year, month_numbers, dirs)
+    print("\n=== Weather inputs downloaded ===")
+    exit()
+    _download_grid_inputs(dirs)
+    _download_market_inputs(year, month_numbers)
+    _build_thermal_inputs(year, month_numbers, force_rebuild)
+
+    print("\n=== Step 6: Build ERA5 forecast errors ===")
+    for model in ("hrrr", "gfs"):
+        print(f"  Model: {model.upper()}")
+        for run_year, month in month_pairs:
+            calculate_era5_errors_for_month(run_year, month, model=model)
+
+    print("\n=== Step 7: Build RUC commitments ===")
+    compute_ruc_commitments(year, months=month_numbers, force_rebuild=force_rebuild)
+
+    print("\n=== Step 8: Build system hourly outcomes ===")
+    build_system_hourly_outcomes(year, months=month_numbers, force_rebuild=force_rebuild)
+
+    if run_significance:
+        print("\n=== Step 9: EOF significance ===")
+        run_eof_significance()
+
+    print("\n=== Step 10: EOF decomposition ===")
+    decomp_result = run_eof_decomposition(K=n_modes)
+
+    if run_analysis:
+        print("\n=== Step 11: EOF analysis ===")
+        run_eof_analysis(K=n_modes, depvars=depvars, bundle=decomp_result.get("bundle"))
+
+    return {
+        "dirs": dirs,
+        "year": year,
+        "months": month_pairs,
+        "force_rebuild": force_rebuild,
+        "run_analysis": run_analysis,
+        "run_significance": run_significance,
+    }
+
+
+def main():
+    """Command-line entry point."""
+    parser = argparse.ArgumentParser(
+        description="Build the EOF analysis inputs and run the EOF workflow"
+    )
+    parser.add_argument("--year", type=int, default=DEFAULT_YEAR,
+                        help="Analysis year (default: 2025)")
+    parser.add_argument("--months", type=int, nargs="*", default=None,
+                        help="Months to process (default: all 12)")
+    parser.add_argument("--n-modes", type=int, default=None,
+                        help="Override EOF modes per channel uniformly")
+    parser.add_argument("--depvars", nargs="*", default=None,
+                        help="Subset of EOF outcomes to analyze")
+    parser.add_argument("--no-force", action="store_true",
+                        help="Reuse cached outputs when available")
+    parser.add_argument("--skip-analysis", action="store_true",
+                        help="Stop after the EOF decomposition stage")
+    parser.add_argument("--skip-significance", action="store_true",
+                        help="Skip the EOF significance step")
+    args = parser.parse_args()
+
+    months = args.months if args.months else list(DEFAULT_MONTHS)
+    build_pipeline(
+        year=args.year,
+        months=months,
+        force_rebuild=not args.no_force,
+        run_analysis=not args.skip_analysis,
+        n_modes=args.n_modes,
+        depvars=args.depvars,
+        run_significance=not args.skip_significance,
+    )
+
+
+if __name__ == "__main__":
+    main()
 
 
