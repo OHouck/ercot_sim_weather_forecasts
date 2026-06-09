@@ -1,7 +1,7 @@
 """Compute hourly economic congestion cost from zone LMPs and SCED system lambda.
 
 Produces one output:
-  economic_congestion_cost [$/h] = Σ_z (LMP_z - λ_sys) × Q_z
+  economic_congestion_cost [$/h] = Σ_z (LMP_z - λ_sys)^2 × Q_z
   zone_lmp_spread_mw [$/MWh]     = load-weighted std dev of zone LMPs
   system_lambda [$/MWh]          = actual RT system lambda from SCED data
 
@@ -75,7 +75,7 @@ def _load_sced_lambda_month(year, month):
 # ---------------------------------------------------------------------------
 
 def compute_economic_congestion_cost(year, month, force_rebuild=False):
-    """Compute hourly economic congestion rent = Σ_z (LMP_z - λ_sys) × Q_z.
+    """Compute hourly economic congestion rent = Σ_z (LMP_z - λ_sys)^2 × Q_z.
 
     System lambda is the actual real-time system lambda from SCED data,
     averaged from 5-minute intervals to hourly. Zone LMPs and load come
@@ -130,9 +130,9 @@ def compute_economic_congestion_cost(year, month, force_rebuild=False):
     lmp_cols = [f"{z}_lmp" for z in common_zones]
     mw_cols = [f"{z}_mw" for z in common_zones]
 
-    # Congestion rent = Σ_z (LMP_z - λ) × Q_z  [$/h]
+    # Congestion rent = Σ_z (LMP_z - λ)^2 × Q_z  [$/h]
     merged["economic_congestion_cost"] = sum(
-        (merged[f"{z}_lmp"] - merged["system_lambda"]) * merged[f"{z}_mw"]
+        (merged[f"{z}_lmp"] - merged["system_lambda"])**2 * merged[f"{z}_mw"]
         for z in common_zones
     )
 

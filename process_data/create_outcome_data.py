@@ -3,7 +3,7 @@
 Creates one row per operating hour with all system-level outcome variables:
 
 Prices / congestion
-  economic_congestion_cost [$/h]   — Σ_z (LMP_z - λ) × Q_z
+  economic_congestion_cost [$/h]   — Σ_z (LMP_z - λ)^2 × Q_z
   rt_system_lambda [$/MWh]         — RT SCED system lambda 
 
 Renewables
