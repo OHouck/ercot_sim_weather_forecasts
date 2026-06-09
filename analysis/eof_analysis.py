@@ -1,64 +1,58 @@
 """
 EOF analysis of ERCOT weather-error fields — three-phase workflow.
 
-This module decomposes three field sets with two channels (wind, temp) processed
-independently:
+Channels (six per decomposition × cut):
+  1. day-ahead  : GFS day-ahead wind-speed error + temperature error
+  2. hour-ahead : HRRR 1h wind-speed error + temperature error
+  3. realized   : ERA5 realized wind speed + temperature
 
-  1. day-ahead   : GFS day-ahead 100m wind-speed error + 2m temperature error
-  2. hour-ahead  : HRRR 1h 100m wind-speed error + 2m temperature error
-  3. realized    : ERA5 realized 100m wind speed + realized 2m temperature
+Sample cuts (SAMPLE_CUT) determine which hours are used for each decomposition:
+full year, four meteorological seasons (DJF/MAM/JJA/SON), and RUC-deployed
+hours. Add further heterogeneity cuts as new SAMPLE_CUT entries.
 
-Each decomposition runs two per-channel blocks (wind and temp independently),
-for six total blocks per sample cut.
+━━━ Phase 1 — run_eof_significance ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fit an unrotated EOF on the FULL DATASET for every channel block and plot the
+eigenvalue scree with CI bands (used only to diagnose default_modes).
+  * North et al. (1982) rule-of-thumb band
+  * xeofs bootstrap 95% CI  (set N_BOOTSTRAPS=0 to skip — much faster)
+Output: figures/eof_decomposition/eof_significance.png
 
-Hours are subset by SAMPLE_CUT before fitting: the full year, the four meteorological
-seasons, and an RUC-deployed cut (hours with ruc_deployment_mw > 0). Add further
-heterogeneity cuts as new SAMPLE_CUT entries.
+━━━ Phase 2 — run_eof_decomposition ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Update default_modes after reviewing the Phase-1 scree, then run this phase.
+For EACH cut in SAMPLE_CUT:
+  • Fits Varimax-rotated EOFs on that cut's hours using default_modes.
+  • Saves projection-weight modes to disk (consumed by Phase 3 without re-fitting).
+  • Produces a combined loading-map / daily-score figure.
+Output: figures/eof_decomposition/eof_decomposition_{cut}.png
+        processed/eof/eof_modes_K{tag}_{cut}.npz
 
-The workflow has three phases, run in order:
+━━━ Phase 3 — run_eof_analysis ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For EACH cut in SAMPLE_CUT:
+  • Loads that cut's saved modes from Phase 2 (no re-fitting).
+  • Projects the cut's hours onto those modes to get per-hour scores.
+  • Runs OLS (HAC s.e.) against every outcome variable in depvars.
+  • Saves coefficient tables and produces:
+      – eof_coefs_across_outcomes_{field}.png per weather channel
+      – eof_ftest_heatmap.png
+Output: figures/eof_analysis/{cut}/
 
-Phase 1 — run_eof_significance
-    Fit the unrotated EOF spectrum for every block and plot its eigenvalue scree
-    with confidence intervals (Hannachi et al. 2007, Fig. 1). Two error-band types:
-      * North et al. (1982) rule of thumb  lambda_k * (1 +/- sqrt(2/n*)), where n*
-        is the autocorrelation-adjusted effective sample size (Thiebaux & Zwiers 1984).
-      * xeofs EOFBootstrapper 95% CI (Monte-Carlo resampling; Bjornsson & Venegas 1997).
-        Set N_BOOTSTRAPS = 0 to skip and use only North's rule — much faster for
-        exploratory runs.
-    Output: figures/eof_decomposition/eof_significance_{cut}.png
-
-Phase 2 — run_eof_decomposition
-    AFTER inspecting the Phase-1 scree plots, update default_modes. The saved
-    per-channel modes are fit on all hours (no train/test split). Per-cut Varimax
-    EOFs are then combined into one figure per sample cut: loading maps (top)
-    + daily-averaged score time series with ±1 SEM bands (bottom).
-    Output: figures/eof_decomposition/eof_decomposition_{cut}.png
-            processed/eof/eof_modes_K{K}.npz
-
-Phase 3 — run_eof_analysis
-    Loads the saved EOF modes from Phase 2 and projects channel data onto them to
-    create per-hour scores. Runs OLS regressions (HAC s.e.) against ERCOT outcome
-    variables, produces coefficient forest plots, a joint F-test heatmap, spatial
-    EOF coefficient maps, and season-conditional regressions.
-
-Both Phase 2 and Phase 3 use the same default_modes value. default_modes is a
-dict keyed by block (e.g. "dayahead_wind", "hourahead_temp") with the number of
-rotated EOF modes to retain for each block. Change these values after reviewing
-Phase 1 scree plots, then re-run Phases 2 and 3.
+Both Phase 2 and Phase 3 use default_modes (a dict keyed by block, e.g.
+"dayahead_wind", "hourahead_temp"). Update it after reviewing Phase 1 scree
+plots, then re-run Phases 2 and 3.
 
 Block keys are `{decomp}_{channel}`, e.g. `dayahead_wind`, `realized_temp`.
 
 Usage:
-    # Phase 1 first — inspect scree plots to choose default_modes:
+    # Phase 1 — inspect scree to choose default_modes:
     uv run python -m analysis.eof_analysis --task significance
 
-    # Phase 2 — fit, save, and visualize modes with default_modes:
+    # Phase 2 — fit and save per-cut modes + figures:
     uv run python -m analysis.eof_analysis --task decompose
 
-    # Phase 3 — run regressions using saved modes:
+    # Phase 3 — regressions using saved per-cut modes:
     uv run python -m analysis.eof_analysis --task analyze
 
-    # Run all three phases in sequence:
+    # All three phases in sequence:
     uv run python -m analysis.eof_analysis
 """
 
@@ -72,31 +66,40 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import statsmodels.api as sm
 import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from helper_funcs import setup_directories
 
 from analysis.pca_decomposition import (
-    load_channel_fields, ALL_MONTHS, ALL_FIELDS, N_COMPONENTS, RANDOM_STATE,
-    HAC_MAXLAGS, _r2,
+    load_channel_fields, ALL_MONTHS, ALL_FIELDS, RANDOM_STATE, _r2,
     CHANNEL_SPEC, FIELD_LABELS,
     _draw_texas, _get_cartopy_crs, _grid_marker_size,
     ERROR_FIELDS, REALIZED_FIELDS,
 )
 from analysis.pca_mode_analysis import (
-    DEPVAR_CONFIGS, DEPVARS,
     load_outcomes, build_regression_matrix, standardize_pca_cols, run_ols_inference,
-    save_coef_table, plot_coefficient_forest, plot_ftest_heatmap, plot_pca_maps,
+    save_coef_table, plot_ftest_heatmap,
     plot_pca_coefs_across_outcomes,
 )
-from analysis.eof_methods import fit_varimax, DEFAULT_K
+from analysis.eof_methods import fit_varimax, DEFAULT_K, fit_sparse_joint, fit_mca
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+
+DEPVAR_CONFIGS = {
+    "economic_congestion_cost":       {"label": "Congestion Cost", "transform": "log1p"},
+    "total_renewable_curtailment_mw": {"label": "Renewable Curtailment", "transform": "log1p"},
+    "avg_intensity_kg_per_mwh":       {"label": "Avg Carbon Intensity",  "transform": "log1p"},
+    "ruc_deployment_mw":              {"label": "RUC Deployment",         "transform": "log1p"},
+    "ruc_deployment_binary":          {"label": "Binary RUC Deployment",    "transform": "raw"},
+    "rt_scgt_p85_markup":             {"label": "SC Gas Markup",     "transform": "raw"},
+    "rt_ccgt_p85_markup":             {"label": "CC Gas Markup",     "transform": "raw"},
+    "rt_cllig_p85_markup":            {"label": "Coal Markup",     "transform": "raw"},
+}
+DEPVARS = list(DEPVAR_CONFIGS.keys())
 
 # decomp key -> (channel fields [wind, temp], human-readable label)
 DECOMPOSITIONS = {
@@ -699,8 +702,6 @@ def plot_season_figure(season_results, season_label, figures_dir, season_key):
     if scatter_axes:
         sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=diverging_norm)
         sm.set_array([])
-        fig.colorbar(sm, ax=scatter_axes, shrink=0.5, pad=0.03,
-                     label="Normalised loading", fraction=0.015)
 
     fig.suptitle(f"Varimax EOF Decomposition — {season_label}", fontsize=10, y=0.998)
     output_path = figures_dir / f"eof_decomposition_{season_key}.png"
@@ -962,10 +963,12 @@ def run_eof_decomposition(K=None, months=None):
                 if n_hours < n_block + 10:
                     continue
                 print(f"  {block_key:20s}: n_modes={n_block}")
+
                 fit_result = fit_varimax(
                     cut_bundle, np.arange(n_hours), cut_bundle["hours"],
                     K=n_block, error_fields=block_fields, seed=RANDOM_STATE,
                 )
+
                 fit_result.scores.columns = [
                     f"{block_key}_PC{i + 1}" for i in range(fit_result.scores.shape[1])
                 ]
@@ -983,174 +986,31 @@ def run_eof_decomposition(K=None, months=None):
 # Section 3: EOF Regression Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_season_regressions(X_std, y, hours_clean, col_names, tables_dir, outcomes_df):
-    """OLS regressions conditioned on each sample cut (seasons + RUC-deployed hours).
-
-    Each cut's hours are fit with HAC (Newey-West) standard errors using the same
-    standardized design matrix as the primary regression. Cuts are drawn from
-    CONDITION_CUTS (every SAMPLE_CUT except the full-year base).
-
-    Parameters
-    ----------
-    X_std       : pd.DataFrame (T_clean, p) — standardized design matrix
-    y           : ndarray (T_clean,) — transformed outcome
-    hours_clean : pd.DatetimeIndex (T_clean,)
-    col_names   : list of str — coefficient names (includes 'const')
-    tables_dir  : Path
-    outcomes_df : pd.DataFrame indexed by valid_time — supplies non-calendar cut masks
-
-    Returns
-    -------
-    dict {cut_key: (ols_result, n_obs)}
-    """
-    results = {}
-    rows    = []
-    for cut_key, cut in CONDITION_CUTS.items():
-        mask = cut.mask(hours_clean, outcomes_df)
-        n    = int(mask.sum())
-        if n < 200:
-            print(f"  {cut.label}: skipped (N={n} < 200)")
-            continue
-        ols = sm.OLS(
-            y[mask], sm.add_constant(X_std.values[mask], has_constant="add")
-        ).fit(
-            cov_type="HAC",
-            cov_kwds={"maxlags": HAC_MAXLAGS, "use_correction": True},
-        )
-        results[cut_key] = (ols, n)
-        print(f"  {cut.label}: N={n}  R²={ols.rsquared:.4f}")
-        for cname, coef, pval in zip(col_names[1:], ols.params[1:], ols.pvalues[1:]):
-            rows.append({"cut": cut_key, "feature": cname,
-                         "coef": coef, "p_value": pval})
-
-    out = Path(tables_dir) / "eof_season_coefficients.csv"
-    pd.DataFrame(rows).to_csv(out, index=False)
-    print(f"  Saved: {out}")
-    return results
-
-
-def plot_season_comparison(season_results, col_names, fig_dir):
-    """Coefficient forest comparing error-EOF coefficients across sample cuts.
-
-    Parameters
-    ----------
-    season_results : dict {cut_key: (ols_result, n_obs)}
-    col_names      : list of str — coefficient names (includes 'const')
-    fig_dir        : Path
-    """
-    error_cols = [c for c in col_names[1:]
-                  if c.startswith(("PC", "INT"))
-                  and "era5" not in c and not c.startswith("INTreal")]
-    if not error_cols or not season_results:
-        print("  (no cut results to plot)")
-        return
-
-    n_feat  = len(error_cols)
-    labels  = [c.replace("_error", "") for c in error_cols]
-    palette = {"winter": "#2980b9", "spring": "#27ae60",
-               "summer": "#e74c3c", "fall":   "#8e44ad", "ruc": "#f39c12"}
-    offsets = np.linspace(-0.3, 0.3, len(season_results) + 1)
-
-    fig, ax = plt.subplots(figsize=(9, max(6, n_feat * 0.38)))
-    for ri, (skey, (ols_r, n_obs)) in enumerate(season_results.items()):
-        rcoef  = pd.Series(ols_r.params[1:], index=col_names[1:])
-        rci    = ols_r.conf_int()
-        rci_lo = pd.Series(rci[1:, 0], index=col_names[1:])
-        rci_hi = pd.Series(rci[1:, 1], index=col_names[1:])
-        label  = CONDITION_CUTS[skey].label
-        for i, c in enumerate(error_cols):
-            if c not in rcoef.index:
-                continue
-            y_pos  = i + offsets[ri]
-            lo_err = max(rcoef[c] - rci_lo[c], 0)
-            hi_err = max(rci_hi[c] - rcoef[c], 0)
-            ax.errorbar(rcoef[c], y_pos,
-                        xerr=[[lo_err], [hi_err]],
-                        fmt="o", color=palette.get(skey, "#333"),
-                        markersize=4, capsize=2, linewidth=1,
-                        label=f"{label} (N={n_obs})" if i == 0 else "")
-
-    ax.axvline(0, color="k", lw=0.8, ls="--")
-    ax.set_yticks(np.arange(n_feat))
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("OLS coefficient (log₁p scale, standardized)", fontsize=9)
-    ax.set_title("Cut-Conditional Regressions — Error EOF Coefficients", fontsize=9)
-    ax.legend(loc="lower right", fontsize=7.5)
-    ax.invert_yaxis()
-    ax.grid(axis="x", linestyle=":", linewidth=0.5, alpha=0.6)
-    plt.tight_layout()
-    out = fig_dir / "eof_season_comparison.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out}")
-
-
-def _coef_map_regressions(bundle, modes, outcomes_df, depvars, K_scalar):
-    """Project a bundle onto its own EOF modes and run one full-sample OLS per depvar.
-
-    Used for the coefficient-across-outcomes maps so the EOF scores feeding each
-    cut's regressions come from modes fit on that same cut's data. Each depvar is
-    fit on every (clean) hour of the bundle with HAC standard errors; depvars with
-    fewer than 200 clean hours are dropped.
-
-    Parameters
-    ----------
-    bundle      : dict from load_channel_fields, already subset to the cut's hours
-    modes       : dict {field: {...}} from fit_eof_modes, fit on this bundle
-    outcomes_df : pd.DataFrame indexed by valid_time
-    depvars     : list of outcome keys
-    K_scalar    : int — max modes per channel (passed to build_regression_matrix)
-
-    Returns
-    -------
-    dict {depvar: {ols_result, col_names, feature_groups}}
-    """
-    scores_dict = project_onto_modes(bundle, modes)
-    hours = bundle["hours"]
-    results = {}
-    for depvar in depvars:
-        if depvar not in outcomes_df.columns:
-            continue
-        transform = DEPVAR_CONFIGS.get(depvar, {"transform": "log1p"})["transform"]
-        X_df, y, _, feature_groups = build_regression_matrix(
-            scores_dict, ERROR_FIELDS, REALIZED_FIELDS, hours, outcomes_df[depvar],
-            K=K_scalar, transform=transform,
-        )
-        if len(X_df) < 200:
-            continue
-        X_std, _ = standardize_pca_cols(X_df, np.ones(len(X_df), dtype=bool))
-        ols, _, col_names = run_ols_inference(y, X_std, feature_groups)
-        results[depvar] = {"ols_result": ols, "col_names": col_names,
-                           "feature_groups": feature_groups}
-    return results
-
-
 def run_eof_analysis(K=None, depvars=None, months=None, bundle=None):
-    """Phase 3: regress per-channel Varimax-EOF scores against outcome variables.
+    """Phase 3: for each sample cut, load its saved modes and regress against outcomes.
 
-    Loads the saved EOF modes from Phase 2, projects the channel data onto them
-    to create per-hour scores, then for each depvar runs the primary OLS (HAC s.e.)
-    and saves coefficient forest plots, a joint F-test heatmap, spatial EOF
-    coefficient maps, and cut-conditional regressions. The coefficient-across-
-    outcomes maps are produced for the full year (using the saved modes) and,
-    separately, for each sample cut under figures/eof_analysis/coefs_by_cut/{cut}/
-    — for those the EOF modes are re-fit on the cut's own hours so the scores come
-    from that cut's decomposition. The full-year EOF modes are read from disk, so
-    regressions can be re-run without re-fitting the full-year decomposition.
+    For every cut in SAMPLE_CUT:
+      1. Loads the cut-specific EOF modes saved by Phase 2.
+      2. Subsets the bundle to that cut's hours and projects onto the cut's modes.
+      3. For each outcome variable runs OLS with HAC standard errors and saves
+         coefficient tables.
+      4. Produces eof_coefs_across_outcomes figures and an F-test heatmap for that
+         cut under figures/eof_analysis/{cut_key}/.
 
-    If modes for the requested K are missing, Phase 2 is run automatically.
+    If modes for a cut are missing, Phase 2 is run automatically to produce them.
 
     Parameters
     ----------
-    K       : int — EOF modes per channel; defaults to default_modes
+    K       : int or dict {block_key: int} — EOF modes per channel; defaults to
+              default_modes
     depvars : list of str — outcome variable keys; defaults to all DEPVARS
-    months  : list of (year, month) — only used when building missing modes
-    bundle  : dict or None — pre-loaded channel bundle from run_eof_decomposition;
-              if provided, skips the disk re-read of ERA5 NetCDF files
+    months  : list of (year, month) — used when bundle must be loaded from disk
+    bundle  : dict or None — pre-loaded channel bundle (from run_eof_decomposition);
+              if None the bundle is loaded from disk using `months`
 
     Returns
     -------
-    dict {depvar: result_dict} for each depvar run
+    dict {cut_key: {depvar: result_dict}}
     """
     if K is None:
         K = default_modes
@@ -1159,154 +1019,102 @@ def run_eof_analysis(K=None, depvars=None, months=None, bundle=None):
     if depvars is None:
         depvars = DEPVARS
 
-    dirs       = setup_directories()
-    fig_dir    = Path(dirs["figures"]) / "eof_analysis"
-    tables_dir = Path(dirs["tables"])
-    eof_dir    = Path(dirs["processed"]) / "eof"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    dirs        = setup_directories()
+    base_fig_dir = Path(dirs["figures"]) / "eof_analysis"
+    tables_dir  = Path(dirs["tables"])
+    eof_dir     = Path(dirs["processed"]) / "eof"
     tables_dir.mkdir(parents=True, exist_ok=True)
     eof_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load saved modes (fit Phase 2 if missing), then project to per-hour scores.
-    print("\n=== Phase 3, Step 1: Loading EOF modes and projecting scores ===")
-    if not (eof_dir / f"eof_modes_K{_modes_tag(K)}.npz").exists():
-        print(f"  No EOF modes for K={K} — running Phase 2 now...")
-        run_eof_decomposition(K=K, months=months)
-    modes, var_df, modes_months = load_eof_modes(K, eof_dir)
-    if bundle is None:
-        bundle = load_channel_fields(modes_months, dirs)
-    scores_dict = project_onto_modes(bundle, modes)
-    hours       = bundle["hours"]
-    pca_dict, lat_dict, lon_dict = modes_to_pca_dict(modes)
-    print(f"  Projected {len(hours)} hours onto {len(modes)} channel mode sets")
-
-    # 2. Spatial mode maps.
-    print("\n=== Phase 3, Step 2: Generating spatial EOF mode maps ===")
-    plot_pca_maps(pca_dict, lat_dict, lon_dict, fig_dir,
-                  fname_prefix="eof", method_label="EOF")
-
-    # 3. Load all outcomes once.
-    print("\n=== Phase 3, Step 3: Loading outcome variables ===")
+    print("\n=== Phase 3: Loading outcomes ===")
     outcomes_df = load_outcomes(dirs)
 
-    all_results = {}
-    all_f_tests = {}
-    primary_cache = None
-    K_scalar = max(K.values())
+    if bundle is None:
+        bundle = load_channel_fields(months or ALL_MONTHS, dirs)
+    all_hours = bundle["hours"]
+    K_scalar  = max(K.values())
 
-    for depvar in depvars:
-        cfg       = DEPVAR_CONFIGS.get(depvar, {"label": depvar, "transform": "log1p"})
-        label     = cfg["label"]
-        transform = cfg["transform"]
+    all_cut_results = {}
 
+    for cut_key, cut in SAMPLE_CUT.items():
         print(f"\n{'='*60}")
-        print(f"=== Depvar: {label} ({depvar}) ===")
+        print(f"=== Phase 3 [{cut.label}] ===")
         print(f"{'='*60}")
 
-        if depvar not in outcomes_df.columns:
-            print(f"  WARNING: {depvar} not in outcomes CSV — skipping")
-            continue
-        dep_series = outcomes_df[depvar]
-
-        X_df, y, hours_clean, feature_groups = build_regression_matrix(
-            scores_dict, ERROR_FIELDS, REALIZED_FIELDS, hours, dep_series,
-            K=K_scalar, transform=transform,
-        )
-        all_mask = np.ones(len(X_df), dtype=bool)
-        X_std, scale_stats = standardize_pca_cols(X_df, all_mask)
-        scale_stats.to_csv(tables_dir / f"eof_scale_stats_{depvar}.csv", index=False)
-
-        ols_result, f_tests, col_names = run_ols_inference(y, X_std, feature_groups)
-        all_f_tests[depvar] = f_tests
-
-        if transform == "log1p":
-            r2_nat = _r2(np.expm1(y), np.expm1(ols_result.fittedvalues))
-            print(f"  Native scale R²={r2_nat:.4f}")
-        else:
-            r2_nat = _r2(y, ols_result.fittedvalues)
-            print(f"  R²={r2_nat:.4f}  (raw scale)")
-
-        save_coef_table(ols_result, col_names,
-                        tables_dir / f"eof_ols_coefficients_{depvar}.csv")
-        pd.DataFrame(
-            [{"group": g, "f_stat": v[0], "p_value": v[1]} for g, v in f_tests.items()]
-        ).to_csv(tables_dir / f"eof_joint_ftests_{depvar}.csv", index=False)
-        print(f"  Saved: eof_joint_ftests_{depvar}.csv")
-
-        plot_coefficient_forest(
-            ols_result, col_names, feature_groups, fig_dir,
-            depvar=depvar, depvar_label=label,
-            fname_prefix="eof", method_label="EOF",
-        )
-
-        n01 = (ols_result.pvalues[1:] < 0.01).sum()
-        n05 = (ols_result.pvalues[1:] < 0.05).sum()
-        print(f"  {n01} features p<0.01, {n05} features p<0.05")
-
-        all_results[depvar] = {
-            "ols_result":     ols_result,
-            "f_tests":        f_tests,
-            "col_names":      col_names,
-            "feature_groups": feature_groups,
-            "r2_nat":         r2_nat,
-            "n_hours":        len(hours_clean),
-        }
-        if depvar == PRIMARY_DEPVAR:
-            primary_cache = (X_std, y, hours_clean, col_names)
-
-    # 4. EOF coefficient maps across all outcomes (full year).
-    print("\n=== Phase 3, Step 4: EOF coefficient maps across outcomes ===")
-    plot_pca_coefs_across_outcomes(
-        pca_dict, lat_dict, lon_dict,
-        {k: v for k, v in all_results.items() if k in DEPVARS},
-        fig_dir, fname_prefix="eof",
-    )
-
-    # 4b. Same coefficient maps, recomputed on each sample cut (seasons + RUC).
-    #     EOF modes are re-fit on each cut's own hours so the scores feeding the
-    #     cut regressions come from that cut's decomposition (e.g. winter modes →
-    #     winter scores → winter regressions), then projected and regressed.
-    print("\n=== Phase 3, Step 4b: Per-cut coefficient maps across outcomes ===")
-    for cut_key, cut in CONDITION_CUTS.items():
-        cut_mask = cut.mask(hours, outcomes_df)
-        n_cut = int(cut_mask.sum())
+        cut_mask = cut.mask(all_hours, outcomes_df)
+        n_cut    = int(cut_mask.sum())
         if n_cut < 200:
-            print(f"  {cut.label}: only {n_cut} hours — skipping")
+            print(f"  Skipping — only {n_cut} hours")
             continue
-        print(f"  {cut.label}: fitting cut-specific EOF modes on {n_cut} hours")
-        cut_bundle = _subset_bundle(bundle, cut_mask)
-        cut_modes, _ = fit_eof_modes(cut_bundle, ALL_FIELDS, K=K)
-        cut_results = _coef_map_regressions(
-            cut_bundle, cut_modes, outcomes_df, depvars, K_scalar
-        )
-        if not cut_results:
-            print(f"  {cut.label}: no depvars with N≥200 — skipping")
-            continue
-        cut_pca, cut_lat, cut_lon = modes_to_pca_dict(cut_modes)
-        cut_fig_dir = fig_dir / "coefs_by_cut" / cut_key
+
+        # Load saved modes for this cut, running Phase 2 if they're missing.
+        modes_file = eof_dir / f"eof_modes_K{_modes_tag(K)}_{cut_key}.npz"
+        if not modes_file.exists():
+            print(f"  No saved modes for '{cut_key}' — running Phase 2 ...")
+            run_eof_decomposition(K=K, months=months)
+        modes, var_df, _ = load_eof_modes(K, eof_dir, cut_key)
+
+        # Subset bundle, project onto cut-specific modes to get per-hour scores.
+        cut_bundle  = _subset_bundle(bundle, cut_mask)
+        scores_dict = project_onto_modes(cut_bundle, modes)
+        cut_hours   = cut_bundle["hours"]
+        pca_dict, lat_dict, lon_dict = modes_to_pca_dict(modes)
+        print(f"  Projected {n_cut} hours onto {len(modes)} channel mode sets")
+
+        cut_fig_dir = base_fig_dir / cut_key
         cut_fig_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  {cut.label}: {len(cut_results)} depvars → {cut_fig_dir}")
+        cut_table_dir = tables_dir / "eof" / cut_key
+        cut_table_dir.mkdir(parents=True, exist_ok=True)
+
+        cut_results = {}
+        cut_f_tests = {}
+
+        for depvar in depvars:
+            if depvar not in outcomes_df.columns:
+                print(f"  WARNING: {depvar} not in outcomes — skipping")
+                continue
+            cfg       = DEPVAR_CONFIGS.get(depvar, {"label": depvar, "transform": "log1p"})
+            transform = cfg["transform"]
+
+            X_df, y, _, feature_groups = build_regression_matrix(
+                scores_dict, ERROR_FIELDS, REALIZED_FIELDS, cut_hours,
+                outcomes_df[depvar], K=K_scalar, transform=transform,
+            )
+            if len(X_df) < 200:
+                print(f"  {depvar}: only {len(X_df)} clean hours — skipping")
+                continue
+
+            X_std, _ = standardize_pca_cols(X_df, np.ones(len(X_df), dtype=bool))
+            ols_result, f_tests, col_names = run_ols_inference(y, X_std, feature_groups)
+            cut_f_tests[depvar] = f_tests
+
+            r2_nat = (_r2(np.expm1(y), np.expm1(ols_result.fittedvalues))
+                      if transform == "log1p"
+                      else _r2(y, ols_result.fittedvalues))
+            print(f"  {depvar}: R²={r2_nat:.4f}  N={len(X_df)}")
+
+            save_coef_table(ols_result, col_names,
+                            cut_table_dir / f"eof_ols_coefficients_{depvar}.csv")
+            cut_results[depvar] = {"ols_result": ols_result, "col_names": col_names,
+                                   "feature_groups": feature_groups, "r2_nat": r2_nat,
+                                   "n_hours": len(X_df)}
+
+        if not cut_results:
+            print(f"  No depvars completed for {cut.label} — skipping plots")
+            continue
+
         plot_pca_coefs_across_outcomes(
-            cut_pca, cut_lat, cut_lon, cut_results, cut_fig_dir, fname_prefix="eof",
+            pca_dict, lat_dict, lon_dict,
+            {k: v for k, v in cut_results.items() if k in DEPVARS},
+            cut_fig_dir, fname_prefix="eof",
         )
-
-    # 5. Combined cross-depvar F-test heatmap.
-    print("\n=== Phase 3, Step 5: Combined F-test heatmap ===")
-    plot_ftest_heatmap(all_f_tests, fig_dir, fname_prefix="eof", method_label="EOF")
-
-    # 6. Cut-conditional regressions on the primary depvar's design matrix.
-    print("\n=== Phase 3, Step 6: Cut-conditional regressions ===")
-    if primary_cache is not None:
-        X_std, y, hours_clean, col_names = primary_cache
-        season_results = run_season_regressions(
-            X_std, y, hours_clean, col_names, tables_dir, outcomes_df
+        plot_ftest_heatmap(
+            cut_f_tests, cut_fig_dir,
+            fname_prefix="eof", method_label=f"EOF [{cut.label}]",
         )
-        plot_season_comparison(season_results, col_names, fig_dir)
-    else:
-        print(f"  Primary depvar '{PRIMARY_DEPVAR}' not run — skipping season analysis")
+        all_cut_results[cut_key] = cut_results
 
-    all_results.update({"pca_dict": pca_dict, "var_df": var_df, "K": K})
-    return all_results
+    return all_cut_results
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1337,14 +1145,14 @@ def main():
     )
     args = parser.parse_args()
 
-    K = args.n_modes  # None means functions will use default_modes
+    K = args.n_modes  # None → functions use default_modes
 
     if args.task in ("significance", "all"):
         run_eof_significance(n_scree_modes=SIG_N_MODES, n_boot=N_BOOTSTRAPS)
     decomp_bundle = None
     if args.task in ("decompose", "all"):
-        decomp_result = run_eof_decomposition(K=K)
-        decomp_bundle = decomp_result.get("bundle")
+        result = run_eof_decomposition(K=K)
+        decomp_bundle = result.get("bundle")
     if args.task in ("analyze", "all"):
         run_eof_analysis(K=K, depvars=args.depvars, bundle=decomp_bundle)
 

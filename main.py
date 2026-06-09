@@ -46,8 +46,8 @@ def _download_weather_inputs(year: int, months: list[int], dirs: dict) -> None:
     for month in months:
         download_hrrr_month(year, month, dirs["raw"])
         download_gfs_month(year, month, dirs["raw"])
-        download_era5_month(year, month, base_dir=dirs["raw"], forece_rebuild=True)
-        download_era5_wind100m_month(year, month, base_dir=dirs["raw"], forece_rebuild=True)
+        download_era5_month(year, month, base_dir=dirs["raw"])
+        download_era5_wind100m_month(year, month, base_dir=dirs["raw"])
 
 
 def _download_grid_inputs(dirs: dict) -> None:

@@ -413,6 +413,9 @@ def build_system_hourly_outcomes(year, months=None, force_rebuild=True):
         .drop_duplicates(subset='valid_time', keep='first')
         .reset_index(drop=True)
     )
+    # create ruc_deployment_binary column for if any RUC deployment occurred (1) or not (0)
+    if 'ruc_deployment_mw' in result.columns:
+        result['ruc_deployment_binary'] = (result['ruc_deployment_mw'] > 0).astype(int)
 
     # Merge year-level markups (filtered to included months after concat)
     if markups is not None and not markups.empty:
@@ -433,7 +436,7 @@ def build_system_hourly_outcomes(year, months=None, force_rebuild=True):
         'rt_cllig_p85', 'dam_cllig_p85', 'cllig_mc',
         'rt_scgt_p85', 'dam_scgt_p85', 'scgt_mc',
         'rt_ccgt_p85', 'dam_ccgt_p85', 'ccgt_mc',
-        'ruc_deployment_mw', 'ruc_optout_deployment_mw',
+        'ruc_deployment_mw', 'ruc_optout_deployment_mw', 'ruc_deployment_binary'
     ]
     ordered = ['valid_time'] + time_feat_cols + [
         c for c in outcome_cols if c in result.columns

@@ -429,9 +429,9 @@ class TestModesRoundTrip:
         # the two fields in the synthetic bundle.
         K_dict = {"wspd100_error_0h": 2, "temp_error_0h": 2}
         modes, var_df = fit_eof_modes(bundle, fields, K=K_dict, seed=0)
-        save_eof_modes(modes, var_df, [(2025, 1), (2025, 2)], K_dict, tmp_path)
+        save_eof_modes(modes, var_df, [(2025, 1), (2025, 2)], K_dict, tmp_path, "all")
 
-        loaded, loaded_var_df, months = load_eof_modes(K_dict, tmp_path)
+        loaded, loaded_var_df, months = load_eof_modes(K_dict, tmp_path, "all")
         assert months == [(2025, 1), (2025, 2)]
         assert set(loaded) == set(modes)
         for field in fields:

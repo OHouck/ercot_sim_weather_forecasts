@@ -4451,6 +4451,22 @@ wheels = [
 ]
 
 [[package]]
+name = "sparse-pls"
+version = "0.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/7d/c34c3d5645711bc9dd582d56b55289c9a0de48b9a9e9895e26679d5733f4/sparse_pls-0.1.3.tar.gz", hash = "sha256:801a1ec1dbbdd660a451318e8aca7a923b95865285a14985e43fca6f88f9f597", size = 26732 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/57/2ddbcd97f190961f39e83be885ddaea67b77ad0233225651b6662cd1febd/sparse_pls-0.1.3-py3-none-any.whl", hash = "sha256:5912b7eace9be33df90a556e3a6b41a09f2869d7d46ec08cd25e4cbf90f903a1", size = 16582 },
+]
+
+[[package]]
 name = "stack-data"
 version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4554,6 +4570,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "seaborn" },
+    { name = "sparse-pls" },
     { name = "tabulate" },
     { name = "torch" },
     { name = "torch-geometric" },
@@ -4606,6 +4623,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.4.0" },
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "sparse-pls", specifier = ">=0.1.3" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "torch", specifier = ">=2.2.0" },
     { name = "torch-geometric", specifier = ">=2.5.0" },

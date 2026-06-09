@@ -63,7 +63,22 @@ from shapely.geometry import Point
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from helper_funcs import setup_directories
-from analysis.create_plots import parse_tmp, parse_wnd_speed
+
+def parse_tmp(tmp_str):
+    """Parse ISD TMP field to degrees Celsius."""
+    if pd.isna(tmp_str) or '+9999' in str(tmp_str):
+        return None
+    return int(str(tmp_str).split(',')[0]) / 10.0
+
+
+def parse_wnd_speed(wnd_str):
+    """Parse ISD WND field to wind speed in m/s."""
+    if pd.isna(wnd_str):
+        return None
+    parts = str(wnd_str).split(',')
+    if len(parts) < 5 or parts[3] == '9999':
+        return None
+    return int(parts[3]) / 10.0
 
 
 # ── Model configuration ──────────────────────────────────────────────────────

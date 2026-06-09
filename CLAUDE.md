@@ -1,5 +1,20 @@
 # CLAUDE.md — Data Build Guide
 
+## Code Style: Variable Naming
+
+Use long, descriptive variable names throughout all code. Prefer explicit names
+that convey type and role over short abbreviations. Examples:
+
+- `n_effective_components` not `K`
+- `training_scores_matrix` not `T_train`
+- `soft_threshold_lambda` not `lam`
+- `finite_outcome_mask` not `valid`
+- `temporal_chunk_labels` not `groups_all`
+- `conf_int_lower_bounds` not `ci_lo`
+
+Single-letter names (`n`, `p`, `k`, `w`) are only acceptable as loop indices
+for very short loops where the meaning is obvious from immediate context.
+
 ## Research Question
 How do joint errors in short-range (HRRR 1h) and day-ahead (GFS) wind and temperature forecasts impact locational marginal prices (LMP) and renewable curtailment in ERCOT?
 

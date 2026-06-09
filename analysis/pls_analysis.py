@@ -6,9 +6,20 @@ one error field is passed, the columns are concatenated horizontally so PLS
 sees the full joint covariance structure.  Loading and coefficient surfaces
 are then split back by field for per-field visualisation.
 
+Sparsity
+--------
+Dense PLS components load on essentially every pixel, which makes the maps
+hard to read.  Passing ``--sparse`` switches to Sparse PLS (Chun & Keleş 2010;
+Lê Cao et al. 2008): each NIPALS weight vector is L1-penalised by
+soft-thresholding so only ``keep_x`` pixels load on each component.  The CV
+sweep then searches jointly over (n_components, keep_x), and a heatmap reports
+out-of-sample R² across that grid.  Sparse runs write figures with a
+``_sparse`` suffix so they never overwrite the dense ones.
+
 Outputs
 -------
-  pls_cv_curve_*.png         — CV R² vs n_components for each run
+  pls_cv_curve_*.png         — CV R² vs n_components (dense runs)
+  pls_cv_heatmap_*.png       — CV R² over (n_components × keep_x) (sparse runs)
   pls_component_maps_*.png   — top-4 component loadings, one panel per field
   pls_coefficient_map_*.png  — β(s) coefficient surface, one panel per field
   pls_comparison_cv.png      — overlay of single-field vs joint CV curves
@@ -23,6 +34,10 @@ Usage:
 
     # Joint model + comparison against each single field
     uv run python -m analysis.pls_analysis --fields wspd_error_1h temp_error_1h --compare
+
+    # Sparse PLS — each component loads on at most keep_x pixels
+    uv run python -m analysis.pls_analysis --fields wspd_error_1h temp_error_1h \\
+        --sparse --keep-x-grid 50 100 200 400
 
     # Different outcome variable
     uv run python -m analysis.pls_analysis --fields wspd_error_1h temp_error_1h \\
@@ -42,6 +57,7 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 import cartopy.crs as ccrs
 import cartopy.io.shapereader as shpreader
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -62,13 +78,16 @@ RANDOM_STATE = 42
 N_COMPONENTS_GRID = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 75, 100]
 N_BOOTSTRAP = 500
 
+# Sparse-PLS sparsity grid: number of NON-ZERO pixel weights kept PER component
+# (the mixOmics "keepX" parameter).  Spans the joint stacked X, so a value of
+# 100 means 100 nonzero columns total across all stacked error fields.
+KEEP_X_GRID = [50, 100, 200, 400, 800, 1600]
+
 # Concise labels for figure titles
 FIELD_LABELS = {
     "wspd_error_1h":  "Wind speed error (HRRR 1h)",
-    "wspd_error_18h": "Wind speed error (HRRR 18h)",
     "wspd_error_0h":  "Wind speed error (GFS day-ahead)",
     "temp_error_1h":  "Temp error (HRRR 1h)",
-    "temp_error_18h": "Temp error (HRRR 18h)",
     "temp_error_0h":  "Temp error (GFS day-ahead)",
 }
 
@@ -191,6 +210,123 @@ def load_and_prepare(months, error_fields, depvar):
     return X, Y, pixel_coords, pixel_ids, common_times, offsets
 
 
+# ── Sparse PLS ──────────────────────────────────────────────────────────────
+
+def _soft_threshold_keep(w, keep_x):
+    """Soft-threshold a weight vector to keep at most ``keep_x`` nonzeros.
+
+    Implements the mixOmics-style sparsity step: the penalty λ is set to the
+    largest *discarded* magnitude (the (keep_x+1)-th largest |wᵢ|), then
+    surviving weights are shrunk toward zero by λ.  This is the L1 / lasso
+    penalty applied to the PLS weight vector at each NIPALS iteration.
+
+    Parameters
+    ----------
+    w      : ndarray (p,) — raw covariance direction Xᵀy_resid
+    keep_x : int          — number of nonzero weights to retain
+
+    Returns
+    -------
+    w_thr : ndarray (p,) — soft-thresholded weight vector (not normalised)
+    """
+    p = w.size
+    if keep_x >= p:
+        return w
+    abs_w = np.abs(w)
+    # λ = (keep_x+1)-th largest magnitude → everything ≤ λ is zeroed
+    lam = np.partition(abs_w, p - keep_x - 1)[p - keep_x - 1]
+    w_thr = np.sign(w) * np.maximum(abs_w - lam, 0.0)
+    if not np.any(w_thr):
+        # Degenerate (e.g. ties at λ): fall back to hard top-keep_x selection
+        keep_idx = np.argpartition(abs_w, p - keep_x)[p - keep_x:]
+        w_thr = np.zeros_like(w)
+        w_thr[keep_idx] = w[keep_idx]
+    return w_thr
+
+
+class SparsePLS(BaseEstimator, RegressorMixin):
+    """Sparse Partial Least Squares for a univariate response.
+
+    NIPALS PLS where each component's weight vector is L1-penalised via
+    soft-thresholding so that only ``keep_x`` pixels load on it (Chun & Keleş
+    2010; Lê Cao et al. 2008).  Drop-in compatible with the parts of
+    ``sklearn.cross_decomposition.PLSRegression`` used in this module:
+    exposes ``.fit``, ``.predict``, ``.coef_`` (shape (1, p)),
+    ``.x_weights_`` (shape (p, n_components)), and ``.n_components``.
+
+    Parameters
+    ----------
+    n_components : int   — number of latent components
+    keep_x       : int   — nonzero pixel weights retained per component
+    max_iter     : int   — accepted for API parity (single-response NIPALS is
+                           non-iterative, so it is unused)
+
+    Notes
+    -----
+    X is assumed already column-standardised by the caller; only centring is
+    applied internally (matching how PLSRegression treats pre-scaled input).
+    """
+
+    def __init__(self, n_components=2, keep_x=100, max_iter=1000):
+        self.n_components = n_components
+        self.keep_x = keep_x
+        self.max_iter = max_iter
+
+    def fit(self, X, Y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(Y, dtype=float).ravel()
+
+        self.x_mean_ = X.mean(axis=0)
+        self.y_mean_ = y.mean()
+        X_res = X - self.x_mean_
+        y_res = y - self.y_mean_
+
+        n, p = X_res.shape
+        K = min(self.n_components, n - 1, p)
+
+        W = np.zeros((p, K))   # sparse weights
+        P = np.zeros((p, K))   # x-loadings (for deflation)
+        C = np.zeros(K)        # y-loadings
+
+        for k in range(K):
+            w = X_res.T @ y_res
+            w = _soft_threshold_keep(w, self.keep_x)
+            nw = np.linalg.norm(w)
+            if nw == 0:
+                K = k
+                W, P, C = W[:, :K], P[:, :K], C[:K]
+                break
+            w /= nw
+            t = X_res @ w
+            tt = t @ t
+            P[:, k] = (X_res.T @ t) / tt
+            C[k] = (y_res @ t) / tt
+            X_res = X_res - np.outer(t, P[:, k])
+            y_res = y_res - C[k] * t
+            W[:, k] = w
+
+        self.x_weights_ = W
+        # B = W (Pᵀ W)⁻¹ C   — standard PLS coefficient reconstruction
+        if K > 0:
+            beta = W @ np.linalg.pinv(P.T @ W) @ C
+        else:
+            beta = np.zeros(p)
+        self.coef_ = beta.reshape(1, -1)
+        self._beta = beta
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        return (X - self.x_mean_) @ self._beta + self.y_mean_
+
+
+def _make_pls(n_components, keep_x=None, max_iter=1000):
+    """Factory: dense PLSRegression when keep_x is None, else SparsePLS."""
+    if keep_x is None:
+        return PLSRegression(n_components=n_components, max_iter=max_iter)
+    return SparsePLS(n_components=n_components, keep_x=keep_x, max_iter=max_iter)
+
+
 # ── PLS CV sweep ──────────────────────────────────────────────────────────────
 
 def cv_sweep(X, Y, n_components_grid=None, n_folds=N_CV_FOLDS):
@@ -223,19 +359,72 @@ def cv_sweep(X, Y, n_components_grid=None, n_folds=N_CV_FOLDS):
     return results, best_n
 
 
-def fit_pls(X, Y, n_components):
-    pls = PLSRegression(n_components=n_components, max_iter=1000)
+def cv_sweep_sparse(X, Y, n_components_grid=None, keep_x_grid=None,
+                    n_folds=N_CV_FOLDS):
+    """Cross-validate Sparse PLS over a 2-D grid of (n_components, keep_x).
+
+    Returns
+    -------
+    results : dict  {(n_comp, keep_x): {"r2_mean", "r2_std", "r2_folds"}}
+    best_n  : int   — n_components at the CV-optimal cell
+    best_kx : int   — keep_x at the CV-optimal cell
+    """
+    if n_components_grid is None:
+        n_components_grid = N_COMPONENTS_GRID
+    if keep_x_grid is None:
+        keep_x_grid = KEEP_X_GRID
+
+    n_pixels = X.shape[1]
+    max_feasible = min(X.shape) - 1
+    n_grid = [n for n in n_components_grid if n <= max_feasible]
+    # keep_x cannot exceed the number of available columns
+    kx_grid = sorted({min(kx, n_pixels) for kx in keep_x_grid})
+
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    results = {}
+
+    print(f"  Sparse CV sweep: {len(n_grid)} component counts × "
+          f"{len(kx_grid)} keep_x values (k={n_folds} folds):")
+    for kx in kx_grid:
+        for n in n_grid:
+            model = SparsePLS(n_components=n, keep_x=kx, max_iter=1000)
+            r2_folds = cross_val_score(model, X, Y, cv=kf, scoring="r2")
+            results[(n, kx)] = {"r2_mean": r2_folds.mean(),
+                                "r2_std": r2_folds.std(),
+                                "r2_folds": r2_folds}
+        best_n_for_kx = max(n_grid, key=lambda n: results[(n, kx)]["r2_mean"])
+        print(f"    keep_x={kx:5d}  best n={best_n_for_kx:4d}  "
+              f"CV R² = {results[(best_n_for_kx, kx)]['r2_mean']:.4f}")
+
+    best_n, best_kx = max(results, key=lambda k: results[k]["r2_mean"])
+    print(f"  → Best (n_components, keep_x) = ({best_n}, {best_kx})  "
+          f"(CV R² = {results[(best_n, best_kx)]['r2_mean']:.4f})")
+    return results, best_n, best_kx
+
+
+def _collapse_sparse_cv(results_2d, keep_x):
+    """Slice a 2-D sparse CV result dict to a 1-D {n: stats} dict at fixed keep_x.
+
+    Lets the existing ``plot_cv_curve`` reuse the sparse sweep output by
+    plotting the R²-vs-n_components curve at the CV-optimal keep_x.
+    """
+    return {n: stats for (n, kx), stats in results_2d.items() if kx == keep_x}
+
+
+def fit_pls(X, Y, n_components, keep_x=None):
+    pls = _make_pls(n_components, keep_x=keep_x)
     pls.fit(X, Y)
     return pls
 
 
-def bootstrap_pls_coefs(X, Y, n_components, n_bootstrap=N_BOOTSTRAP,
+def bootstrap_pls_coefs(X, Y, n_components, keep_x=None, n_bootstrap=N_BOOTSTRAP,
                         random_state=RANDOM_STATE):
     """Bootstrap PLS coefficients by resampling hours with replacement.
 
-    n_components is fixed to the CV-optimal value so each bootstrap draw fits
-    the same model complexity as the original.  Sign alignment is not needed
-    because pls.coef_ is pinned to the Y direction and stays sign-stable.
+    n_components (and keep_x, for sparse models) are fixed to the CV-optimal
+    values so each bootstrap draw fits the same model complexity as the
+    original.  Sign alignment is not needed because coef_ is pinned to the Y
+    direction and stays sign-stable.
 
     Returns
     -------
@@ -245,13 +434,14 @@ def bootstrap_pls_coefs(X, Y, n_components, n_bootstrap=N_BOOTSTRAP,
     n_obs = X.shape[0]
     coef_samples = np.empty((n_bootstrap, X.shape[1]))
 
-    print(f"  Bootstrapping PLS (n_components={n_components}, "
+    kx_note = "" if keep_x is None else f", keep_x={keep_x}"
+    print(f"  Bootstrapping PLS (n_components={n_components}{kx_note}, "
           f"B={n_bootstrap} draws) …", flush=True)
     for i in range(n_bootstrap):
         if (i + 1) % 100 == 0:
             print(f"    {i + 1}/{n_bootstrap}", flush=True)
         idx = rng.integers(0, n_obs, size=n_obs)
-        pls_b = PLSRegression(n_components=n_components, max_iter=1000)
+        pls_b = _make_pls(n_components, keep_x=keep_x)
         pls_b.fit(X[idx], Y[idx])
         coef_samples[i] = pls_b.coef_.ravel()
 
@@ -568,6 +758,44 @@ def plot_cv_curve(cv_results, best_n, save_path, title_suffix=""):
     print(f"  Saved: {save_path.name}")
 
 
+def plot_cv_heatmap(results_2d, best_n, best_kx, save_path, title_suffix=""):
+    """Heatmap of CV R² over the Sparse-PLS (n_components × keep_x) grid."""
+    ns  = sorted({n for n, _ in results_2d})
+    kxs = sorted({kx for _, kx in results_2d})
+
+    grid = np.full((len(kxs), len(ns)), np.nan)
+    for i, kx in enumerate(kxs):
+        for j, n in enumerate(ns):
+            if (n, kx) in results_2d:
+                grid[i, j] = results_2d[(n, kx)]["r2_mean"]
+
+    fig, ax = plt.subplots(figsize=(1.1 * len(ns) + 2, 0.7 * len(kxs) + 2))
+    im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+    ax.set_xticks(range(len(ns)),  labels=ns)
+    ax.set_yticks(range(len(kxs)), labels=kxs)
+    ax.set_xlabel("Number of PLS Components", fontsize=11)
+    ax.set_ylabel("keep_x  (nonzero pixels / component)", fontsize=11)
+
+    # Annotate each cell and ring the CV-optimal one
+    for i, kx in enumerate(kxs):
+        for j, n in enumerate(ns):
+            if np.isnan(grid[i, j]):
+                continue
+            ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center",
+                    fontsize=7, color="white")
+    bj, bi = ns.index(best_n), kxs.index(best_kx)
+    ax.add_patch(plt.Rectangle((bj - 0.5, bi - 0.5), 1, 1, fill=False,
+                               edgecolor="crimson", linewidth=2.5))
+
+    fig.colorbar(im, ax=ax, label="Out-of-Sample R² (5-fold CV)")
+    ax.set_title(f"Sparse PLS Selection{title_suffix}\n"
+                 f"optimal: n={best_n}, keep_x={best_kx}", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {save_path.name}")
+
+
 def plot_component_maps(pls, pixel_coords, offsets, error_fields, save_path,
                         n_show=4, depvar=DEPVAR):
     """Heatmap grid: rows = error fields (temp top, wind bottom), cols = top-N components.
@@ -863,7 +1091,8 @@ def plot_comparison_coefs(pls_runs, labels, pixel_coords, save_path, depvar,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(months=None, error_fields=None, depvar=DEPVAR,
-        n_components_grid=None, compare=False, n_bootstrap=N_BOOTSTRAP):
+        n_components_grid=None, compare=False, n_bootstrap=N_BOOTSTRAP,
+        sparse=False, keep_x_grid=None):
     """Fit PLS for the given (possibly multi-field) error spec.
 
     Parameters
@@ -877,6 +1106,13 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
     n_bootstrap : int
         Number of bootstrap draws for coefficient significance testing.
         Set to 0 to skip bootstrapping (all pixels shown).
+    sparse : bool
+        If True, fit Sparse PLS (L1-penalised weights) and cross-validate
+        jointly over (n_components, keep_x).  Each component then loads on at
+        most keep_x pixels, giving sparse, more interpretable maps.
+    keep_x_grid : list of int
+        Candidate keep_x values (nonzero pixels per component) for the sparse
+        CV sweep.  Defaults to KEEP_X_GRID.  Ignored when sparse=False.
     """
     if months is None:
         months = ALL_MONTHS
@@ -886,21 +1122,27 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
         error_fields = [error_fields]
     if n_components_grid is None:
         n_components_grid = N_COMPONENTS_GRID
+    if keep_x_grid is None:
+        keep_x_grid = KEEP_X_GRID
 
     dirs = setup_directories()
     fig_dir = Path(dirs["figures"]) / "pls_analysis"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # File-name stem for this run
+    # File-name stems for this run; sparse runs get their own suffix so dense
+    # and sparse figures never overwrite each other.
     fields_slug = "_".join(error_fields)
+    mode_slug = "_sparse" if sparse else ""
 
     print("=" * 65)
-    print("PLS SPATIAL ANALYSIS")
+    print("PLS SPATIAL ANALYSIS" + ("  (SPARSE)" if sparse else ""))
     print(f"  Error fields : {error_fields}")
     print(f"  Outcome      : {depvar}")
     print(f"  Months       : {months[0]} – {months[-1]}")
     print(f"  Compare mode : {compare}")
     print(f"  Bootstrap B  : {n_bootstrap}")
+    if sparse:
+        print(f"  keep_x grid  : {keep_x_grid}")
     print("=" * 65)
 
     # ── Joint (or single-field) model ──────────────────────────────────────
@@ -910,16 +1152,24 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
     )
 
     print(f"\n--- CV sweep: joint [{', '.join(error_fields)}] ---")
-    cv_joint, best_n_joint = cv_sweep(X, Y, n_components_grid)
+    if sparse:
+        cv_joint_2d, best_n_joint, best_kx_joint = cv_sweep_sparse(
+            X, Y, n_components_grid, keep_x_grid
+        )
+        cv_joint = _collapse_sparse_cv(cv_joint_2d, best_kx_joint)
+    else:
+        cv_joint, best_n_joint = cv_sweep(X, Y, n_components_grid)
+        best_kx_joint = None
 
-    print(f"\n--- Fitting final PLS (n={best_n_joint}) ---")
-    pls_joint = fit_pls(X, Y, best_n_joint)
+    print(f"\n--- Fitting final PLS (n={best_n_joint}"
+          f"{'' if best_kx_joint is None else f', keep_x={best_kx_joint}'}) ---")
+    pls_joint = fit_pls(X, Y, best_n_joint, keep_x=best_kx_joint)
 
     # Bootstrap significance for joint model
     if n_bootstrap > 0:
         print(f"\n--- Bootstrapping joint model ---")
         coef_samples_joint = bootstrap_pls_coefs(
-            X, Y, best_n_joint, n_bootstrap=n_bootstrap
+            X, Y, best_n_joint, keep_x=best_kx_joint, n_bootstrap=n_bootstrap
         )
         sig_mask_joint, _, _ = compute_significance_mask(coef_samples_joint)
         n_sig = sig_mask_joint.sum()
@@ -929,19 +1179,26 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
         sig_mask_joint = None
 
     # Per-run figures
-    plot_cv_curve(
-        cv_joint, best_n_joint,
-        fig_dir / f"pls_cv_curve_{fields_slug}_{depvar}.png",
-        title_suffix=f"\n{'+'.join(error_fields)}  →  {depvar}",
-    )
+    if sparse:
+        plot_cv_heatmap(
+            cv_joint_2d, best_n_joint, best_kx_joint,
+            fig_dir / f"pls_cv_heatmap_{fields_slug}_{depvar}.png",
+            title_suffix=f"  |  {'+'.join(error_fields)} → {depvar}",
+        )
+    else:
+        plot_cv_curve(
+            cv_joint, best_n_joint,
+            fig_dir / f"pls_cv_curve_{fields_slug}_{depvar}.png",
+            title_suffix=f"\n{'+'.join(error_fields)}  →  {depvar}",
+        )
     plot_component_maps(
         pls_joint, pixel_coords, offsets, error_fields,
-        fig_dir / f"pls_component_maps_{fields_slug}_{depvar}.png",
+        fig_dir / f"pls_component_maps_{fields_slug}{mode_slug}_{depvar}.png",
         n_show=4, depvar=depvar,
     )
     plot_coefficient_map(
         pls_joint, pixel_coords, offsets, error_fields,
-        fig_dir / f"pls_coefficient_map_{fields_slug}_{depvar}.png",
+        fig_dir / f"pls_coefficient_map_{fields_slug}{mode_slug}_{depvar}.png",
         cv_r2=cv_joint[best_n_joint]["r2_mean"],
         best_n=best_n_joint,
         depvar=depvar,
@@ -963,14 +1220,21 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
             X_s, Y_s, pc_s, pi_s, hi_s, off_s = load_and_prepare(
                 months, [field], depvar
             )
-            cv_s, best_n_s = cv_sweep(X_s, Y_s, n_components_grid)
-            pls_s = fit_pls(X_s, Y_s, best_n_s)
+            if sparse:
+                cv_s_2d, best_n_s, best_kx_s = cv_sweep_sparse(
+                    X_s, Y_s, n_components_grid, keep_x_grid
+                )
+                cv_s = _collapse_sparse_cv(cv_s_2d, best_kx_s)
+            else:
+                cv_s, best_n_s = cv_sweep(X_s, Y_s, n_components_grid)
+                best_kx_s = None
+            pls_s = fit_pls(X_s, Y_s, best_n_s, keep_x=best_kx_s)
 
             # Bootstrap significance for this single-field model
             if n_bootstrap > 0:
                 print(f"\n--- Bootstrapping single-field model: {field} ---")
                 coef_samples_s = bootstrap_pls_coefs(
-                    X_s, Y_s, best_n_s, n_bootstrap=n_bootstrap
+                    X_s, Y_s, best_n_s, keep_x=best_kx_s, n_bootstrap=n_bootstrap
                 )
                 sig_mask_s, _, _ = compute_significance_mask(coef_samples_s)
                 n_sig_s = sig_mask_s.sum()
@@ -980,14 +1244,21 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
                 sig_mask_s = None
 
             # Per-field individual figures
-            plot_cv_curve(
-                cv_s, best_n_s,
-                fig_dir / f"pls_cv_curve_{field}_{depvar}.png",
-                title_suffix=f"\n{_label(field)}  →  {depvar}",
-            )
+            if sparse:
+                plot_cv_heatmap(
+                    cv_s_2d, best_n_s, best_kx_s,
+                    fig_dir / f"pls_cv_heatmap_{field}_{depvar}.png",
+                    title_suffix=f"  |  {_label(field)} → {depvar}",
+                )
+            else:
+                plot_cv_curve(
+                    cv_s, best_n_s,
+                    fig_dir / f"pls_cv_curve_{field}_{depvar}.png",
+                    title_suffix=f"\n{_label(field)}  →  {depvar}",
+                )
             plot_coefficient_map(
                 pls_s, pc_s, off_s, [field],
-                fig_dir / f"pls_coefficient_map_{field}_{depvar}.png",
+                fig_dir / f"pls_coefficient_map_{field}{mode_slug}_{depvar}.png",
                 cv_r2=cv_s[best_n_s]["r2_mean"],
                 best_n=best_n_s,
                 depvar=depvar,
@@ -1003,12 +1274,12 @@ def run(months=None, error_fields=None, depvar=DEPVAR,
         # Comparison figures use the joint model's pixel_coords as reference
         plot_comparison_cv(
             all_cv_results, all_best_ns, all_labels,
-            fig_dir / f"pls_comparison_cv_{fields_slug}_{depvar}.png",
+            fig_dir / f"pls_comparison_cv_{fields_slug}{mode_slug}_{depvar}.png",
             depvar=depvar,
         )
         plot_comparison_coefs(
             pls_runs, all_labels, pixel_coords,
-            fig_dir / f"pls_comparison_coefs_{fields_slug}_{depvar}.png",
+            fig_dir / f"pls_comparison_coefs_{fields_slug}{mode_slug}_{depvar}.png",
             depvar=depvar,
             sig_masks=all_sig_masks,
         )
@@ -1051,6 +1322,21 @@ if __name__ == "__main__":
             f"(default: {N_BOOTSTRAP}). Set to 0 to skip."
         ),
     )
+    parser.add_argument(
+        "--sparse", action="store_true",
+        help=(
+            "Fit Sparse PLS (L1-penalised weights) instead of dense PLS, "
+            "cross-validating jointly over (n_components, keep_x).  Each "
+            "component loads on at most keep_x pixels."
+        ),
+    )
+    parser.add_argument(
+        "--keep-x-grid", nargs="+", type=int, default=KEEP_X_GRID, metavar="K",
+        help=(
+            "Candidate keep_x values (nonzero pixels per component) for the "
+            f"sparse CV sweep.  Default: {KEEP_X_GRID}.  Ignored without --sparse."
+        ),
+    )
     args = parser.parse_args()
 
     months = [(2025, m) for m in args.months] if args.months else ALL_MONTHS
@@ -1060,4 +1346,6 @@ if __name__ == "__main__":
         depvar=args.depvar,
         compare=args.compare,
         n_bootstrap=args.bootstrap,
+        sparse=args.sparse,
+        keep_x_grid=args.keep_x_grid,
     )

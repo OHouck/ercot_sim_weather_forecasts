@@ -833,8 +833,6 @@ def plot_pca_coefs_across_outcomes(
 
         sm_map = plt.cm.ScalarMappable(cmap="RdBu_r", norm=norm)
         sm_map.set_array([])
-        fig.colorbar(sm_map, ax=map_axes, shrink=0.6, pad=0.02, fraction=0.05,
-                     label="Normalised loading")
 
         fig.suptitle(
             f"{label}\n"
