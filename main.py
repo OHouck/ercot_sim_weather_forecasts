@@ -139,8 +139,6 @@ def build_pipeline(year=DEFAULT_YEAR, months=None, force_rebuild=True,
     print("  " + ", ".join(f"{year}-{month:02d}" for year, month in month_pairs))
 
     _download_weather_inputs(year, month_numbers, dirs)
-    print("\n=== Weather inputs downloaded ===")
-    exit()
     _download_grid_inputs(dirs)
     _download_market_inputs(year, month_numbers)
     _build_thermal_inputs(year, month_numbers, force_rebuild)
@@ -156,6 +154,8 @@ def build_pipeline(year=DEFAULT_YEAR, months=None, force_rebuild=True,
 
     print("\n=== Step 8: Build system hourly outcomes ===")
     build_system_hourly_outcomes(year, months=month_numbers, force_rebuild=force_rebuild)
+
+    exit()
 
     if run_significance:
         print("\n=== Step 9: EOF significance ===")

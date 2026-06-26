@@ -1034,6 +1034,20 @@ wheels = [
 ]
 
 [[package]]
+name = "fpls"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "seaborn" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e6/d9/e5f334481aa45f00e1535841ac46edde8c2ffebde87cb0489848a258b9ad/fpls-0.2.0.tar.gz", hash = "sha256:cf283fcdbe2c9e9f600b78efedce4b36599d06269937292c94023782afcd3bda", size = 17049 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/11/9892595d72912a54f93ee0ef47b5f1bdee42aca1281eb4730e1354ef44ec/fpls-0.2.0-py3-none-any.whl", hash = "sha256:19e9d38a84ecceeadb2a23a05796e82f8acd988d5d2646a4318018ee2f12ffde", size = 14912 },
+]
+
+[[package]]
 name = "fqdn"
 version = "1.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -4544,6 +4558,7 @@ dependencies = [
     { name = "cftime" },
     { name = "ecmwf-api-client" },
     { name = "formulaic" },
+    { name = "fpls" },
     { name = "fuzzywuzzy" },
     { name = "geopandas" },
     { name = "great-tables" },
@@ -4597,6 +4612,7 @@ requires-dist = [
     { name = "cftime", specifier = ">=1.6.5" },
     { name = "ecmwf-api-client", specifier = ">=1.6.3" },
     { name = "formulaic", specifier = ">=1.2.1" },
+    { name = "fpls", specifier = ">=0.2.0" },
     { name = "fuzzywuzzy", specifier = ">=0.18.0" },
     { name = "geopandas", specifier = ">=1.1.2" },
     { name = "great-tables", specifier = ">=0.21.0" },
