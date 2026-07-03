@@ -356,13 +356,17 @@ def _build_bin_map(src_lats, src_lons, tgt_lats, tgt_lons,
 
     # ── Try loading from cache ────────────────────────────────────────────
     if cache_path is not None and os.path.exists(cache_path) and not force_rebuild:
-        cached = np.load(cache_path)
-        cached_shape = tuple(cached['src_shape'])
+        try:
+            cached = np.load(cache_path)
+            cached_shape = tuple(cached['src_shape'])
+        except KeyError:
+            cached_shape = None
         if cached_shape == src_shape:
             print(f"  Loaded bin map from cache: {cache_path}")
             return cached['bin_lat_idx'], cached['bin_lon_idx'], cached['valid_mask']
         else:
-            print(f"  Cache grid shape {cached_shape} ≠ current {src_shape}; rebuilding...")
+            reason = "missing src_shape" if cached_shape is None else f"shape {cached_shape} ≠ {src_shape}"
+            print(f"  Cache stale ({reason}); rebuilding...")
 
     # Work in ascending latitude for np.digitize
     lat_ascending = tgt_lats[0] < tgt_lats[-1] if len(tgt_lats) > 1 else True
@@ -1390,7 +1394,8 @@ def _compute_era5_gridded_errors(
 
 
 def calculate_era5_errors_for_month(year, month, model='hrrr',
-                                     lead_hours=None, force_rebuild_bin_map=False):
+                                     lead_hours=None, force_rebuild_bin_map=False,
+                                     force_rebuild=False):
     """Calculate forecast errors vs ERA5-Land at every ERA5 grid cell for a month.
 
     Uses ERA5-Land reanalysis as the ground truth (instead of ISD weather stations),
@@ -1421,6 +1426,9 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
         force_rebuild_bin_map: If True, recompute the forecast-to-ERA5 bin map even
                                if a cached copy already exists. Only relevant for
                                bin-averaging models (HRRR). Defaults to False.
+        force_rebuild: If True, recompute errors even if the output NetCDF and
+                       summary CSV already exist for this year/month/model.
+                       Defaults to False (reuse cached output).
 
     Returns:
         Summary DataFrame with per-cell, per-lead-time statistics.
@@ -1443,6 +1451,12 @@ def calculate_era5_errors_for_month(year, month, model='hrrr',
         processed_dir, 'forecast_errors_era5', model_lower, str(year), f"{month:02d}"
     )
     os.makedirs(out_dir, exist_ok=True)
+
+    nc_path = os.path.join(out_dir, f'era5_errors_{year}{month:02d}.nc')
+    summary_path = os.path.join(out_dir, 'error_summary.csv')
+    if not force_rebuild and os.path.exists(nc_path) and os.path.exists(summary_path):
+        print(f"  Cached: {summary_path}")
+        return pd.read_csv(summary_path)
 
     # ── Load ERA5 as xarray Dataset ──
     era5_nc = os.path.join(raw_dir, 'era5_land', str(year), f'{month:02d}',

@@ -1375,7 +1375,7 @@ def run_eda_plots(months=None):
         # "std_error_maps":          plot_std_forecast_error_maps(months=months),
         # "error_vs_realized":       plot_forecast_error_vs_realized(months=months),
         # "co2_intensity":           plot_co2_intensity(months=months),
-        "offer_curves":            plot_offer_curves(year=2025),
+        # "offer_curves":            plot_offer_curves(year=2025),
     }
 
 

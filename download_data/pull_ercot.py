@@ -531,6 +531,43 @@ def download_sced_lambda(start_date, end_date, output_dir, api_key, bearer_token
         current = month_end + timedelta(days=1)
 
 
+def _ercot_month_complete(base_dir, year, month):
+    """Return True if all ERCOT daily files for the month already exist.
+
+    Checks only the daily-file datasets (DAM SPP, RT SPP, demand forecasts,
+    wind forecasts) and the monthly actual-load file. Used to skip
+    authentication when the full month was already downloaded.
+
+    Args:
+        base_dir: Root ERCOT raw data directory.
+        year: Calendar year.
+        month: Calendar month (1–12).
+
+    Returns:
+        bool
+    """
+    num_days = calendar.monthrange(year, month)[1]
+    month_str = f"{year}-{month:02d}"
+    month_dir = f"{year}/{month:02d}"
+
+    daily_prefixes = [
+        (os.path.join(base_dir, 'dam_spp', month_dir), 'dam_spp'),
+        (os.path.join(base_dir, 'rt_spp', month_dir), 'rt_spp'),
+        (os.path.join(base_dir, 'demand_forecast', month_dir), 'demand_forecast'),
+        (os.path.join(base_dir, 'wind_forecast', month_dir), 'wind_forecast'),
+    ]
+    for dir_path, prefix in daily_prefixes:
+        for day in range(1, num_days + 1):
+            date_str = f"{year}-{month:02d}-{day:02d}"
+            if not os.path.exists(os.path.join(dir_path, f"{prefix}_{date_str}.csv")):
+                return False
+
+    load_path = os.path.join(
+        base_dir, 'actual_load', month_dir, f"actual_load_{month_str}.csv"
+    )
+    return os.path.exists(load_path)
+
+
 def download_month(year, month):
     """Download all ERCOT data for a given month.
 
@@ -540,13 +577,18 @@ def download_month(year, month):
     """
     dirs = setup_directories()
     base_dir = os.path.join(dirs['raw'], 'ercot')
-    creds = load_credentials()
 
     num_days = calendar.monthrange(year, month)[1]
     start_date = f"{year}-{month:02d}-01"
     end_date = f"{year}-{month:02d}-{num_days:02d}"
 
     print(f"=== ERCOT Data Download: {start_date} to {end_date} ===\n")
+
+    if _ercot_month_complete(base_dir, year, month):
+        print(f"  All ERCOT files for {year}-{month:02d} already exist, skipping.")
+        return
+
+    creds = load_credentials()
 
     # Try to get bearer token
     print("Authenticating with ERCOT API...")

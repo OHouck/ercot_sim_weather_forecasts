@@ -74,7 +74,59 @@ CHANNEL_SPEC = {
     "era5_temp":        ("hrrr", "era5_temp",      1),
     "era5_wspd100":     ("hrrr", "era5_wspd100",   1),
 }
-OUTCOMES_CSV = "system_hourly_outcomes_2025.csv"
+
+
+def system_outcomes_path(dirs, year):
+    """Return the path to the per-year system hourly outcomes CSV.
+
+    Parameters
+    ----------
+    dirs : dict from setup_directories()
+    year : int
+
+    Returns
+    -------
+    pathlib.Path — {processed}/system_hourly_outcomes_{year}.csv
+    """
+    return Path(dirs["processed"]) / f"system_hourly_outcomes_{year}.csv"
+
+
+def read_system_outcomes(dirs, months=None):
+    """Load and vertically concatenate the per-year system hourly outcome CSVs.
+
+    Reads ``system_hourly_outcomes_{year}.csv`` for each distinct year spanned by
+    ``months`` and concatenates them into one valid_time-indexed frame, so an
+    analysis can cover a single year or several years at once. This replaces the
+    old hardcoded single-year file so the loaders follow whatever year/months the
+    caller requests.
+
+    Parameters
+    ----------
+    dirs   : dict from setup_directories()
+    months : list of (year, month), or None to default to ALL_MONTHS
+
+    Returns
+    -------
+    pd.DataFrame indexed by valid_time (deduplicated, sorted), raw columns only.
+    """
+    years = sorted({year for year, _ in (months or ALL_MONTHS)})
+    frames = []
+    for year in years:
+        path = system_outcomes_path(dirs, year)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"System hourly outcomes file not found: {path}\n"
+                f"Build it with build_system_hourly_outcomes({year}, ...)."
+            )
+        frames.append(pd.read_csv(path, parse_dates=["valid_time"]))
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset="valid_time")
+        .sort_values("valid_time")
+        .set_index("valid_time")
+    )
+    return combined
+
 
 COLOR_P001 = "#00008B"
 COLOR_P005 = "#6699CC"
@@ -290,11 +342,9 @@ def load_channel_fields(months, dirs):
         model_ds[model] = ds.isel(valid_time=keep_idx)
         print(f"  {model.upper()}: {model_ds[model].sizes['valid_time']} hours loaded")
 
-    outcomes_path = Path(dirs["processed"]) / OUTCOMES_CSV
-    outcomes_raw  = pd.read_csv(outcomes_path)
-    outcomes_raw["valid_time"] = pd.to_datetime(outcomes_raw["valid_time"])
-    outcomes_raw  = outcomes_raw.set_index("valid_time")
-    print(f"  CSV: {len(outcomes_raw)} hours loaded")
+    outcomes_raw = read_system_outcomes(dirs, months)
+    print(f"  CSV: {len(outcomes_raw)} hours loaded "
+          f"({', '.join(str(y) for y in sorted({y for y, _ in months}))})")
 
     raw_das     = {}
     time_arrays = []

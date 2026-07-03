@@ -46,6 +46,7 @@ dependencies = [
     "xeofs>=3.0.4",
     "sparse-pls>=0.1.3",
     "fpls>=0.2.0",
+    "scikit-fda>=0.10.1",
 ]
 
 [dependency-groups]

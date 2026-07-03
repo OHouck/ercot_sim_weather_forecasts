@@ -378,7 +378,7 @@ def run_fpls_mode_selection(depvars=None, months=None, n_splits=N_CV_FOLDS):
 
     print("\n=== Phase 1: Loading channel fields and outcomes ===")
     channel_bundle     = load_channel_fields(months, project_dirs)
-    outcomes_dataframe = load_outcomes(project_dirs)
+    outcomes_dataframe = load_outcomes(project_dirs, months=months)
     all_valid_hours    = channel_bundle["hours"]
     temporal_chunk_labels = _chunk_labels(all_valid_hours)
     time_controls = build_time_controls(all_valid_hours)
@@ -572,7 +572,7 @@ def run_fpls_decomposition(depvars=None, months=None, n_components_per_block=Non
 
     print("\n=== Phase 2: Loading channel fields and outcomes ===")
     channel_bundle     = load_channel_fields(months, project_dirs)
-    outcomes_dataframe = load_outcomes(project_dirs)
+    outcomes_dataframe = load_outcomes(project_dirs, months=months)
     all_valid_hours    = channel_bundle["hours"]
 
     for cut_key, cut in SAMPLE_CUT.items():
@@ -982,14 +982,24 @@ def main():
               "analyze (Phase 3), all (default)"))
     arg_parser.add_argument("--depvars", nargs="*", default=None,
                             help="Outcome variables (default: all)")
+    arg_parser.add_argument("--years", type=int, nargs="*", default=None,
+                            help="Years to include (default: the module's ALL_MONTHS)")
+    arg_parser.add_argument("--months", type=int, nargs="*", default=None,
+                            help="Months to include across the given years (default: all 12)")
     cli_args = arg_parser.parse_args()
 
+    if cli_args.years:
+        month_numbers = cli_args.months or list(range(1, 13))
+        months = [(year, month) for year in cli_args.years for month in month_numbers]
+    else:
+        months = None  # each phase falls back to ALL_MONTHS
+
     if cli_args.task in ("select", "all"):
-        run_fpls_mode_selection(depvars=cli_args.depvars)
+        run_fpls_mode_selection(depvars=cli_args.depvars, months=months)
     if cli_args.task in ("decompose", "all"):
-        run_fpls_decomposition(depvars=cli_args.depvars)
+        run_fpls_decomposition(depvars=cli_args.depvars, months=months)
     if cli_args.task in ("analyze", "all"):
-        run_fpls_analysis(depvars=cli_args.depvars)
+        run_fpls_analysis(depvars=cli_args.depvars, months=months)
 
 
 if __name__ == "__main__":

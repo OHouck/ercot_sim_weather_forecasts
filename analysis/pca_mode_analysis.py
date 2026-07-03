@@ -34,11 +34,10 @@ from analysis.pca_decomposition import (
     COLOR_P001, COLOR_P005, COLOR_NSIG,
     _r2, _normalize_comp, _sig_stars, _draw_texas, _get_cartopy_crs,
     _grid_marker_size, make_chunk_splits, load_pca_results,
+    read_system_outcomes,
 )
 
 # ── Outcome configuration ──────────────────────────────────────────────────────
-
-OUTCOMES_CSV = "system_hourly_outcomes_2025.csv"
 
 DEPVAR_CONFIGS = {
     "economic_congestion_cost":       {"label": "Congestion Cost", "transform": "log1p"},
@@ -58,24 +57,29 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ── Outcome loading ────────────────────────────────────────────────────────────
 
 
-def load_outcomes(dirs):
-    """Load the system hourly outcomes CSV and compute derived markup columns.
+def load_outcomes(dirs, months=None):
+    """Load the system hourly outcomes and compute derived markup columns.
+
+    Reads and concatenates the per-year outcome CSVs for the years spanned by
+    ``months`` (defaults to ALL_MONTHS, i.e. the single configured year), so the
+    same analysis can run over one year or several.
 
     Parameters
     ----------
-    dirs : dict from setup_directories()
+    dirs   : dict from setup_directories()
+    months : list of (year, month), or None to default to ALL_MONTHS
 
     Returns
     -------
     pd.DataFrame indexed by valid_time with all outcome columns plus:
         rt_cllig_p85_markup, rt_scgt_p85_markup, rt_ccgt_p85_markup
     """
-    path = Path(dirs["processed"]) / OUTCOMES_CSV
-    df = pd.read_csv(path, parse_dates=["valid_time"]).set_index("valid_time")
+    df = read_system_outcomes(dirs, months)
     df["rt_cllig_p85_markup"] = df["rt_cllig_p85"] - df["cllig_mc"]
     df["rt_scgt_p85_markup"]  = df["rt_scgt_p85"]  - df["scgt_mc"]
     df["rt_ccgt_p85_markup"]  = df["rt_ccgt_p85"]  - df["ccgt_mc"]
-    print(f"  Outcomes: {len(df)} hours, {len(df.columns)} columns from {path.name}")
+    years = ", ".join(str(y) for y in sorted({y for y, _ in (months or ALL_MONTHS)}))
+    print(f"  Outcomes: {len(df)} hours, {len(df.columns)} columns ({years})")
     return df
 
 
